@@ -1,0 +1,239 @@
+use crate::{
+    Result,
+    config::{Config, FeatureKind, ObservationFeatureKind},
+    execution::Portfolio,
+    market::FeatureRow,
+};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub enum NormalizationRule {
+    RatioClipped { minimum: f64, maximum: f64 },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub enum PortfolioFeatureSpec {
+    CashAllocation,
+    AssetAllocation,
+    UnrealizedReturn,
+    NetWorthToStarting,
+    CurrentDrawdown,
+    PortfolioReturn1,
+    TurnoverToNetWorth,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub enum AgentStateFeatureSpec {
+    NormalizedAge,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub enum ObservationFeatureSpec {
+    Market {
+        feature: FeatureKind,
+        normalization: NormalizationRule,
+    },
+    Portfolio {
+        feature: PortfolioFeatureSpec,
+        normalization: NormalizationRule,
+    },
+    AgentState {
+        feature: AgentStateFeatureSpec,
+        normalization: NormalizationRule,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ObservationSchema {
+    pub version: u32,
+    pub market_schema_version: u32,
+    pub features: Vec<ObservationFeatureSpec>,
+}
+
+impl ObservationSchema {
+    pub fn from_config(config: &Config) -> Self {
+        let mut features = Vec::new();
+        for configured in &config.observation.features {
+            match configured {
+                ObservationFeatureKind::Market => {
+                    for feature in &config.features.features {
+                        features.push(ObservationFeatureSpec::Market {
+                            feature: *feature,
+                            normalization: NormalizationRule::RatioClipped {
+                                minimum: -config.features.clip,
+                                maximum: config.features.clip,
+                            },
+                        });
+                    }
+                }
+                ObservationFeatureKind::CashAllocation => {
+                    features.push(portfolio(PortfolioFeatureSpec::CashAllocation, 0.0, 1.0))
+                }
+                ObservationFeatureKind::AssetAllocation => {
+                    features.push(portfolio(PortfolioFeatureSpec::AssetAllocation, 0.0, 1.0))
+                }
+                ObservationFeatureKind::UnrealizedReturn => features.push(portfolio(
+                    PortfolioFeatureSpec::UnrealizedReturn,
+                    -10.0,
+                    10.0,
+                )),
+                ObservationFeatureKind::NetWorthToStarting => features.push(portfolio(
+                    PortfolioFeatureSpec::NetWorthToStarting,
+                    -10.0,
+                    10.0,
+                )),
+                ObservationFeatureKind::CurrentDrawdown => {
+                    features.push(portfolio(PortfolioFeatureSpec::CurrentDrawdown, 0.0, 1.0))
+                }
+                ObservationFeatureKind::PortfolioReturn1 => features.push(portfolio(
+                    PortfolioFeatureSpec::PortfolioReturn1,
+                    -10.0,
+                    10.0,
+                )),
+                ObservationFeatureKind::TurnoverToNetWorth => features.push(portfolio(
+                    PortfolioFeatureSpec::TurnoverToNetWorth,
+                    0.0,
+                    10.0,
+                )),
+                ObservationFeatureKind::NormalizedAge => {
+                    features.push(ObservationFeatureSpec::AgentState {
+                        feature: AgentStateFeatureSpec::NormalizedAge,
+                        normalization: NormalizationRule::RatioClipped {
+                            minimum: 0.0,
+                            maximum: 1.0,
+                        },
+                    })
+                }
+            }
+        }
+        Self {
+            version: config.observation.version,
+            market_schema_version: config.features.schema_version,
+            features,
+        }
+    }
+    pub fn dimension(&self, asset_count: usize) -> usize {
+        self.features.iter().map(|spec|match spec { ObservationFeatureSpec::Market{..}=>asset_count,ObservationFeatureSpec::Portfolio{feature:PortfolioFeatureSpec::AssetAllocation|PortfolioFeatureSpec::UnrealizedReturn,..}=>asset_count,_=>1 }).sum()
+    }
+    pub fn identity(&self, asset_count: usize) -> Result<String> {
+        Ok(blake3::hash(&serde_json::to_vec(&(self, asset_count))?)
+            .to_hex()
+            .to_string())
+    }
+}
+fn portfolio(feature: PortfolioFeatureSpec, minimum: f64, maximum: f64) -> ObservationFeatureSpec {
+    ObservationFeatureSpec::Portfolio {
+        feature,
+        normalization: NormalizationRule::RatioClipped { minimum, maximum },
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Observation {
+    pub schema_hash: String,
+    pub values: Vec<f32>,
+}
+pub struct ObservationContext<'a> {
+    pub market: &'a FeatureRow,
+    pub portfolio: &'a Portfolio,
+    pub prices: &'a [Option<f64>],
+    pub starting_net_worth: f64,
+    pub maximum_net_worth: f64,
+    pub age: u64,
+    pub episode_steps: usize,
+}
+
+pub trait ObservationBuilder: Send + Sync {
+    fn schema(&self) -> &ObservationSchema;
+    fn build(&self, context: &ObservationContext<'_>) -> Result<Observation>;
+}
+pub struct SchemaObservationBuilder {
+    schema: ObservationSchema,
+    market_features: Vec<FeatureKind>,
+    asset_count: usize,
+    schema_hash: String,
+}
+impl SchemaObservationBuilder {
+    pub fn new(
+        schema: ObservationSchema,
+        market_features: Vec<FeatureKind>,
+        asset_count: usize,
+    ) -> Result<Self> {
+        let schema_hash = schema.identity(asset_count)?;
+        Ok(Self {
+            schema,
+            market_features,
+            asset_count,
+            schema_hash,
+        })
+    }
+}
+impl ObservationBuilder for SchemaObservationBuilder {
+    fn schema(&self) -> &ObservationSchema {
+        &self.schema
+    }
+    fn build(&self, c: &ObservationContext<'_>) -> Result<Observation> {
+        let allocations = c.portfolio.allocations(c.prices)?;
+        let mut values = Vec::with_capacity(self.schema.dimension(self.asset_count));
+        for spec in &self.schema.features {
+            match spec {
+                ObservationFeatureSpec::Market { feature, .. } => {
+                    let feature_index = self
+                        .market_features
+                        .iter()
+                        .position(|f| f == feature)
+                        .expect("schema built from configured market features");
+                    for asset in 0..self.asset_count {
+                        values.push(
+                            c.market.values[asset * self.market_features.len() + feature_index],
+                        );
+                    }
+                }
+                ObservationFeatureSpec::Portfolio { feature, .. } => match feature {
+                    PortfolioFeatureSpec::CashAllocation => values.push(allocations[0] as f32),
+                    PortfolioFeatureSpec::AssetAllocation => {
+                        values.extend(allocations.iter().skip(1).map(|v| *v as f32))
+                    }
+                    PortfolioFeatureSpec::UnrealizedReturn => {
+                        for (position, price) in c.portfolio.positions.iter().zip(c.prices) {
+                            values.push(
+                                if position.quantity > 0.0 && position.average_entry_price > 0.0 {
+                                    (price.unwrap_or(position.average_entry_price)
+                                        / position.average_entry_price
+                                        - 1.0)
+                                        .clamp(-10.0, 10.0)
+                                        as f32
+                                } else {
+                                    0.0
+                                },
+                            );
+                        }
+                    }
+                    PortfolioFeatureSpec::NetWorthToStarting => values.push(
+                        (c.portfolio.net_worth / c.starting_net_worth).clamp(-10.0, 10.0) as f32,
+                    ),
+                    PortfolioFeatureSpec::CurrentDrawdown => values.push(
+                        (1.0 - c.portfolio.net_worth / c.maximum_net_worth.max(1e-9))
+                            .clamp(0.0, 1.0) as f32,
+                    ),
+                    PortfolioFeatureSpec::PortfolioReturn1 => values.push(
+                        (c.portfolio.net_worth / c.portfolio.previous_net_worth.max(1e-9) - 1.0)
+                            .clamp(-10.0, 10.0) as f32,
+                    ),
+                    PortfolioFeatureSpec::TurnoverToNetWorth => values.push(
+                        (c.portfolio.cumulative_turnover / c.portfolio.net_worth.max(1e-9))
+                            .clamp(0.0, 10.0) as f32,
+                    ),
+                },
+                ObservationFeatureSpec::AgentState {
+                    feature: AgentStateFeatureSpec::NormalizedAge,
+                    ..
+                } => values
+                    .push((c.age as f64 / c.episode_steps.max(1) as f64).clamp(0.0, 1.0) as f32),
+            }
+        }
+        debug_assert_eq!(values.len(), self.schema.dimension(self.asset_count));
+        Ok(Observation {
+            schema_hash: self.schema_hash.clone(),
+            values,
+        })
+    }
+}

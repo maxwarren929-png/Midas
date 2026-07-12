@@ -1,20 +1,33 @@
 use crate::{
     AgentId, AssetId, MidasError, Result,
-    brain::{
-        BrainGenome, BurnActorCriticPolicy, BuyAndHoldPolicy, CashPolicy, EqualWeightPolicy,
-        Policy, PolicyInput, PolicySnapshot, RandomPolicy,
+    action::{
+        ActionValidationContext, ActionValidator, LongOnlyActionValidator, ProposedAllocation,
     },
-    config::{Config, DateRange, PolicyKind},
-    execution::{CostExecutionModel, ExecutionModel, Portfolio, Trade},
-    market::{BackwardFeaturePipeline, FeaturePipeline, FeatureRow, MarketDataset},
+    agent::{
+        Agent, AgentBuildContext, AgentFactory, AgentSpawnRequest, SpawnMetadata,
+        StandardAgentFactory, configured_blueprint,
+    },
+    brain::{BrainArchitecture, BrainGenome, PolicyContext, PolicySnapshot},
+    config::{Config, DateRange, DeathHandling},
+    execution::{
+        CostExecutionEngine, ExecutionApplier, ExecutionPlanner, ExecutionSnapshot, PlannedTrade,
+    },
+    market::{
+        BackwardFeaturePipeline, CorporateAction, FeaturePipeline, FeatureRow, MarketDataset,
+    },
     metrics::{EventSink, MetricsCollector},
+    observation::{
+        ObservationBuilder, ObservationContext, ObservationSchema, SchemaObservationBuilder,
+    },
+    replacement::{
+        LivingAgentSummary, NonEvolutionaryRandomGenomeReplacement, ReplacementContext,
+        ReplacementStrategy,
+    },
 };
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
-
-pub const CHECKPOINT_VERSION: u32 = 1;
-
+pub const CHECKPOINT_VERSION: u32 = 2;
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum DatasetSplit {
     Training,
@@ -30,13 +43,18 @@ impl DatasetSplit {
         }
     }
 }
-
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SimulationLifecycle {
+    Initialized,
+    Running,
+    Completed,
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum DeathCause {
     Bankruptcy,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub enum SimulationEvent {
+pub enum DomainEvent {
     DayStarted {
         date: NaiveDate,
         step: usize,
@@ -52,10 +70,15 @@ pub enum SimulationEvent {
         agent_id: AgentId,
         date: NaiveDate,
     },
+    CorporateActionApplied {
+        agent_id: AgentId,
+        date: NaiveDate,
+        action: CorporateAction,
+    },
     TradeExecuted {
         agent_id: AgentId,
         date: NaiveDate,
-        trade: Trade,
+        trade: PlannedTrade,
     },
     TradeRejected {
         agent_id: AgentId,
@@ -79,78 +102,33 @@ pub enum SimulationEvent {
         maximum_net_worth: f64,
         cause: DeathCause,
     },
-    CheckpointSaved {
-        date: NaiveDate,
-        path: String,
-    },
     TimelineCompleted {
         date: NaiveDate,
     },
 }
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct AgentState {
-    pub id: AgentId,
-    pub birth_date: NaiveDate,
-    pub age: u64,
-    pub portfolio: Portfolio,
-    pub maximum_net_worth: f64,
-    pub alive: bool,
-    pub genome: Option<BrainGenome>,
+pub enum OperationalEvent {
+    CheckpointSaved { date: NaiveDate, path: String },
 }
-struct Agent {
-    state: AgentState,
-    policy: Box<dyn Policy>,
-}
-
-pub trait ReplacementStrategy: Send {
-    fn replacement_genome(
-        &mut self,
-        config: &Config,
-        observation_size: usize,
-        asset_count: usize,
-        agent_id: AgentId,
-    ) -> Result<BrainGenome>;
-    fn name(&self) -> &'static str;
-}
-pub struct NonEvolutionaryRandomGenomeReplacement;
-impl ReplacementStrategy for NonEvolutionaryRandomGenomeReplacement {
-    fn replacement_genome(
-        &mut self,
-        c: &Config,
-        o: usize,
-        a: usize,
-        id: AgentId,
-    ) -> Result<BrainGenome> {
-        BrainGenome::random(
-            &c.brain,
-            o,
-            a,
-            c.simulation.seed ^ id.0.wrapping_mul(0x9e3779b97f4a7c15),
-        )
-    }
-    fn name(&self) -> &'static str {
-        "non_evolutionary_random_genome"
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct AgentCheckpoint {
-    state: AgentState,
+    state: crate::agent::AgentState,
     policy: PolicySnapshot,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Checkpoint {
+struct Checkpoint {
     version: u32,
     config_hash: String,
     dataset_identity: String,
-    feature_schema_identity: String,
+    observation_schema_hash: String,
+    architecture: BrainArchitecture,
     split: DatasetSplit,
     next_step: usize,
     next_agent_id: u64,
+    lifecycle: SimulationLifecycle,
     agents: Vec<AgentCheckpoint>,
     metrics: MetricsCollector,
-    events: Vec<SimulationEvent>,
+    domain_events: Vec<DomainEvent>,
     accessed_through: Option<NaiveDate>,
 }
 
@@ -159,19 +137,39 @@ pub struct SimulationEngine {
     data: MarketDataset,
     split: DatasetSplit,
     features: Vec<FeatureRow>,
-    feature_schema_identity: String,
+    observation_schema: ObservationSchema,
+    observation_builder: Box<dyn ObservationBuilder>,
+    architecture: BrainArchitecture,
     agents: Vec<Agent>,
-    execution: Box<dyn ExecutionModel>,
+    planner: Box<dyn ExecutionPlanner>,
+    applier: Box<dyn ExecutionApplier>,
+    validator: Box<dyn ActionValidator>,
+    factory: Box<dyn AgentFactory>,
     replacement: Box<dyn ReplacementStrategy>,
-    event_sinks: Vec<Box<dyn EventSink>>,
     pub metrics: MetricsCollector,
-    pub events: Vec<SimulationEvent>,
+    pub domain_events: Vec<DomainEvent>,
+    pub operational_events: Vec<OperationalEvent>,
+    event_sinks: Vec<Box<dyn EventSink>>,
     next_step: usize,
     next_agent_id: u64,
+    lifecycle: SimulationLifecycle,
 }
-
 impl SimulationEngine {
     pub fn new(config: Config, data: MarketDataset, split: DatasetSplit) -> Result<Self> {
+        Self::new_with_factory(
+            config,
+            data,
+            split,
+            Box::new(StandardAgentFactory::default()),
+        )
+    }
+    pub fn new_with_factory(
+        config: Config,
+        data: MarketDataset,
+        split: DatasetSplit,
+        factory: Box<dyn AgentFactory>,
+    ) -> Result<Self> {
+        config.validate()?;
         let pipeline = BackwardFeaturePipeline::from_config(&config);
         let dates = data.split_dates(split.range(&config));
         if dates.len() < 2 {
@@ -180,74 +178,127 @@ impl SimulationEngine {
             ));
         }
         let features = pipeline.generate(&data, &dates)?;
-        let schema_id = pipeline.schema().identity()?;
-        let observation_size =
-            observation_size(pipeline.schema().market_size(), config.market.assets.len());
+        let observation_schema = ObservationSchema::from_config(&config);
+        let schema_hash = observation_schema.identity(data.assets.len())?;
+        let observation_builder = SchemaObservationBuilder::new(
+            observation_schema.clone(),
+            config.features.features.clone(),
+            data.assets.len(),
+        )?;
+        let architecture = BrainArchitecture::from_config(
+            &config.brain,
+            schema_hash,
+            observation_schema.dimension(data.assets.len()),
+            data.assets.len(),
+        );
         let first = features[0].date;
+        let blueprint = configured_blueprint(&config)?;
         let mut agents = Vec::new();
         let mut metrics = MetricsCollector::default();
-        let mut events = Vec::new();
+        let mut domain_events = Vec::new();
         for i in 0..config.simulation.population_size {
             let id = AgentId(i as u64);
-            let (policy, genome) = new_policy(&config, observation_size, id)?;
-            let state = AgentState {
-                id,
-                birth_date: first,
-                age: 0,
-                portfolio: Portfolio::new(
-                    config.simulation.starting_cash,
-                    config.market.assets.len(),
-                ),
-                maximum_net_worth: config.simulation.starting_cash,
-                alive: true,
-                genome,
+            let genome = if matches!(blueprint, crate::brain::PolicyBlueprint::Neural) {
+                Some(BrainGenome::random(
+                    &architecture,
+                    &config.brain.traits,
+                    config.simulation.seed ^ id.0,
+                )?)
+            } else {
+                None
             };
-            let event = SimulationEvent::AgentBorn {
+            let request = AgentSpawnRequest {
+                policy_blueprint: blueprint.clone(),
+                genome,
+                parent_ids: Vec::new(),
+                metadata: SpawnMetadata {
+                    reason: "initial_population".into(),
+                },
+            };
+            let agent = factory.spawn(
+                request,
+                &AgentBuildContext {
+                    agent_id: id,
+                    birth_date: first,
+                    config: &config,
+                    architecture: &architecture,
+                },
+            )?;
+            let event = DomainEvent::AgentBorn {
                 agent_id: id,
                 date: first,
             };
             metrics.on_event(&event);
-            events.push(event);
-            agents.push(Agent { state, policy });
+            domain_events.push(event);
+            agents.push(agent);
         }
+        let costs = CostExecutionEngine {
+            costs: config.execution.clone(),
+        };
         let next_agent_id = config.simulation.population_size as u64;
         Ok(Self {
-            execution: Box::new(CostExecutionModel {
-                costs: config.execution.clone(),
-            }),
-            replacement: Box::new(NonEvolutionaryRandomGenomeReplacement),
-            event_sinks: Vec::new(),
             config,
             data,
             split,
             features,
-            feature_schema_identity: schema_id,
+            observation_schema,
+            observation_builder: Box::new(observation_builder),
+            architecture,
             agents,
+            planner: Box::new(costs.clone()),
+            applier: Box::new(costs),
+            validator: Box::new(LongOnlyActionValidator),
+            factory,
+            replacement: Box::new(NonEvolutionaryRandomGenomeReplacement),
             metrics,
-            events,
+            domain_events,
+            operational_events: Vec::new(),
+            event_sinks: Vec::new(),
             next_step: 0,
             next_agent_id,
+            lifecycle: SimulationLifecycle::Initialized,
         })
     }
-
+    pub fn lifecycle(&self) -> SimulationLifecycle {
+        self.lifecycle
+    }
+    pub fn agents(&self) -> impl Iterator<Item = &crate::agent::AgentState> {
+        self.agents.iter().map(|a| &a.state)
+    }
+    pub fn agent_blueprints(
+        &self,
+    ) -> impl Iterator<Item = (AgentId, crate::brain::PolicyBlueprint)> + '_ {
+        self.agents
+            .iter()
+            .map(|agent| (agent.state.id, agent.policy.policy_blueprint()))
+    }
+    pub fn observation_schema(&self) -> &ObservationSchema {
+        &self.observation_schema
+    }
+    pub fn add_event_sink(&mut self, sink: Box<dyn EventSink>) {
+        self.event_sinks.push(sink)
+    }
+    pub fn set_replacement_strategy(&mut self, r: Box<dyn ReplacementStrategy>) {
+        self.replacement = r
+    }
     pub fn run(&mut self) -> Result<SimulationReport> {
+        if self.lifecycle == SimulationLifecycle::Completed {
+            return Ok(self.report());
+        }
+        self.lifecycle = SimulationLifecycle::Running;
         while self.next_step + 1 < self.features.len() {
             self.step()?;
         }
-        let date = self.features.last().expect("validated feature rows").date;
-        self.emit(SimulationEvent::TimelineCompleted { date });
+        self.lifecycle = SimulationLifecycle::Completed;
+        let date = self.features.last().expect("validated features").date;
+        self.emit(DomainEvent::TimelineCompleted { date });
         Ok(self.report())
     }
-    pub fn set_execution_model(&mut self, execution: Box<dyn ExecutionModel>) {
-        self.execution = execution;
-    }
-    pub fn set_replacement_strategy(&mut self, replacement: Box<dyn ReplacementStrategy>) {
-        self.replacement = replacement;
-    }
-    pub fn add_event_sink(&mut self, sink: Box<dyn EventSink>) {
-        self.event_sinks.push(sink);
-    }
     pub fn run_steps(&mut self, count: usize) -> Result<()> {
+        if self.lifecycle == SimulationLifecycle::Completed {
+            return Ok(());
+        }
+        self.lifecycle = SimulationLifecycle::Running;
         for _ in 0..count {
             if self.next_step + 1 >= self.features.len() {
                 break;
@@ -260,74 +311,106 @@ impl SimulationEngine {
         let t = self.next_step;
         let observation_date = self.features[t].date;
         let execution_date = self.features[t + 1].date;
-        self.emit(SimulationEvent::DayStarted {
+        self.emit(DomainEvent::DayStarted {
             date: execution_date,
             step: t,
         });
-        self.emit(SimulationEvent::ObservationRevealed {
+        self.emit(DomainEvent::ObservationRevealed {
             date: observation_date,
         });
-        let current_closes = self.valuation_prices(observation_date);
-        let next_closes = self.valuation_prices(execution_date);
+        let current_prices = self.valuation_prices(observation_date);
+        let next_prices = self.valuation_prices(execution_date);
         let bars = (0..self.data.assets.len())
             .map(|i| self.data.bar(execution_date, AssetId(i as u64)))
             .collect::<Vec<_>>();
-        let market_values = self.features[t].values.clone();
         let tradable = self.features[t].tradable.clone();
-        let total_steps = self.features.len() - 1;
+        let market = self.features[t].clone();
+        let actions = self
+            .data
+            .corporate_actions_on(execution_date)
+            .cloned()
+            .collect::<Vec<_>>();
         let mut deaths = Vec::new();
-        let mut pending_events = Vec::new();
+        let mut pending = Vec::new();
         for agent in &mut self.agents {
             if !agent.state.alive {
                 continue;
             }
-            let allocations = agent.state.portfolio.allocations(&current_closes)?;
-            let obs = build_observation(&market_values, &agent.state, &allocations, total_steps);
-            let output = agent.policy.act(PolicyInput {
-                observation: &obs,
-                tradable: &tradable,
-                current_allocations: &allocations,
+            let allocations = agent.state.portfolio.allocations(&current_prices)?;
+            let observation = self.observation_builder.build(&ObservationContext {
+                market: &market,
+                portfolio: &agent.state.portfolio,
+                prices: &current_prices,
+                starting_net_worth: self.config.simulation.starting_cash,
+                maximum_net_worth: agent.state.maximum_net_worth,
+                age: agent.state.age,
+                episode_steps: self.features.len() - 1,
             })?;
-            if !output.valid {
-                pending_events.push(SimulationEvent::ActionFallback {
-                    agent_id: agent.state.id,
-                    date: observation_date,
-                });
-            }
-            let report = if output.rebalance {
-                self.execution.rebalance(
-                    &mut agent.state.portfolio,
-                    &output.allocations,
-                    &bars,
-                    &current_closes,
-                    self.config.simulation.minimum_trade_value,
-                )?
-            } else {
-                Default::default()
+            let proposal = match agent.policy.propose_action(
+                &observation,
+                &PolicyContext {
+                    tradable: &tradable,
+                    current_allocations: &allocations,
+                },
+            ) {
+                Ok(p) => p,
+                Err(_) => ProposedAllocation::rebalance(vec![f64::NAN; self.data.assets.len() + 1]),
             };
-            if report.invalid_action {
-                pending_events.push(SimulationEvent::ActionFallback {
+            let maximum_asset_allocation = agent
+                .state
+                .genome
+                .as_ref()
+                .map(|genome| genome.traits.maximum_allocation as f64)
+                .unwrap_or(self.config.brain.traits.maximum_allocation.initial as f64);
+            let validated = self.validator.validate(
+                proposal,
+                &ActionValidationContext {
+                    asset_count: self.data.assets.len(),
+                    tradable: &tradable,
+                    maximum_asset_allocation,
+                },
+            )?;
+            if validated.used_fallback() {
+                pending.push(DomainEvent::ActionFallback {
                     agent_id: agent.state.id,
                     date: observation_date,
                 });
             }
+            for action in &actions {
+                agent.state.portfolio.apply_corporate_action(action)?;
+                pending.push(DomainEvent::CorporateActionApplied {
+                    agent_id: agent.state.id,
+                    date: execution_date,
+                    action: action.clone(),
+                });
+            }
+            let plan = self.planner.plan(
+                &agent.state.portfolio,
+                &validated,
+                &ExecutionSnapshot {
+                    bars: &bars,
+                    valuation_prices: &current_prices,
+                },
+                self.config.simulation.minimum_trade_value,
+            )?;
+            let report = self.applier.apply(&mut agent.state.portfolio, &plan)?;
             for trade in report.trades {
-                pending_events.push(SimulationEvent::TradeExecuted {
+                pending.push(DomainEvent::TradeExecuted {
                     agent_id: agent.state.id,
                     date: execution_date,
                     trade,
-                })
+                });
             }
             for asset_id in report.rejected_assets {
-                pending_events.push(SimulationEvent::TradeRejected {
+                pending.push(DomainEvent::TradeRejected {
                     agent_id: agent.state.id,
                     date: execution_date,
                     asset_id,
-                })
+                });
             }
             let previous = agent.state.portfolio.net_worth;
             agent.state.portfolio.previous_net_worth = previous;
-            agent.state.portfolio.net_worth = agent.state.portfolio.value(&next_closes)?;
+            agent.state.portfolio.net_worth = agent.state.portfolio.value(&next_prices)?;
             agent
                 .state
                 .portfolio
@@ -340,7 +423,7 @@ impl SimulationEngine {
             };
             agent.state.age += 1;
             agent.state.maximum_net_worth = agent.state.maximum_net_worth.max(current);
-            pending_events.push(SimulationEvent::Valuation {
+            pending.push(DomainEvent::Valuation {
                 agent_id: agent.state.id,
                 date: execution_date,
                 net_worth: current,
@@ -350,7 +433,7 @@ impl SimulationEngine {
             if current <= self.config.simulation.bankruptcy_threshold {
                 agent.state.alive = false;
                 deaths.push(agent.state.id);
-                pending_events.push(SimulationEvent::AgentDied {
+                pending.push(DomainEvent::AgentDied {
                     agent_id: agent.state.id,
                     birth_date: agent.state.birth_date,
                     death_date: execution_date,
@@ -362,11 +445,11 @@ impl SimulationEngine {
                 });
             }
         }
-        for event in pending_events {
+        for event in pending {
             self.emit(event)
         }
         for id in deaths {
-            self.replace(id, execution_date)?
+            self.handle_death(id, execution_date)?
         }
         self.next_step += 1;
         if self.config.checkpoint.every_steps > 0
@@ -376,69 +459,89 @@ impl SimulationEngine {
         {
             let path = self.config.checkpoint.path.clone();
             self.save_checkpoint(&path)?;
-            self.emit(SimulationEvent::CheckpointSaved {
-                date: execution_date,
-                path,
-            });
         }
         Ok(())
     }
-    fn replace(&mut self, id: AgentId, date: NaiveDate) -> Result<()> {
-        let slot = self
-            .agents
-            .iter()
-            .position(|a| a.state.id == id)
-            .ok_or_else(|| MidasError::Accounting("dead agent missing".into()))?;
-        let new_id = AgentId(self.next_agent_id);
-        self.next_agent_id += 1;
-        let obs = self.features[0].values.len() + self.data.assets.len() * 2 + 5;
-        let genome = self.replacement.replacement_genome(
-            &self.config,
-            obs,
-            self.data.assets.len(),
-            new_id,
-        )?;
-        let policy = BurnActorCriticPolicy::new(genome.clone())?;
-        let state = AgentState {
-            id: new_id,
-            birth_date: date,
-            age: 0,
-            portfolio: Portfolio::new(self.config.simulation.starting_cash, self.data.assets.len()),
-            maximum_net_worth: self.config.simulation.starting_cash,
-            alive: true,
-            genome: Some(genome),
-        };
-        self.agents[slot] = Agent {
-            state,
-            policy: Box::new(policy),
-        };
-        self.emit(SimulationEvent::AgentBorn {
-            agent_id: new_id,
-            date,
-        });
-        Ok(())
+    fn handle_death(&mut self, id: AgentId, date: NaiveDate) -> Result<()> {
+        match self.config.simulation.death_handling {
+            DeathHandling::LeaveVacant => Ok(()),
+            DeathHandling::EndAgentOnly => {
+                self.agents.retain(|a| a.state.id != id);
+                Ok(())
+            }
+            DeathHandling::Replace => {
+                let slot = self
+                    .agents
+                    .iter()
+                    .position(|a| a.state.id == id)
+                    .ok_or_else(|| MidasError::Accounting("dead agent missing".into()))?;
+                let dead_state = self.agents[slot].state.clone();
+                let dead_policy = self.agents[slot].policy.policy_blueprint();
+                let living = self
+                    .agents
+                    .iter()
+                    .filter(|a| a.state.alive)
+                    .map(|a| LivingAgentSummary {
+                        id: a.state.id,
+                        net_worth: a.state.portfolio.net_worth,
+                        age: a.state.age,
+                        policy: a.policy.policy_blueprint(),
+                        genome: a.state.genome.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let new_id = AgentId(self.next_agent_id);
+                self.next_agent_id += 1;
+                let request = self.replacement.create_replacement(&ReplacementContext {
+                    dead_agent: &dead_state,
+                    dead_policy,
+                    living_population: &living,
+                    config: &self.config,
+                    architecture: &self.architecture,
+                    observation_schema: &self.observation_schema,
+                    deterministic_seed: self.config.simulation.seed
+                        ^ new_id.0.wrapping_mul(0x9e3779b97f4a7c15),
+                })?;
+                let agent = self.factory.spawn(
+                    request,
+                    &AgentBuildContext {
+                        agent_id: new_id,
+                        birth_date: date,
+                        config: &self.config,
+                        architecture: &self.architecture,
+                    },
+                )?;
+                self.agents[slot] = agent;
+                self.emit(DomainEvent::AgentBorn {
+                    agent_id: new_id,
+                    date,
+                });
+                Ok(())
+            }
+        }
     }
     fn valuation_prices(&self, date: NaiveDate) -> Vec<Option<f64>> {
         (0..self.data.assets.len())
             .map(|i| self.data.last_close(date, AssetId(i as u64)))
             .collect()
     }
-    fn emit(&mut self, event: SimulationEvent) {
+    fn emit(&mut self, event: DomainEvent) {
         self.metrics.on_event(&event);
         for sink in &mut self.event_sinks {
-            sink.on_event(&event);
+            sink.on_event(&event)
         }
-        self.events.push(event)
+        self.domain_events.push(event)
     }
-    pub fn save_checkpoint(&self, path: impl AsRef<Path>) -> Result<()> {
+    pub fn save_checkpoint(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let checkpoint = Checkpoint {
             version: CHECKPOINT_VERSION,
             config_hash: self.config.hash()?,
             dataset_identity: self.data.identity.clone(),
-            feature_schema_identity: self.feature_schema_identity.clone(),
+            observation_schema_hash: self.observation_schema.identity(self.data.assets.len())?,
+            architecture: self.architecture.clone(),
             split: self.split,
             next_step: self.next_step,
             next_agent_id: self.next_agent_id,
+            lifecycle: self.lifecycle,
             agents: self
                 .agents
                 .iter()
@@ -450,58 +553,109 @@ impl SimulationEngine {
                 })
                 .collect::<Result<_>>()?,
             metrics: self.metrics.clone(),
-            events: self.events.clone(),
+            domain_events: self.domain_events.clone(),
             accessed_through: self.features.get(self.next_step).map(|f| f.date),
         };
         if let Some(parent) = path.as_ref().parent() {
             fs::create_dir_all(parent)?
         }
-        fs::write(path, bincode::serialize(&checkpoint)?)?;
+        fs::write(path.as_ref(), bincode::serialize(&checkpoint)?)?;
+        let date = self
+            .features
+            .get(self.next_step)
+            .map(|f| f.date)
+            .unwrap_or_else(|| self.features.last().expect("features").date);
+        self.operational_events
+            .push(OperationalEvent::CheckpointSaved {
+                date,
+                path: path.as_ref().display().to_string(),
+            });
         Ok(())
     }
     pub fn resume(config: Config, mut data: MarketDataset, path: impl AsRef<Path>) -> Result<Self> {
-        let cp: Checkpoint = bincode::deserialize(&fs::read(path)?)?;
+        let bytes = fs::read(path)?;
+        let cp: Checkpoint = bincode::deserialize(&bytes).map_err(|_| {
+            MidasError::Checkpoint(format!(
+                "incompatible checkpoint; expected format version {CHECKPOINT_VERSION}"
+            ))
+        })?;
         if cp.version != CHECKPOINT_VERSION {
-            return Err(MidasError::Checkpoint("checkpoint version mismatch".into()));
+            return Err(MidasError::Checkpoint(format!(
+                "checkpoint version {} is incompatible with {CHECKPOINT_VERSION}",
+                cp.version
+            )));
         }
-        if cp.config_hash != config.hash()? || cp.dataset_identity != data.identity {
-            return Err(MidasError::Checkpoint(
-                "configuration or dataset identity mismatch".into(),
-            ));
+        if cp.dataset_identity != data.identity {
+            return Err(MidasError::Checkpoint("dataset identity mismatch".into()));
         }
         data.rebuild_index();
         let pipeline = BackwardFeaturePipeline::from_config(&config);
-        if cp.feature_schema_identity != pipeline.schema().identity()? {
-            return Err(MidasError::Checkpoint("feature schema mismatch".into()));
-        }
         let dates = data.split_dates(cp.split.range(&config));
         let features = pipeline.generate(&data, &dates)?;
+        let observation_schema = ObservationSchema::from_config(&config);
+        let schema_hash = observation_schema.identity(data.assets.len())?;
+        if cp.observation_schema_hash != schema_hash {
+            return Err(MidasError::Checkpoint("observation schema mismatch".into()));
+        }
+        if cp.config_hash != config.hash()? {
+            return Err(MidasError::Checkpoint("configuration mismatch".into()));
+        }
+        let architecture = BrainArchitecture::from_config(
+            &config.brain,
+            schema_hash,
+            observation_schema.dimension(data.assets.len()),
+            data.assets.len(),
+        );
+        if cp.architecture != architecture {
+            return Err(MidasError::Checkpoint("brain architecture mismatch".into()));
+        }
+        let observation_builder = SchemaObservationBuilder::new(
+            observation_schema.clone(),
+            config.features.features.clone(),
+            data.assets.len(),
+        )?;
+        let factory: Box<dyn AgentFactory> = Box::new(StandardAgentFactory::default());
+        let birth = features[0].date;
         let agents = cp
             .agents
             .into_iter()
             .map(|a| {
-                Ok(Agent {
-                    state: a.state,
-                    policy: restore_policy(a.policy)?,
-                })
+                factory.restore(
+                    a.state,
+                    a.policy,
+                    &AgentBuildContext {
+                        agent_id: AgentId(0),
+                        birth_date: birth,
+                        config: &config,
+                        architecture: &architecture,
+                    },
+                )
             })
             .collect::<Result<_>>()?;
+        let costs = CostExecutionEngine {
+            costs: config.execution.clone(),
+        };
         Ok(Self {
-            execution: Box::new(CostExecutionModel {
-                costs: config.execution.clone(),
-            }),
-            replacement: Box::new(NonEvolutionaryRandomGenomeReplacement),
-            event_sinks: Vec::new(),
             config,
             data,
             split: cp.split,
             features,
-            feature_schema_identity: cp.feature_schema_identity,
+            observation_schema,
+            observation_builder: Box::new(observation_builder),
+            architecture,
             agents,
+            planner: Box::new(costs.clone()),
+            applier: Box::new(costs),
+            validator: Box::new(LongOnlyActionValidator),
+            factory,
+            replacement: Box::new(NonEvolutionaryRandomGenomeReplacement),
             metrics: cp.metrics,
-            events: cp.events,
+            domain_events: cp.domain_events,
+            operational_events: Vec::new(),
+            event_sinks: Vec::new(),
             next_step: cp.next_step,
             next_agent_id: cp.next_agent_id,
+            lifecycle: cp.lifecycle,
         })
     }
     pub fn report(&self) -> SimulationReport {
@@ -518,93 +672,16 @@ impl SimulationEngine {
             births: self.metrics.births,
             invalid_actions: self.metrics.invalid_actions,
             dataset_identity: self.data.identity.clone(),
-            feature_schema_identity: self.feature_schema_identity.clone(),
+            observation_schema_identity: self
+                .observation_schema
+                .identity(self.data.assets.len())
+                .expect("serializable schema"),
             replacement_strategy: self.replacement.name().into(),
             learning_implementation: "no_learning".into(),
+            lifecycle: self.lifecycle,
         }
     }
 }
-
-fn observation_size(market: usize, assets: usize) -> usize {
-    market + assets * 2 + 5
-}
-fn build_observation(
-    market: &[f32],
-    state: &AgentState,
-    allocations: &[f64],
-    total_steps: usize,
-) -> Vec<f32> {
-    let mut o = market.to_vec();
-    o.push(allocations[0] as f32);
-    o.extend(allocations.iter().skip(1).map(|v| *v as f32));
-    o.extend(state.portfolio.positions.iter().map(|p| {
-        if p.average_entry_price > 0.0 {
-            ((p.quantity * p.average_entry_price) / state.portfolio.net_worth.max(1e-9))
-                .clamp(-10.0, 10.0) as f32
-        } else {
-            0.0
-        }
-    }));
-    o.push((state.portfolio.net_worth / state.maximum_net_worth.max(1e-9)).clamp(0.0, 1.0) as f32);
-    o.push(
-        (state.portfolio.net_worth / state.portfolio.previous_net_worth.max(1e-9) - 1.0)
-            .clamp(-10.0, 10.0) as f32,
-    );
-    o.push(
-        (state.portfolio.cumulative_turnover / state.portfolio.net_worth.max(1e-9)).clamp(0.0, 10.0)
-            as f32,
-    );
-    o.push((state.age as f64 / total_steps.max(1) as f64).clamp(0.0, 1.0) as f32);
-    o
-}
-fn new_policy(
-    c: &Config,
-    obs: usize,
-    id: AgentId,
-) -> Result<(Box<dyn Policy>, Option<BrainGenome>)> {
-    Ok(match c.brain.policy {
-        PolicyKind::Cash => (Box::new(CashPolicy), None),
-        PolicyKind::Random => (Box::new(RandomPolicy::new(c.simulation.seed ^ id.0)), None),
-        PolicyKind::EqualWeight => (Box::new(EqualWeightPolicy), None),
-        PolicyKind::BuyAndHold => {
-            let target = c
-                .market
-                .assets
-                .iter()
-                .position(|a| a == &c.market.benchmark_asset)
-                .ok_or_else(|| MidasError::Config("benchmark asset missing".into()))?;
-            (Box::new(BuyAndHoldPolicy::new(target)), None)
-        }
-        PolicyKind::BurnActorCritic => {
-            let g = BrainGenome::random(
-                &c.brain,
-                obs,
-                c.market.assets.len(),
-                c.simulation.seed ^ id.0,
-            )?;
-            (Box::new(BurnActorCriticPolicy::new(g.clone())?), Some(g))
-        }
-    })
-}
-fn restore_policy(s: PolicySnapshot) -> Result<Box<dyn Policy>> {
-    Ok(match s {
-        PolicySnapshot::Cash => Box::new(CashPolicy),
-        PolicySnapshot::Random { rng } => Box::new(RandomPolicy { rng }),
-        PolicySnapshot::EqualWeight => Box::new(EqualWeightPolicy),
-        PolicySnapshot::BuyAndHold {
-            initialized,
-            target_asset,
-        } => Box::new(BuyAndHoldPolicy {
-            initialized,
-            target_asset,
-        }),
-        PolicySnapshot::Burn { genome, lifetime } => Box::new(BurnActorCriticPolicy {
-            genome,
-            lifetime: *lifetime,
-        }),
-    })
-}
-
 #[derive(Clone, Debug, Serialize)]
 pub struct SimulationReport {
     pub split: DatasetSplit,
@@ -614,7 +691,8 @@ pub struct SimulationReport {
     pub births: u64,
     pub invalid_actions: u64,
     pub dataset_identity: String,
-    pub feature_schema_identity: String,
+    pub observation_schema_identity: String,
     pub replacement_strategy: String,
     pub learning_implementation: String,
+    pub lifecycle: SimulationLifecycle,
 }

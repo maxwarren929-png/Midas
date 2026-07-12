@@ -24,6 +24,7 @@ daily_survival_cost = 2.0
 minimum_trade_value = 1.0
 seed = 42
 forced_liquidation = false
+death_handling = "replace"
 
 [execution]
 commission_fixed = 0.0
@@ -36,13 +37,70 @@ schema_version = 1
 features = ["return1", "return5", "return20", "price_to_ma20", "price_to_ma50", "volatility20", "volume_change", "volume_to_ma20", "distance_high20", "tradable"]
 clip = 10.0
 
+[observation]
+version = 2
+features = ["market", "cash_allocation", "asset_allocation", "unrealized_return", "net_worth_to_starting", "current_drawdown", "portfolio_return1", "turnover_to_net_worth", "normalized_age"]
+
+[corporate_actions]
+mode = "reject"
+discontinuity_threshold = 0.35
+adjusted_price_tolerance = 0.000001
+
 [brain]
 architecture_version = 1
 hidden_layers = [32, 16]
 memory_size = 8
-maximum_allocation = 0.5
 activation = "gelu"
 policy = "burn_actor_critic"
+
+[brain.traits.learning_rate]
+initial = 0.0003
+minimum = 0.00001
+maximum = 0.01
+mutation_scale = 0.0
+evolvable = false
+
+[brain.traits.entropy_coefficient]
+initial = 0.01
+minimum = 0.0
+maximum = 0.1
+mutation_scale = 0.0
+evolvable = false
+
+[brain.traits.action_temperature]
+initial = 1.0
+minimum = 0.1
+maximum = 3.0
+mutation_scale = 0.0
+evolvable = false
+
+[brain.traits.temperature_decay]
+initial = 0.999
+minimum = 0.9
+maximum = 1.0
+mutation_scale = 0.0
+evolvable = false
+
+[brain.traits.drawdown_sensitivity]
+initial = 0.1
+minimum = 0.0
+maximum = 2.0
+mutation_scale = 0.0
+evolvable = false
+
+[brain.traits.turnover_sensitivity]
+initial = 0.01
+minimum = 0.0
+maximum = 1.0
+mutation_scale = 0.0
+evolvable = false
+
+[brain.traits.maximum_allocation]
+initial = 0.5
+minimum = 0.01
+maximum = 1.0
+mutation_scale = 0.0
+evolvable = false
 
 [learning]
 implementation = "no_learning"

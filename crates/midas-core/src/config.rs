@@ -12,6 +12,10 @@ pub struct Config {
     pub simulation: SimulationConfig,
     pub execution: ExecutionConfig,
     pub features: FeatureConfig,
+    #[serde(default)]
+    pub observation: ObservationConfig,
+    #[serde(default)]
+    pub corporate_actions: CorporateActionConfig,
     pub brain: BrainConfig,
     pub learning: LearningConfig,
     pub backend: BackendConfig,
@@ -33,6 +37,8 @@ pub struct DataConfig {
     pub path: String,
     #[serde(default)]
     pub format: DataFormat,
+    #[serde(default)]
+    pub corporate_actions_path: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -69,6 +75,8 @@ pub struct SimulationConfig {
     pub seed: u64,
     #[serde(default)]
     pub forced_liquidation: bool,
+    #[serde(default)]
+    pub death_handling: DeathHandling,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -109,11 +117,12 @@ pub struct BrainConfig {
     pub architecture_version: u32,
     pub hidden_layers: Vec<usize>,
     pub memory_size: usize,
-    pub maximum_allocation: f64,
     #[serde(default = "default_activation")]
     pub activation: Activation,
     #[serde(default = "default_policy")]
     pub policy: PolicyKind,
+    #[serde(default)]
+    pub traits: EvolvableTraitsConfig,
 }
 fn default_activation() -> Activation {
     Activation::Gelu
@@ -138,6 +147,142 @@ pub enum PolicyKind {
     EqualWeight,
     BuyAndHold,
     BurnActorCritic,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeathHandling {
+    #[default]
+    Replace,
+    LeaveVacant,
+    EndAgentOnly,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvolvableTraitConfig {
+    pub initial: f32,
+    pub minimum: f32,
+    pub maximum: f32,
+    pub mutation_scale: f32,
+    pub evolvable: bool,
+}
+
+impl EvolvableTraitConfig {
+    fn validate(&self, name: &str) -> Result<()> {
+        if !self.initial.is_finite()
+            || !self.minimum.is_finite()
+            || !self.maximum.is_finite()
+            || !self.mutation_scale.is_finite()
+            || self.minimum > self.initial
+            || self.initial > self.maximum
+            || self.mutation_scale < 0.0
+        {
+            return Err(MidasError::Config(format!(
+                "invalid evolvable trait {name}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvolvableTraitsConfig {
+    pub learning_rate: EvolvableTraitConfig,
+    pub entropy_coefficient: EvolvableTraitConfig,
+    pub action_temperature: EvolvableTraitConfig,
+    pub temperature_decay: EvolvableTraitConfig,
+    pub drawdown_sensitivity: EvolvableTraitConfig,
+    pub turnover_sensitivity: EvolvableTraitConfig,
+    pub maximum_allocation: EvolvableTraitConfig,
+}
+
+impl Default for EvolvableTraitsConfig {
+    fn default() -> Self {
+        let fixed = |initial, minimum, maximum| EvolvableTraitConfig {
+            initial,
+            minimum,
+            maximum,
+            mutation_scale: 0.0,
+            evolvable: false,
+        };
+        Self {
+            learning_rate: fixed(0.0003, 0.00001, 0.01),
+            entropy_coefficient: fixed(0.01, 0.0, 0.1),
+            action_temperature: fixed(1.0, 0.1, 3.0),
+            temperature_decay: fixed(0.999, 0.9, 1.0),
+            drawdown_sensitivity: fixed(0.1, 0.0, 2.0),
+            turnover_sensitivity: fixed(0.01, 0.0, 1.0),
+            maximum_allocation: fixed(0.5, 0.01, 1.0),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationFeatureKind {
+    Market,
+    CashAllocation,
+    AssetAllocation,
+    UnrealizedReturn,
+    NetWorthToStarting,
+    CurrentDrawdown,
+    PortfolioReturn1,
+    TurnoverToNetWorth,
+    NormalizedAge,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationConfig {
+    pub version: u32,
+    pub features: Vec<ObservationFeatureKind>,
+}
+
+impl Default for ObservationConfig {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            features: vec![
+                ObservationFeatureKind::Market,
+                ObservationFeatureKind::CashAllocation,
+                ObservationFeatureKind::AssetAllocation,
+                ObservationFeatureKind::UnrealizedReturn,
+                ObservationFeatureKind::NetWorthToStarting,
+                ObservationFeatureKind::CurrentDrawdown,
+                ObservationFeatureKind::PortfolioReturn1,
+                ObservationFeatureKind::TurnoverToNetWorth,
+                ObservationFeatureKind::NormalizedAge,
+            ],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CorporateActionMode {
+    #[default]
+    Reject,
+    ExplicitEvents,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CorporateActionConfig {
+    pub mode: CorporateActionMode,
+    pub discontinuity_threshold: f64,
+    pub adjusted_price_tolerance: f64,
+}
+
+impl Default for CorporateActionConfig {
+    fn default() -> Self {
+        Self {
+            mode: CorporateActionMode::Reject,
+            discontinuity_threshold: 0.35,
+            adjusted_price_tolerance: 1e-6,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -242,6 +387,15 @@ impl Config {
         if self.simulation.starting_cash <= self.simulation.bankruptcy_threshold {
             return bad("starting_cash must exceed bankruptcy_threshold");
         }
+        if self.execution.spread_rate >= 2.0 {
+            return bad("spread_rate must be less than 2");
+        }
+        if self.execution.slippage_rate >= 1.0 {
+            return bad("slippage_rate must be less than 1");
+        }
+        if self.execution.spread_rate / 2.0 + self.execution.slippage_rate >= 1.0 {
+            return bad("spread_rate / 2 + slippage_rate must be less than 1");
+        }
         if self.features.schema_version == 0
             || self.features.features.is_empty()
             || !self.features.clip.is_finite()
@@ -256,10 +410,41 @@ impl Config {
         {
             return bad("brain architecture dimensions must be positive");
         }
-        if !(0.0..=1.0).contains(&self.brain.maximum_allocation)
-            || self.brain.maximum_allocation == 0.0
+        for (name, value) in [
+            ("learning_rate", &self.brain.traits.learning_rate),
+            (
+                "entropy_coefficient",
+                &self.brain.traits.entropy_coefficient,
+            ),
+            ("action_temperature", &self.brain.traits.action_temperature),
+            ("temperature_decay", &self.brain.traits.temperature_decay),
+            (
+                "drawdown_sensitivity",
+                &self.brain.traits.drawdown_sensitivity,
+            ),
+            (
+                "turnover_sensitivity",
+                &self.brain.traits.turnover_sensitivity,
+            ),
+            ("maximum_allocation", &self.brain.traits.maximum_allocation),
+        ] {
+            value.validate(name)?;
+        }
+        if self.brain.traits.maximum_allocation.minimum <= 0.0
+            || self.brain.traits.maximum_allocation.maximum > 1.0
         {
-            return bad("maximum_allocation must be in (0, 1]");
+            return bad("maximum allocation trait bounds must be within (0, 1]");
+        }
+        if self.observation.version == 0 || self.observation.features.is_empty() {
+            return bad("observation schema version and features must be non-empty");
+        }
+        if self.corporate_actions.discontinuity_threshold <= 0.0
+            || self.corporate_actions.discontinuity_threshold >= 1.0
+            || !self.corporate_actions.discontinuity_threshold.is_finite()
+            || self.corporate_actions.adjusted_price_tolerance < 0.0
+            || !self.corporate_actions.adjusted_price_tolerance.is_finite()
+        {
+            return bad("corporate action thresholds are invalid");
         }
         for range in [
             &self.splits.training,
@@ -277,6 +462,28 @@ impl Config {
         }
         if self.learning.implementation != LearningKind::NoLearning {
             return bad("Prompt 1 supports only explicit no_learning");
+        }
+        if !self.learning.learning_rate.is_finite()
+            || self.learning.learning_rate <= 0.0
+            || !self.learning.gamma.is_finite()
+            || !(0.0..=1.0).contains(&self.learning.gamma)
+            || !self.learning.gae_lambda.is_finite()
+            || !(0.0..=1.0).contains(&self.learning.gae_lambda)
+            || !self.learning.ppo_clip.is_finite()
+            || self.learning.ppo_clip < 0.0
+            || !self.learning.critic_coefficient.is_finite()
+            || self.learning.critic_coefficient < 0.0
+            || !self.learning.entropy_coefficient.is_finite()
+            || self.learning.entropy_coefficient < 0.0
+            || !self.learning.gradient_clip.is_finite()
+            || self.learning.gradient_clip <= 0.0
+            || self.learning.rollout_length == 0
+            || self.learning.optimisation_epochs == 0
+        {
+            return bad("learning configuration values are invalid");
+        }
+        if self.backend.device.trim().is_empty() {
+            return bad("backend.device must not be empty");
         }
         Ok(())
     }

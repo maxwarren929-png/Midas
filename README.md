@@ -21,9 +21,13 @@ cargo run -p midas-cli -- resume --config configs/test.toml --checkpoint checkpo
 
 ## Timing and data contract
 
-Data uses a long-form canonical schema: `date, asset, open, high, low, close, adjusted_close, volume`. CSV and Parquet are loaded through Polars. Execution uses unadjusted prices; backward-looking return features use adjusted close. At close on day `t`, a policy sees features and availability known through `t`; its target allocation is executed at open on `t+1`. Missing `t+1` bars reject that asset's order. Holdings in unavailable assets use the latest known close for valuation.
+Data uses a long-form canonical schema: `date, asset, open, high, low, close, adjusted_close, volume`. CSV and Parquet are loaded through Polars. `adjusted_close` must equal raw close within the configured tolerance; arbitrary provider back-adjustment is rejected and never used for features. In `reject` corporate-action mode, declared actions and likely undeclared discontinuities are fatal. In `explicit_events` mode, canonical split and cash-dividend records may be supplied separately. Splits adjust quantities and entry prices before next-open execution, and features build a forward-only point-in-time split series without rewriting prior observations.
 
-Feature rows are calculated from current and earlier bars only. Configuration splits are chronological and non-overlapping. The feature schema has a version and identity hash; checkpoint compatibility includes this identity, the dataset content identity, configuration hash, and checkpoint version.
+An optional `data.corporate_actions_path` CSV uses `date,asset,kind,value`, where `kind` is `split` or `cash_dividend`. Split `value` is the positive new-shares-per-old-share ratio; dividend `value` is non-negative cash per share.
+
+At close on day `t`, a policy sees features and availability known through `t`; its proposal is validated centrally and executes at open on `t+1`. Missing `t+1` bars reject that asset's order. Holdings in unavailable assets use the latest known close for valuation.
+
+Feature rows are calculated from current and earlier bars only. A complete versioned observation schema orders market, portfolio, and agent-state features and derives the neural input dimension. Its stable hash is part of `BrainArchitecture` and checkpoint compatibility. Checkpoint format version 2 rejects older layouts explicitly.
 
 ## Architecture
 
@@ -31,13 +35,16 @@ Feature rows are calculated from current and earlier bars only. Configuration sp
 
 - `MarketDataSource`: load a canonical `MarketDataset`.
 - `FeaturePipeline`: publish a versioned schema and legal feature rows.
-- `Policy`: consume a fixed observation and return target allocations.
-- `ExecutionModel`: apply allocation targets and return transparent trades/rejections.
-- `EventSink`: consume typed immutable simulation events.
-- `ReplacementStrategy`: supply a replacement genome without owning market logic.
+- `Policy`: consume a typed observation and emit an untrusted `ProposedAllocation`.
+- `ActionValidator`: authoritatively mask, normalise, cap, or fall back before execution.
+- `ExecutionPlanner` and `ExecutionApplier`: create an immutable cost-aware proportional plan, then apply it atomically.
+- `NeuralModel` and `NeuralModelFactory`: isolate Burn from policy and simulation interfaces.
+- `AgentFactory`: build both initial and replacement agents from `AgentSpawnRequest`.
+- `ReplacementStrategy`: use read-only replacement context to choose a policy blueprint and optional genome.
+- `EventSink`: consume deterministic `DomainEvent` values; operational events are separate.
 - `LearningStrategy`: lifetime-learning boundary; Prompt 1 provides only `NoLearning`.
 
-The stable `BrainGenome` stores explicit matrix shapes, values, bounded traits, and format/architecture versions. `LifetimeBrain` owns a copy plus recurrent memory and counters. Burn is used for inference behind `Policy`; serialisation does not rely on Burn's private record format.
+The stable `BrainGenome` stores explicit matrix shapes, values, configured bounded traits, and complete architecture metadata. `LifetimeBrain` owns a copy plus recurrent memory and counters. Burn implements `NeuralModel`; serialisation and simulation interfaces do not expose Burn tensor types.
 
 See [Extending Midas](docs/EXTENDING.md) for subsystem-specific extension steps and [Implementation Status](IMPLEMENTATION_STATUS.md) for the exact Prompt 1 boundary.
 

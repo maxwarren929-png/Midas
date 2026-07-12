@@ -1,9 +1,9 @@
-use crate::{AgentId, execution::Trade, simulation::SimulationEvent};
+use crate::{AgentId, execution::PlannedTrade, simulation::DomainEvent};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub trait EventSink: Send {
-    fn on_event(&mut self, event: &SimulationEvent);
+    fn on_event(&mut self, event: &DomainEvent);
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -28,13 +28,13 @@ pub struct MetricsCollector {
     pub births: u64,
 }
 impl EventSink for MetricsCollector {
-    fn on_event(&mut self, event: &SimulationEvent) {
+    fn on_event(&mut self, event: &DomainEvent) {
         match event {
-            SimulationEvent::AgentBorn { agent_id, .. } => {
+            DomainEvent::AgentBorn { agent_id, .. } => {
                 self.births += 1;
                 self.agents.entry(*agent_id).or_default();
             }
-            SimulationEvent::Valuation {
+            DomainEvent::Valuation {
                 agent_id,
                 net_worth,
                 previous,
@@ -49,12 +49,12 @@ impl EventSink for MetricsCollector {
                 });
                 m.survival_days += 1;
             }
-            SimulationEvent::TradeExecuted {
+            DomainEvent::TradeExecuted {
                 agent_id, trade, ..
             } => add_trade(self.agents.entry(*agent_id).or_default(), trade),
-            SimulationEvent::ActionFallback { .. } => self.invalid_actions += 1,
-            SimulationEvent::TradeRejected { .. } => self.rejected_trades += 1,
-            SimulationEvent::AgentDied { agent_id, .. } => {
+            DomainEvent::ActionFallback { .. } => self.invalid_actions += 1,
+            DomainEvent::TradeRejected { .. } => self.rejected_trades += 1,
+            DomainEvent::AgentDied { agent_id, .. } => {
                 self.deaths += 1;
                 self.agents.entry(*agent_id).or_default().bankrupt = true
             }
@@ -62,7 +62,7 @@ impl EventSink for MetricsCollector {
         }
     }
 }
-fn add_trade(m: &mut AgentMetrics, t: &Trade) {
+fn add_trade(m: &mut AgentMetrics, t: &PlannedTrade) {
     m.trades += 1;
     m.turnover += t.notional;
     m.commission += t.commission;

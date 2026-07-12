@@ -6,17 +6,18 @@
 - Strict typed TOML with unknown-field rejection, bounded numeric validation, derived dimensions, and chronological non-overlapping splits.
 - Strong `AssetId`, `AgentId`, and `ExperimentId` types.
 - Polars CSV/Parquet ingestion into validated long-form `MarketBar` data, union trading calendar, latest-close fallback, and content identity.
-- Versioned configurable backward-only feature pipeline with leakage tests.
-- Close `t` observation to open `t+1` execution, long-only allocations, cash fallback, next-day unavailable-order rejection, fractional shares, sells-before-buys, and proportional cash limiting.
+- Explicit corporate-action modes, provider-adjustment rejection, discontinuity detection, tested split accounting, and forward-only point-in-time split features.
+- Versioned schema-driven observations with stable hashes, configured ordering and dimensions, and correct unrealised-return features.
+- Close `t` observation to open `t+1` execution, authoritative shared action validation, long-only masking/capping/fallback, and immutable cost-aware proportional execution planning.
 - Independent portfolios; commission, spread, slippage, turnover, minimum trade, survival liabilities, close valuation, bankruptcy, death, and replacement events.
 - Typed events and event-driven performance metrics including return, annualisation, volatility, drawdown, Sharpe-like and Sortino-like values, turnover, costs, trades, survival, and bankruptcy.
-- Policy, data-source, feature, execution, event-sink, learning, and replacement traits.
+- Policy, neural-model/factory, agent-factory, action-validator, data-source, feature, observation-builder, execution-planner/applier, event-sink, learning, and replacement traits.
 - Cash, seeded-random, equal-weight, and configured-benchmark buy-and-hold policies.
-- Configurable Burn CPU actor-critic inference with runtime-derived input/output sizes, configurable dense layout and activation, deterministic masking/capping, persistent recurrent memory, stable genome matrices, and separate lifetime state.
+- Burn CPU actor-critic inference behind framework-neutral neural interfaces, persistent recurrent memory, configured evolvable-trait bounds, stable genome matrices, and complete architecture/schema validation.
 - Explicit `NoLearning` and explicitly non-evolutionary random-genome replacement.
-- Versioned deterministic checkpoints with configuration, dataset, feature-schema, policies/genomes/lifetime memory, portfolios, metrics, events, counters, and accessed-through date.
+- Checkpoint format v2 with lifecycle, complete observation schema and architecture, policies/genomes/lifetime memory, portfolios, metrics, deterministic domain events, counters, and accessed-through date. Operational events are deliberately excluded.
 - CLI validation, inspection, simulation, resume, and benchmark commands plus offline synthetic data.
-- Unit, integration, property, leakage, Parquet, timing, portfolio-isolation, Burn determinism/memory, and checkpoint-resume tests.
+- Twenty-five focused regressions covering all seven repaired findings, CSV/Parquet, property invariants, mock and Burn neural models, replacement consistency, lifecycle idempotence, and checkpoint-resume domain-event equivalence.
 
 ## Known Prompt 1 limitations
 
@@ -27,6 +28,7 @@
 - Detailed event persistence is in-memory; additional sinks can implement durable output.
 - The synthetic dataset is intentionally small and does not meet the recommended research demonstration universe or eliminate survivorship bias.
 - Agent inference is deterministic and independent but currently sequential; stable indexed parallel inference is reserved as a performance extension.
+- Explicit corporate actions currently support splits and cash dividends supplied through a separate CSV; embedded provider-specific action encodings are not inferred.
 
 ## Reserved exactly for Prompt 2
 

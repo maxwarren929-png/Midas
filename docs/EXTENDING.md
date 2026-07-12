@@ -1,33 +1,33 @@
 # Extending Midas
 
-## Data sources
+## Market data and corporate actions
 
-Implement `MarketDataSource` and return `MarketDataset::new`. Provider parsing stays outside the engine; canonical validation, typed asset IDs, ordering, and identity hashing remain centralized. Add malformed-input and identity tests.
+Implement `MarketDataSource` and construct `MarketDataset` through validated constructors. Provider-adjusted history is not accepted as point-in-time data. New corporate actions belong in the canonical `CorporateAction` enum and need an explicit timeline rule, portfolio accounting test, and future-safety test.
 
-## Feature pipelines
+## Features and observations
 
-Implement `FeaturePipeline`, publish a new schema version whenever ordering or meaning changes, and derive vector size from the schema. Each row must be reproducible from data no later than its observation date. Add an extreme-future-value leakage test and document adjusted-price use.
+`FeaturePipeline` produces market-only rows. `ObservationSchema` expands configured market, portfolio, and agent-state specifications, owns ordering and dimensions, and is hashed with the asset count. Add new values in `SchemaObservationBuilder`; never append positional fields in the engine. Any semantic or ordering change requires a schema-version increment.
 
-## Policies and brains
+## Actions and policies
 
-Implement `Policy::act` and `Policy::snapshot`. Outputs contain cash plus one allocation per runtime asset. The execution layer remains authoritative. Stable brain changes require new genome and architecture versions plus explicit checkpoint compatibility handling.
+Policies implement `propose_action`, snapshot/reset state, and return a `PolicyBlueprint`. Proposals are untrusted. `ActionValidator` is the only authority for length, finiteness, long-only rules, masking, normalisation, fallback, and concentration. Execution accepts only `ValidatedAllocation`.
 
-## Execution models
+## Neural implementations
 
-Implement `ExecutionModel::rebalance` without querying future market state. Preserve sells-before-buys, non-negative cash and quantities, minimum-trade handling, unavailable-asset rejection, and separate cost fields. Add accounting and monotonic-cost property tests.
+Implement `NeuralModel` and `NeuralModelFactory`. A model owns recurrent state and maps `NeuralInput` to logits/value. Burn is one adapter. Stable snapshots use `NeuralModelState`; adding another serialisable implementation requires a distinct state kind and checkpoint tests. The simulation engine must remain free of ML-framework types.
 
-## Events and metrics
+## Agent construction and replacement
 
-Add immutable variants to `SimulationEvent`. Metrics implement `EventSink` and must derive results only from events. A new sink can stream JSON, persist records, or aggregate diagnostics without modifying the daily loop.
+Both initial population and death replacement use `AgentFactory::spawn`. A replacement strategy receives `ReplacementContext` with dead state and blueprint, living summaries, configuration, architecture, observation schema, and deterministic seed material. It returns `AgentSpawnRequest`; it must not construct a policy. Prompt 1 preserves benchmark blueprints and randomises only neural genomes. Parent selection and reproduction remain deferred.
 
-## Replacement
+## Execution
 
-Implement `ReplacementStrategy`. Prompt 1's strategy is deliberately named `NonEvolutionaryRandomGenomeReplacement`: it has no selection, parents, crossover, mutation, ancestry, or reproductive fitness. Prompt 2 should add those concepts behind this boundary and add stable RNG state to checkpoints for any stateful strategy.
+`ExecutionPlanner` computes sells, eligible buys, full fixed/variable costs, a common affordability scale, and convergent minimum-trade filtering without mutating a portfolio. `ExecutionApplier` independently validates economics and applies the immutable plan atomically. Add permutation tests for any new cost model.
+
+## Events and checkpoints
+
+`DomainEvent` is deterministic and checkpointed. `OperationalEvent` records effects such as successful checkpoint writes and is not part of simulation equivalence. `SimulationLifecycle` makes completion idempotent. Checkpoint format or schema changes require a version bump and explicit rejection of incompatible files.
 
 ## Learning
 
-Implement `LearningStrategy` only when rollout and update semantics are complete. Prompt 1 uses `NoLearning`; it is never called PPO. PPO will require typed transitions, rollout ownership, GAE, clipped actor loss, critic loss, entropy, AdamW state, gradient validation/rollback, terminal handling, and checkpointed optimiser/RNG/buffer state.
-
-## Configuration and CLI
-
-Add typed enums and `deny_unknown_fields` configuration structures, validate before I/O, and route CLI construction through a factory. Do not branch inside the simulation timeline for provider- or model-specific behavior.
+Prompt 1 uses `NoLearning`; it is not PPO. Prompt 2 may add rollout ownership, GAE, clipped losses, optimiser state, gradient validation/rollback, terminal handling, and checkpointed learning RNG through the existing policy/model boundary.

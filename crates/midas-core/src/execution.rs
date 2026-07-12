@@ -1,13 +1,16 @@
-use crate::{AssetId, MidasError, Result, config::ExecutionConfig, market::MarketBar};
+use crate::{
+    AssetId, MidasError, Result,
+    action::ValidatedAllocation,
+    config::ExecutionConfig,
+    market::{CorporateAction, MarketBar},
+};
 use serde::{Deserialize, Serialize};
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Position {
     pub asset_id: AssetId,
     pub quantity: f64,
     pub average_entry_price: f64,
 }
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Portfolio {
     pub cash: f64,
@@ -42,22 +45,22 @@ impl Portfolio {
             cumulative_survival_cost: 0.0,
         }
     }
-    pub fn value(&self, closes: &[Option<f64>]) -> Result<f64> {
+    pub fn value(&self, prices: &[Option<f64>]) -> Result<f64> {
+        if prices.len() != self.positions.len() {
+            return Err(MidasError::Accounting(
+                "valuation price length mismatch".into(),
+            ));
+        }
         let mut total = self.cash - self.liabilities;
-        for (p, price) in self.positions.iter().zip(closes) {
+        for (p, price) in self.positions.iter().zip(prices) {
             if p.quantity < 0.0 || !p.quantity.is_finite() {
-                return Err(MidasError::Accounting(
-                    "negative or non-finite holding".into(),
-                ));
+                return Err(MidasError::Accounting("invalid holding".into()));
             }
             if p.quantity > 0.0 {
                 total += p.quantity
                     * price.ok_or_else(|| {
-                        MidasError::Accounting(format!(
-                            "no historical valuation for asset {}",
-                            p.asset_id
-                        ))
-                    })?
+                        MidasError::Accounting(format!("no valuation for asset {}", p.asset_id))
+                    })?;
             }
         }
         if !total.is_finite() {
@@ -74,18 +77,18 @@ impl Portfolio {
                 .map(|(p, v)| p.quantity * v.unwrap_or(0.0))
                 .sum::<f64>();
         if gross <= 0.0 {
-            return Ok(std::iter::once(1.0)
-                .chain(std::iter::repeat_n(0.0, self.positions.len()))
-                .collect());
+            let mut w = vec![0.0; self.positions.len() + 1];
+            w[0] = 1.0;
+            return Ok(w);
         }
-        let mut a = vec![self.cash / gross];
-        a.extend(
+        let mut w = vec![self.cash / gross];
+        w.extend(
             self.positions
                 .iter()
                 .zip(prices)
                 .map(|(p, v)| p.quantity * v.unwrap_or(0.0) / gross),
         );
-        Ok(a)
+        Ok(w)
     }
     pub fn apply_survival_cost(&mut self, cost: f64) {
         let paid = self.cash.min(cost);
@@ -94,31 +97,62 @@ impl Portfolio {
         self.cumulative_survival_cost += cost;
         self.net_worth -= cost;
     }
-    pub fn check(&self) -> Result<()> {
-        if !self.cash.is_finite() || self.cash < -1e-8 {
-            return Err(MidasError::Accounting(format!(
-                "cash invariant failed: {}",
-                self.cash
-            )));
+    pub fn apply_corporate_action(&mut self, action: &CorporateAction) -> Result<()> {
+        match action {
+            CorporateAction::Split {
+                asset_id, ratio, ..
+            } => {
+                if !ratio.is_finite() || *ratio <= 0.0 {
+                    return Err(MidasError::Accounting("invalid split ratio".into()));
+                }
+                let p = &mut self.positions[asset_id.0 as usize];
+                p.quantity *= ratio;
+                if p.average_entry_price > 0.0 {
+                    p.average_entry_price /= ratio;
+                }
+            }
+            CorporateAction::CashDividend {
+                asset_id,
+                amount_per_share,
+                ..
+            } => {
+                if !amount_per_share.is_finite() || *amount_per_share < 0.0 {
+                    return Err(MidasError::Accounting("invalid dividend".into()));
+                }
+                self.cash += self.positions[asset_id.0 as usize].quantity * amount_per_share;
+            }
         }
-        if self
-            .positions
-            .iter()
-            .any(|p| p.quantity < -1e-10 || !p.quantity.is_finite())
+        self.check()
+    }
+    pub fn check(&self) -> Result<()> {
+        if !self.cash.is_finite()
+            || self.cash < -1e-8
+            || !self.liabilities.is_finite()
+            || self.liabilities < 0.0
+            || self.positions.iter().any(|p| {
+                p.quantity < -1e-10
+                    || !p.quantity.is_finite()
+                    || !p.average_entry_price.is_finite()
+                    || p.average_entry_price < 0.0
+            })
         {
-            return Err(MidasError::Accounting("holding invariant failed".into()));
+            return Err(MidasError::Accounting("portfolio invariant failed".into()));
         }
         Ok(())
     }
 }
-
+#[derive(Clone, Debug)]
+pub struct ExecutionSnapshot<'a> {
+    pub bars: &'a [Option<&'a MarketBar>],
+    pub valuation_prices: &'a [Option<f64>],
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum TradeSide {
     Buy,
     Sell,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct Trade {
+pub struct PlannedTrade {
     pub asset_id: AssetId,
     pub side: TradeSide,
     pub quantity: f64,
@@ -130,199 +164,250 @@ pub struct Trade {
     pub notional: f64,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-pub struct ExecutionReport {
-    pub trades: Vec<Trade>,
+pub struct ExecutionPlan {
+    pub trades: Vec<PlannedTrade>,
     pub rejected_assets: Vec<AssetId>,
-    pub invalid_action: bool,
+    pub affordability_scale: f64,
 }
-
-pub trait ExecutionModel: Send + Sync {
-    fn rebalance(
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ExecutionReport {
+    pub trades: Vec<PlannedTrade>,
+    pub rejected_assets: Vec<AssetId>,
+}
+pub trait ExecutionPlanner: Send + Sync {
+    fn plan(
         &self,
-        portfolio: &mut Portfolio,
-        target: &[f64],
-        open_bars: &[Option<&MarketBar>],
-        valuation_prices: &[Option<f64>],
+        portfolio: &Portfolio,
+        action: &ValidatedAllocation,
+        market: &ExecutionSnapshot<'_>,
         minimum_trade: f64,
-    ) -> Result<ExecutionReport>;
+    ) -> Result<ExecutionPlan>;
 }
-
+pub trait ExecutionApplier: Send + Sync {
+    fn apply(&self, portfolio: &mut Portfolio, plan: &ExecutionPlan) -> Result<ExecutionReport>;
+}
 #[derive(Clone)]
-pub struct CostExecutionModel {
+pub struct CostExecutionEngine {
     pub costs: ExecutionConfig,
 }
-impl CostExecutionModel {
-    fn execute_sell(
-        &self,
-        p: &mut Portfolio,
-        i: usize,
-        value: f64,
-        bar: &MarketBar,
-        report: &mut ExecutionReport,
-    ) {
-        let qty = (value / bar.open).min(p.positions[i].quantity);
-        if qty <= 0.0 {
-            return;
+impl CostExecutionEngine {
+    fn validate_costs(&self) -> Result<()> {
+        let c = &self.costs;
+        if !c.commission_fixed.is_finite()
+            || c.commission_fixed < 0.0
+            || !c.commission_rate.is_finite()
+            || c.commission_rate < 0.0
+            || !c.spread_rate.is_finite()
+            || c.spread_rate < 0.0
+            || c.spread_rate >= 2.0
+            || !c.slippage_rate.is_finite()
+            || c.slippage_rate < 0.0
+            || c.slippage_rate >= 1.0
+            || c.spread_rate / 2.0 + c.slippage_rate >= 1.0
+        {
+            return Err(MidasError::Config(
+                "execution costs cannot produce positive finite prices".into(),
+            ));
         }
-        let half = self.costs.spread_rate / 2.0;
-        let price = bar.open * (1.0 - half - self.costs.slippage_rate);
-        let proceeds = qty * price;
-        let commission = (self.costs.commission_fixed
-            + self.costs.commission_rate * qty * bar.open)
-            .min(proceeds);
-        p.cash += proceeds - commission;
-        p.positions[i].quantity -= qty;
-        if p.positions[i].quantity < 1e-12 {
-            p.positions[i].quantity = 0.0;
-            p.positions[i].average_entry_price = 0.0
-        }
-        let spread = qty * bar.open * half;
-        let slippage = qty * bar.open * self.costs.slippage_rate;
-        record_costs(p, commission, spread, slippage, qty * bar.open);
-        report.trades.push(Trade {
-            asset_id: bar.asset_id,
-            side: TradeSide::Sell,
-            quantity: qty,
-            base_price: bar.open,
-            execution_price: price,
-            commission,
-            spread_cost: spread,
-            slippage_cost: slippage,
-            notional: qty * bar.open,
-        });
+        Ok(())
     }
-    fn execute_buy(
+    fn trade(
         &self,
-        p: &mut Portfolio,
-        i: usize,
-        value: f64,
-        bar: &MarketBar,
-        report: &mut ExecutionReport,
-    ) {
+        asset_id: AssetId,
+        side: TradeSide,
+        notional: f64,
+        base: f64,
+    ) -> Result<PlannedTrade> {
         let half = self.costs.spread_rate / 2.0;
-        let price = bar.open * (1.0 + half + self.costs.slippage_rate);
-        let max_notional = ((p.cash - self.costs.commission_fixed).max(0.0)
-            / (1.0 + self.costs.commission_rate + half + self.costs.slippage_rate))
-            .max(0.0);
-        let notional = value.min(max_notional);
-        if notional <= 0.0 {
-            return;
-        }
-        let qty = notional / bar.open;
+        let execution_price = match side {
+            TradeSide::Buy => base * (1.0 + half + self.costs.slippage_rate),
+            TradeSide::Sell => base * (1.0 - half - self.costs.slippage_rate),
+        };
+        let quantity = notional / base;
         let commission = self.costs.commission_fixed + self.costs.commission_rate * notional;
-        let spend = qty * price + commission;
-        if spend > p.cash + 1e-8 {
-            return;
-        }
-        let old = p.positions[i].quantity;
-        let new = old + qty;
-        p.positions[i].average_entry_price = if new > 0.0 {
-            (old * p.positions[i].average_entry_price + qty * price) / new
-        } else {
-            0.0
-        };
-        p.positions[i].quantity = new;
-        p.cash = (p.cash - spend).max(0.0);
-        let spread = notional * half;
-        let slippage = notional * self.costs.slippage_rate;
-        record_costs(p, commission, spread, slippage, notional);
-        report.trades.push(Trade {
-            asset_id: bar.asset_id,
-            side: TradeSide::Buy,
-            quantity: qty,
-            base_price: bar.open,
-            execution_price: price,
-            commission,
-            spread_cost: spread,
-            slippage_cost: slippage,
+        let spread_cost = notional * half;
+        let slippage_cost = notional * self.costs.slippage_rate;
+        if [
             notional,
-        });
+            base,
+            execution_price,
+            quantity,
+            commission,
+            spread_cost,
+            slippage_cost,
+        ]
+        .iter()
+        .any(|v| !v.is_finite())
+            || notional <= 0.0
+            || base <= 0.0
+            || execution_price <= 0.0
+            || quantity <= 0.0
+            || commission < 0.0
+            || spread_cost < 0.0
+            || slippage_cost < 0.0
+        {
+            return Err(MidasError::Accounting(
+                "invalid planned trade economics".into(),
+            ));
+        }
+        if matches!(side, TradeSide::Sell) && quantity * execution_price - commission < 0.0 {
+            return Err(MidasError::Accounting("sell costs exceed proceeds".into()));
+        }
+        Ok(PlannedTrade {
+            asset_id,
+            side,
+            quantity,
+            base_price: base,
+            execution_price,
+            commission,
+            spread_cost,
+            slippage_cost,
+            notional,
+        })
     }
 }
-fn record_costs(p: &mut Portfolio, commission: f64, spread: f64, slippage: f64, turnover: f64) {
-    p.cumulative_commission += commission;
-    p.cumulative_spread += spread;
-    p.cumulative_slippage += slippage;
-    p.cumulative_turnover += turnover;
-}
-
-impl ExecutionModel for CostExecutionModel {
-    fn rebalance(
+impl ExecutionPlanner for CostExecutionEngine {
+    fn plan(
         &self,
-        p: &mut Portfolio,
-        target: &[f64],
-        bars: &[Option<&MarketBar>],
-        valuation_prices: &[Option<f64>],
+        p: &Portfolio,
+        a: &ValidatedAllocation,
+        m: &ExecutionSnapshot<'_>,
         minimum: f64,
-    ) -> Result<ExecutionReport> {
-        let mut report = ExecutionReport::default();
-        let n = p.positions.len();
-        let valid = target.len() == n + 1
-            && target.iter().all(|v| v.is_finite() && *v >= 0.0)
-            && ((target.iter().sum::<f64>() - 1.0).abs() < 1e-6);
-        let fallback = std::iter::once(1.0)
-            .chain(std::iter::repeat_n(0.0, n))
-            .collect::<Vec<_>>();
-        let target = if valid {
-            target
-        } else {
-            report.invalid_action = true;
-            &fallback
-        };
-        let opens = bars
+    ) -> Result<ExecutionPlan> {
+        self.validate_costs()?;
+        if m.bars.len() != p.positions.len() || m.valuation_prices.len() != p.positions.len() {
+            return Err(MidasError::Accounting(
+                "execution snapshot dimension mismatch".into(),
+            ));
+        }
+        if !a.rebalance() {
+            return Ok(ExecutionPlan {
+                affordability_scale: 1.0,
+                ..Default::default()
+            });
+        }
+        let prices = m
+            .bars
             .iter()
-            .zip(valuation_prices)
-            .map(|(b, fallback)| b.map(|x| x.open).or(*fallback))
+            .zip(m.valuation_prices)
+            .map(|(b, f)| b.map(|x| x.open).or(*f))
             .collect::<Vec<_>>();
-        let worth = p.value(&opens)?;
+        let worth = p.value(&prices)?;
         let current = p
             .positions
             .iter()
-            .zip(&opens)
+            .zip(&prices)
             .map(|(pos, price)| pos.quantity * price.unwrap_or(0.0))
             .collect::<Vec<_>>();
-        for i in 0..n {
-            let desired = worth * target[i + 1];
-            if desired + minimum < current[i] {
-                if let Some(bar) = bars[i].filter(|b| b.tradable) {
-                    self.execute_sell(p, i, current[i] - desired, bar, &mut report)
+        let mut plan = ExecutionPlan::default();
+        let mut available = p.cash;
+        for (i, current_value) in current.iter().enumerate() {
+            let desired = worth * a.weights()[i + 1];
+            if *current_value > desired + minimum {
+                if let Some(bar) = m.bars[i].filter(|b| b.tradable) {
+                    let trade = self.trade(
+                        AssetId(i as u64),
+                        TradeSide::Sell,
+                        *current_value - desired,
+                        bar.open,
+                    )?;
+                    available += trade.quantity * trade.execution_price - trade.commission;
+                    plan.trades.push(trade)
                 } else {
-                    report.rejected_assets.push(AssetId(i as u64))
+                    plan.rejected_assets.push(AssetId(i as u64));
                 }
             }
         }
-        let requests = (0..n)
-            .map(|i| {
-                let desired = worth * target[i + 1];
+        let mut eligible = (0..p.positions.len())
+            .filter_map(|i| {
+                let desired = worth * a.weights()[i + 1];
                 if desired > current[i] + minimum {
-                    desired - current[i]
+                    if m.bars[i].is_some_and(|b| b.tradable) {
+                        Some((i, desired - current[i]))
+                    } else {
+                        plan.rejected_assets.push(AssetId(i as u64));
+                        None
+                    }
                 } else {
-                    0.0
+                    None
                 }
             })
             .collect::<Vec<_>>();
-        let total = requests
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| bars[*i].is_some_and(|b| b.tradable))
-            .map(|(_, v)| *v)
-            .sum::<f64>();
-        let scale = if total > 0.0 {
-            (p.cash / total).min(1.0)
-        } else {
-            0.0
-        };
-        for (i, request) in requests.into_iter().enumerate() {
-            if request <= 0.0 {
-                continue;
+        let variable = 1.0
+            + self.costs.commission_rate
+            + self.costs.spread_rate / 2.0
+            + self.costs.slippage_rate;
+        let mut scale;
+        loop {
+            if eligible.is_empty() {
+                scale = 0.0;
+                break;
             }
-            if let Some(bar) = bars[i].filter(|b| b.tradable) {
-                self.execute_buy(p, i, request * scale, bar, &mut report)
-            } else {
-                report.rejected_assets.push(AssetId(i as u64))
+            let requested = eligible.iter().map(|(_, v)| *v).sum::<f64>();
+            let fixed = self.costs.commission_fixed * eligible.len() as f64;
+            scale = ((available - fixed) / requested / variable).clamp(0.0, 1.0);
+            let before = eligible.len();
+            eligible.retain(|(_, request)| request * scale >= minimum);
+            if eligible.len() == before {
+                break;
             }
         }
-        p.check()?;
-        Ok(report)
+        plan.affordability_scale = scale;
+        for (i, request) in eligible {
+            let bar = m.bars[i].expect("eligible buy has bar");
+            plan.trades.push(self.trade(
+                AssetId(i as u64),
+                TradeSide::Buy,
+                request * scale,
+                bar.open,
+            )?);
+        }
+        Ok(plan)
+    }
+}
+impl ExecutionApplier for CostExecutionEngine {
+    fn apply(&self, p: &mut Portfolio, plan: &ExecutionPlan) -> Result<ExecutionReport> {
+        self.validate_costs()?;
+        let mut candidate = p.clone();
+        for t in &plan.trades {
+            self.trade(t.asset_id, t.side.clone(), t.notional, t.base_price)?;
+            let pos = &mut candidate.positions[t.asset_id.0 as usize];
+            match t.side {
+                TradeSide::Sell => {
+                    if t.quantity > pos.quantity + 1e-9 {
+                        return Err(MidasError::Accounting(
+                            "planned sell exceeds holding".into(),
+                        ));
+                    }
+                    pos.quantity = (pos.quantity - t.quantity).max(0.0);
+                    candidate.cash += t.quantity * t.execution_price - t.commission;
+                    if pos.quantity < 1e-12 {
+                        pos.average_entry_price = 0.0;
+                    }
+                }
+                TradeSide::Buy => {
+                    let spend = t.quantity * t.execution_price + t.commission;
+                    if spend > candidate.cash + 1e-8 {
+                        return Err(MidasError::Accounting("planned buys exceed cash".into()));
+                    }
+                    let old = pos.quantity;
+                    let new = old + t.quantity;
+                    pos.average_entry_price =
+                        (old * pos.average_entry_price + t.quantity * t.execution_price) / new;
+                    pos.quantity = new;
+                    candidate.cash = (candidate.cash - spend).max(0.0);
+                }
+            }
+            candidate.cumulative_commission += t.commission;
+            candidate.cumulative_spread += t.spread_cost;
+            candidate.cumulative_slippage += t.slippage_cost;
+            candidate.cumulative_turnover += t.notional;
+        }
+        candidate.check()?;
+        *p = candidate;
+        Ok(ExecutionReport {
+            trades: plan.trades.clone(),
+            rejected_assets: plan.rejected_assets.clone(),
+        })
     }
 }

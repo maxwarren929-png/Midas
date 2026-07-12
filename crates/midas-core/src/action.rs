@@ -1,0 +1,146 @@
+use crate::{MidasError, Result};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ProposedAllocation {
+    pub weights: Vec<f64>,
+    pub rebalance: bool,
+}
+
+impl ProposedAllocation {
+    pub fn rebalance(weights: Vec<f64>) -> Self {
+        Self {
+            weights,
+            rebalance: true,
+        }
+    }
+    pub fn hold(weights: Vec<f64>) -> Self {
+        Self {
+            weights,
+            rebalance: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ValidatedAllocation {
+    weights: Vec<f64>,
+    rebalance: bool,
+    used_fallback: bool,
+}
+
+impl ValidatedAllocation {
+    pub fn weights(&self) -> &[f64] {
+        &self.weights
+    }
+    pub fn rebalance(&self) -> bool {
+        self.rebalance
+    }
+    pub fn used_fallback(&self) -> bool {
+        self.used_fallback
+    }
+}
+
+pub struct ActionValidationContext<'a> {
+    pub asset_count: usize,
+    pub tradable: &'a [bool],
+    pub maximum_asset_allocation: f64,
+}
+
+pub trait ActionValidator: Send + Sync {
+    fn validate(
+        &self,
+        proposed: ProposedAllocation,
+        context: &ActionValidationContext<'_>,
+    ) -> Result<ValidatedAllocation>;
+}
+
+#[derive(Default)]
+pub struct LongOnlyActionValidator;
+
+impl LongOnlyActionValidator {
+    fn cash(asset_count: usize, used_fallback: bool) -> ValidatedAllocation {
+        let mut weights = vec![0.0; asset_count + 1];
+        weights[0] = 1.0;
+        ValidatedAllocation {
+            weights,
+            rebalance: true,
+            used_fallback,
+        }
+    }
+}
+
+impl ActionValidator for LongOnlyActionValidator {
+    fn validate(
+        &self,
+        proposed: ProposedAllocation,
+        context: &ActionValidationContext<'_>,
+    ) -> Result<ValidatedAllocation> {
+        if context.tradable.len() != context.asset_count
+            || !context.maximum_asset_allocation.is_finite()
+            || !(0.0..=1.0).contains(&context.maximum_asset_allocation)
+            || context.maximum_asset_allocation == 0.0
+        {
+            return Err(MidasError::Config(
+                "invalid action-validation context".into(),
+            ));
+        }
+        if proposed.weights.len() != context.asset_count + 1
+            || proposed.weights.iter().any(|v| !v.is_finite() || *v < 0.0)
+        {
+            return Ok(Self::cash(context.asset_count, true));
+        }
+        let mut weights = proposed.weights;
+        for (index, tradable) in context.tradable.iter().enumerate() {
+            if !tradable {
+                weights[index + 1] = 0.0;
+            }
+        }
+        let sum = weights.iter().sum::<f64>();
+        if !sum.is_finite() || sum <= 0.0 {
+            return Ok(Self::cash(context.asset_count, true));
+        }
+        for weight in &mut weights {
+            *weight /= sum;
+        }
+        let max = context.maximum_asset_allocation;
+        loop {
+            let mut excess = 0.0;
+            for weight in weights.iter_mut().skip(1) {
+                if *weight > max {
+                    excess += *weight - max;
+                    *weight = max;
+                }
+            }
+            if excess <= 1e-12 {
+                break;
+            }
+            let eligible = (1..weights.len())
+                .filter(|i| context.tradable[*i - 1] && weights[*i] < max - 1e-12)
+                .collect::<Vec<_>>();
+            if eligible.is_empty() {
+                weights[0] += excess;
+                break;
+            }
+            let share = excess / (eligible.len() + 1) as f64;
+            weights[0] += share;
+            for index in eligible {
+                weights[index] += share;
+            }
+        }
+        let sum = weights.iter().sum::<f64>();
+        for weight in &mut weights {
+            *weight /= sum;
+        }
+        if weights.iter().skip(1).any(|v| *v > max + 1e-9) {
+            return Err(MidasError::Policy(
+                "concentration enforcement failed".into(),
+            ));
+        }
+        Ok(ValidatedAllocation {
+            weights,
+            rebalance: proposed.rebalance,
+            used_fallback: false,
+        })
+    }
+}

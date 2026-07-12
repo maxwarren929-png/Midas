@@ -1,6 +1,8 @@
 use crate::{
     MidasError, Result,
-    config::{Activation, BrainConfig},
+    action::ProposedAllocation,
+    config::{Activation, BrainConfig, EvolvableTraitsConfig},
+    observation::Observation,
 };
 use burn::{
     backend::NdArray,
@@ -10,7 +12,45 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 
-pub type CpuBackend = NdArray<f32>;
+type CpuBackend = NdArray<f32>;
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct MemoryArchitecture {
+    pub size: usize,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct BrainArchitecture {
+    pub version: u32,
+    pub observation_schema_hash: String,
+    pub observation_size: usize,
+    pub asset_count: usize,
+    pub hidden_layers: Vec<usize>,
+    pub memory: MemoryArchitecture,
+    pub actor_output_size: usize,
+    pub critic_output_size: usize,
+    pub activation: Activation,
+}
+impl BrainArchitecture {
+    pub fn from_config(
+        c: &BrainConfig,
+        schema_hash: String,
+        observation_size: usize,
+        asset_count: usize,
+    ) -> Self {
+        Self {
+            version: c.architecture_version,
+            observation_schema_hash: schema_hash,
+            observation_size,
+            asset_count,
+            hidden_layers: c.hidden_layers.clone(),
+            memory: MemoryArchitecture {
+                size: c.memory_size,
+            },
+            actor_output_size: asset_count + 1,
+            critic_output_size: 1,
+            activation: c.activation,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct DenseGenome {
@@ -19,7 +59,6 @@ pub struct DenseGenome {
     pub weights: Vec<f32>,
     pub bias: Vec<f32>,
 }
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct LearningTraits {
     pub learning_rate: f32,
@@ -30,124 +69,152 @@ pub struct LearningTraits {
     pub turnover_sensitivity: f32,
     pub maximum_allocation: f32,
 }
-
+impl LearningTraits {
+    fn from_config(c: &EvolvableTraitsConfig) -> Self {
+        Self {
+            learning_rate: c.learning_rate.initial,
+            entropy_coefficient: c.entropy_coefficient.initial,
+            action_temperature: c.action_temperature.initial,
+            temperature_decay: c.temperature_decay.initial,
+            drawdown_sensitivity: c.drawdown_sensitivity.initial,
+            turnover_sensitivity: c.turnover_sensitivity.initial,
+            maximum_allocation: c.maximum_allocation.initial,
+        }
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct BrainGenome {
     pub genome_format_version: u32,
-    pub architecture_version: u32,
-    pub observation_size: usize,
-    pub asset_count: usize,
+    pub architecture: BrainArchitecture,
     pub hidden: Vec<DenseGenome>,
     pub recurrent: DenseGenome,
     pub actor: DenseGenome,
     pub critic: DenseGenome,
     pub traits: LearningTraits,
-    pub activation: Activation,
 }
-
 impl BrainGenome {
     pub fn random(
-        config: &BrainConfig,
-        observation_size: usize,
-        asset_count: usize,
+        a: &BrainArchitecture,
+        traits: &EvolvableTraitsConfig,
         seed: u64,
     ) -> Result<Self> {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let mut input = observation_size;
+        let mut input = a.observation_size;
         let mut hidden = Vec::new();
-        for &output in &config.hidden_layers {
+        for &output in &a.hidden_layers {
             hidden.push(random_dense(input, output, &mut rng));
             input = output;
         }
-        let recurrent = random_dense(input + config.memory_size, config.memory_size, &mut rng);
-        let actor = random_dense(config.memory_size, asset_count + 1, &mut rng);
-        let critic = random_dense(config.memory_size, 1, &mut rng);
-        let genome = Self {
-            genome_format_version: 1,
-            architecture_version: config.architecture_version,
-            observation_size,
-            asset_count,
+        let recurrent = random_dense(input + a.memory.size, a.memory.size, &mut rng);
+        let actor = random_dense(a.memory.size, a.actor_output_size, &mut rng);
+        let critic = random_dense(a.memory.size, a.critic_output_size, &mut rng);
+        let g = Self {
+            genome_format_version: 2,
+            architecture: a.clone(),
             hidden,
             recurrent,
             actor,
             critic,
-            traits: LearningTraits {
-                learning_rate: 0.0003,
-                entropy_coefficient: 0.01,
-                action_temperature: 1.0,
-                temperature_decay: 0.999,
-                drawdown_sensitivity: 0.1,
-                turnover_sensitivity: 0.01,
-                maximum_allocation: config.maximum_allocation as f32,
-            },
-            activation: config.activation,
+            traits: LearningTraits::from_config(traits),
         };
-        genome.validate()?;
-        Ok(genome)
+        g.validate(a)?;
+        Ok(g)
     }
-    pub fn validate(&self) -> Result<()> {
-        if self.genome_format_version != 1
-            || self.architecture_version == 0
-            || self.observation_size == 0
-            || self.asset_count == 0
+    pub fn validate(&self, a: &BrainArchitecture) -> Result<()> {
+        if self.genome_format_version != 2 || &self.architecture != a {
+            return Err(MidasError::Policy(
+                "genome architecture or observation schema mismatch".into(),
+            ));
+        }
+        let mut expected = a.observation_size;
+        for l in &self.hidden {
+            validate_dense(l, expected)?;
+            expected = l.outputs;
+        }
+        validate_dense(&self.recurrent, expected + a.memory.size)?;
+        validate_dense(&self.actor, a.memory.size)?;
+        validate_dense(&self.critic, a.memory.size)?;
+        if self.recurrent.outputs != a.memory.size
+            || self.actor.outputs != a.actor_output_size
+            || self.critic.outputs != a.critic_output_size
         {
             return Err(MidasError::Policy(
-                "invalid genome version or dimensions".into(),
-            ));
-        }
-        let mut expected = self.observation_size;
-        for layer in &self.hidden {
-            validate_dense(layer, expected)?;
-            expected = layer.outputs;
-        }
-        if self.recurrent.inputs <= expected {
-            return Err(MidasError::Policy(
-                "recurrent layer lacks memory inputs".into(),
-            ));
-        }
-        validate_dense(&self.recurrent, self.recurrent.inputs)?;
-        let memory = self.recurrent.inputs - expected;
-        if self.recurrent.outputs != memory {
-            return Err(MidasError::Policy(
-                "recurrent output must equal memory size".into(),
-            ));
-        }
-        validate_dense(&self.actor, memory)?;
-        validate_dense(&self.critic, memory)?;
-        if self.actor.outputs != self.asset_count + 1 || self.critic.outputs != 1 {
-            return Err(MidasError::Policy(
-                "actor/critic output dimensions mismatch".into(),
+                "genome output dimensions mismatch".into(),
             ));
         }
         Ok(())
     }
+    pub fn validate_with_traits(
+        &self,
+        architecture: &BrainArchitecture,
+        bounds: &EvolvableTraitsConfig,
+    ) -> Result<()> {
+        self.validate(architecture)?;
+        for (name, value, configured) in [
+            (
+                "learning_rate",
+                self.traits.learning_rate,
+                &bounds.learning_rate,
+            ),
+            (
+                "entropy_coefficient",
+                self.traits.entropy_coefficient,
+                &bounds.entropy_coefficient,
+            ),
+            (
+                "action_temperature",
+                self.traits.action_temperature,
+                &bounds.action_temperature,
+            ),
+            (
+                "temperature_decay",
+                self.traits.temperature_decay,
+                &bounds.temperature_decay,
+            ),
+            (
+                "drawdown_sensitivity",
+                self.traits.drawdown_sensitivity,
+                &bounds.drawdown_sensitivity,
+            ),
+            (
+                "turnover_sensitivity",
+                self.traits.turnover_sensitivity,
+                &bounds.turnover_sensitivity,
+            ),
+            (
+                "maximum_allocation",
+                self.traits.maximum_allocation,
+                &bounds.maximum_allocation,
+            ),
+        ] {
+            if !value.is_finite() || value < configured.minimum || value > configured.maximum {
+                return Err(MidasError::Policy(format!(
+                    "genome trait {name} is outside configured bounds"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
-
-fn validate_dense(layer: &DenseGenome, inputs: usize) -> Result<()> {
-    if layer.inputs != inputs
-        || layer.outputs == 0
-        || layer.weights.len() != layer.inputs * layer.outputs
-        || layer.bias.len() != layer.outputs
-        || layer
-            .weights
-            .iter()
-            .chain(&layer.bias)
-            .any(|v| !v.is_finite())
+fn validate_dense(l: &DenseGenome, inputs: usize) -> Result<()> {
+    if l.inputs != inputs
+        || l.outputs == 0
+        || l.weights.len() != l.inputs * l.outputs
+        || l.bias.len() != l.outputs
+        || l.weights.iter().chain(&l.bias).any(|v| !v.is_finite())
     {
-        Err(MidasError::Policy(
-            "invalid dense parameter shape or value".into(),
-        ))
+        Err(MidasError::Policy("invalid dense parameters".into()))
     } else {
         Ok(())
     }
 }
-fn random_dense(inputs: usize, outputs: usize, rng: &mut ChaCha8Rng) -> DenseGenome {
+fn random_dense(inputs: usize, outputs: usize, r: &mut ChaCha8Rng) -> DenseGenome {
     let scale = (2.0 / inputs as f32).sqrt();
     DenseGenome {
         inputs,
         outputs,
         weights: (0..inputs * outputs)
-            .map(|_| rng.gen_range(-scale..scale))
+            .map(|_| r.gen_range(-scale..scale))
             .collect(),
         bias: vec![0.0; outputs],
     }
@@ -159,27 +226,191 @@ pub struct LifetimeBrain {
     pub memory: Vec<f32>,
     pub inference_steps: u64,
 }
-
 #[derive(Clone, Debug)]
-pub struct PolicyInput<'a> {
-    pub observation: &'a [f32],
+pub struct NeuralInput<'a> {
+    pub observation: &'a Observation,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct NeuralOutput {
+    pub logits: Vec<f32>,
+    pub value: f32,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub enum NeuralModelState {
+    Burn(Box<LifetimeBrain>),
+    External { kind: String, state: Vec<f32> },
+}
+pub trait NeuralModel: Send {
+    fn forward(&mut self, input: &NeuralInput<'_>) -> Result<NeuralOutput>;
+    fn reset_memory(&mut self);
+    fn snapshot_state(&self) -> Result<NeuralModelState>;
+}
+#[derive(Clone, Debug)]
+pub enum ComputeDevice {
+    Cpu,
+}
+pub trait NeuralModelFactory: Send + Sync {
+    fn build(
+        &self,
+        genome: &BrainGenome,
+        architecture: &BrainArchitecture,
+        device: &ComputeDevice,
+    ) -> Result<Box<dyn NeuralModel>>;
+    fn restore(
+        &self,
+        genome: &BrainGenome,
+        architecture: &BrainArchitecture,
+        state: NeuralModelState,
+        device: &ComputeDevice,
+    ) -> Result<Box<dyn NeuralModel>>;
+}
+
+pub struct BurnNeuralModel {
+    architecture: BrainArchitecture,
+    lifetime: LifetimeBrain,
+}
+pub struct BurnNeuralModelFactory;
+impl NeuralModelFactory for BurnNeuralModelFactory {
+    fn build(
+        &self,
+        g: &BrainGenome,
+        a: &BrainArchitecture,
+        _: &ComputeDevice,
+    ) -> Result<Box<dyn NeuralModel>> {
+        g.validate(a)?;
+        Ok(Box::new(BurnNeuralModel {
+            architecture: a.clone(),
+            lifetime: LifetimeBrain {
+                parameters: g.clone(),
+                memory: vec![0.0; a.memory.size],
+                inference_steps: 0,
+            },
+        }))
+    }
+    fn restore(
+        &self,
+        g: &BrainGenome,
+        a: &BrainArchitecture,
+        state: NeuralModelState,
+        _: &ComputeDevice,
+    ) -> Result<Box<dyn NeuralModel>> {
+        g.validate(a)?;
+        let NeuralModelState::Burn(lifetime) = state else {
+            return Err(MidasError::Checkpoint("expected Burn neural state".into()));
+        };
+        if lifetime.parameters.architecture != *a {
+            return Err(MidasError::Checkpoint(
+                "neural state architecture mismatch".into(),
+            ));
+        }
+        Ok(Box::new(BurnNeuralModel {
+            architecture: a.clone(),
+            lifetime: *lifetime,
+        }))
+    }
+}
+impl NeuralModel for BurnNeuralModel {
+    fn forward(&mut self, input: &NeuralInput<'_>) -> Result<NeuralOutput> {
+        if input.observation.schema_hash != self.architecture.observation_schema_hash
+            || input.observation.values.len() != self.architecture.observation_size
+            || input.observation.values.iter().any(|v| !v.is_finite())
+        {
+            return Err(MidasError::Policy("invalid neural observation".into()));
+        }
+        let device = Default::default();
+        let mut x = Tensor::<CpuBackend, 2>::from_data(
+            TensorData::new(
+                input.observation.values.clone(),
+                [1, self.architecture.observation_size],
+            ),
+            &device,
+        );
+        for l in &self.lifetime.parameters.hidden {
+            x = activate(dense(x, l, &device), self.architecture.activation);
+        }
+        let memory = Tensor::<CpuBackend, 2>::from_data(
+            TensorData::new(
+                self.lifetime.memory.clone(),
+                [1, self.architecture.memory.size],
+            ),
+            &device,
+        );
+        let next = activation::silu(dense(
+            Tensor::cat(vec![x, memory], 1),
+            &self.lifetime.parameters.recurrent,
+            &device,
+        ));
+        let logits = to_vec(dense(
+            next.clone(),
+            &self.lifetime.parameters.actor,
+            &device,
+        ))?;
+        let value = to_vec(dense(
+            next.clone(),
+            &self.lifetime.parameters.critic,
+            &device,
+        ))?[0];
+        self.lifetime.memory = to_vec(next)?;
+        self.lifetime.inference_steps += 1;
+        if logits.iter().any(|v| !v.is_finite())
+            || !value.is_finite()
+            || self.lifetime.memory.iter().any(|v| !v.is_finite())
+        {
+            return Err(MidasError::Policy("non-finite neural output".into()));
+        }
+        Ok(NeuralOutput { logits, value })
+    }
+    fn reset_memory(&mut self) {
+        self.lifetime.memory.fill(0.0)
+    }
+    fn snapshot_state(&self) -> Result<NeuralModelState> {
+        Ok(NeuralModelState::Burn(Box::new(self.lifetime.clone())))
+    }
+}
+fn dense(
+    x: Tensor<CpuBackend, 2>,
+    l: &DenseGenome,
+    d: &<CpuBackend as burn::tensor::backend::Backend>::Device,
+) -> Tensor<CpuBackend, 2> {
+    let w = Tensor::from_data(TensorData::new(l.weights.clone(), [l.inputs, l.outputs]), d);
+    let b = Tensor::from_data(TensorData::new(l.bias.clone(), [1, l.outputs]), d);
+    x.matmul(w) + b
+}
+fn activate(x: Tensor<CpuBackend, 2>, a: Activation) -> Tensor<CpuBackend, 2> {
+    match a {
+        Activation::Relu => activation::relu(x),
+        Activation::Gelu => activation::gelu(x),
+        Activation::Silu => activation::silu(x),
+    }
+}
+fn to_vec(x: Tensor<CpuBackend, 2>) -> Result<Vec<f32>> {
+    x.into_data()
+        .to_vec::<f32>()
+        .map_err(|e| MidasError::Policy(format!("{e:?}")))
+}
+
+#[derive(Clone, Debug, Eq, Serialize, Deserialize, PartialEq)]
+pub enum PolicyBlueprint {
+    Cash,
+    Random,
+    EqualWeight,
+    BuyAndHold { target_asset: usize },
+    Neural,
+}
+pub struct PolicyContext<'a> {
     pub tradable: &'a [bool],
     pub current_allocations: &'a [f64],
 }
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct PolicyOutput {
-    pub allocations: Vec<f64>,
-    pub value: f32,
-    pub valid: bool,
-    pub rebalance: bool,
-}
-
 pub trait Policy: Send {
-    fn act(&mut self, input: PolicyInput<'_>) -> Result<PolicyOutput>;
+    fn propose_action(
+        &mut self,
+        _: &Observation,
+        context: &PolicyContext<'_>,
+    ) -> Result<ProposedAllocation>;
     fn snapshot(&self) -> Result<PolicySnapshot>;
+    fn reset_episode_state(&mut self);
+    fn policy_blueprint(&self) -> PolicyBlueprint;
 }
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum PolicySnapshot {
     Cash,
@@ -191,215 +422,97 @@ pub enum PolicySnapshot {
         initialized: bool,
         target_asset: usize,
     },
-    Burn {
+    Neural {
         genome: BrainGenome,
-        lifetime: Box<LifetimeBrain>,
+        state: Box<NeuralModelState>,
     },
 }
 
-pub struct BurnActorCriticPolicy {
-    pub genome: BrainGenome,
-    pub lifetime: LifetimeBrain,
+pub struct NeuralPolicy {
+    genome: BrainGenome,
+    model: Box<dyn NeuralModel>,
 }
-impl BurnActorCriticPolicy {
-    pub fn new(genome: BrainGenome) -> Result<Self> {
-        genome.validate()?;
-        let memory = vec![0.0; genome.recurrent.outputs];
-        Ok(Self {
-            lifetime: LifetimeBrain {
-                parameters: genome.clone(),
-                memory,
-                inference_steps: 0,
-            },
-            genome,
-        })
+impl NeuralPolicy {
+    pub fn new(genome: BrainGenome, model: Box<dyn NeuralModel>) -> Self {
+        Self { genome, model }
     }
 }
-
-impl Policy for BurnActorCriticPolicy {
-    fn act(&mut self, input: PolicyInput<'_>) -> Result<PolicyOutput> {
-        if input.observation.len() != self.genome.observation_size
-            || input.tradable.len() != self.genome.asset_count
-            || input.observation.iter().any(|v| !v.is_finite())
-        {
-            return Ok(cash(self.genome.asset_count, false));
+impl Policy for NeuralPolicy {
+    fn propose_action(
+        &mut self,
+        o: &Observation,
+        _: &PolicyContext<'_>,
+    ) -> Result<ProposedAllocation> {
+        let out = self.model.forward(&NeuralInput { observation: o })?;
+        let peak = out.logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut weights = out
+            .logits
+            .iter()
+            .map(|v| ((*v - peak) as f64).exp())
+            .collect::<Vec<_>>();
+        let sum = weights.iter().sum::<f64>();
+        for v in &mut weights {
+            *v /= sum
         }
-        let device = Default::default();
-        let mut x = Tensor::<CpuBackend, 2>::from_data(
-            TensorData::new(input.observation.to_vec(), [1, input.observation.len()]),
-            &device,
-        );
-        for layer in &self.lifetime.parameters.hidden {
-            x = activate(dense(x, layer, &device), self.genome.activation);
-        }
-        let memory = Tensor::<CpuBackend, 2>::from_data(
-            TensorData::new(
-                self.lifetime.memory.clone(),
-                [1, self.lifetime.memory.len()],
-            ),
-            &device,
-        );
-        let joined = Tensor::cat(vec![x, memory], 1);
-        let next = activate(
-            dense(joined, &self.lifetime.parameters.recurrent, &device),
-            Activation::Silu,
-        );
-        let logits = dense(next.clone(), &self.lifetime.parameters.actor, &device)
-            .into_data()
-            .to_vec::<f32>()
-            .map_err(|e| MidasError::Policy(format!("{e:?}")))?;
-        let value = dense(next.clone(), &self.lifetime.parameters.critic, &device)
-            .into_data()
-            .to_vec::<f32>()
-            .map_err(|e| MidasError::Policy(format!("{e:?}")))?[0];
-        self.lifetime.memory = next
-            .into_data()
-            .to_vec::<f32>()
-            .map_err(|e| MidasError::Policy(format!("{e:?}")))?;
-        self.lifetime.inference_steps += 1;
-        if logits.iter().any(|v| !v.is_finite())
-            || !value.is_finite()
-            || self.lifetime.memory.iter().any(|v| !v.is_finite())
-        {
-            return Ok(cash(self.genome.asset_count, false));
-        }
-        Ok(PolicyOutput {
-            allocations: masked_softmax(
-                &logits,
-                input.tradable,
-                self.genome.traits.maximum_allocation as f64,
-            ),
-            value,
-            valid: true,
-            rebalance: true,
-        })
+        Ok(ProposedAllocation::rebalance(weights))
     }
     fn snapshot(&self) -> Result<PolicySnapshot> {
-        Ok(PolicySnapshot::Burn {
+        Ok(PolicySnapshot::Neural {
             genome: self.genome.clone(),
-            lifetime: Box::new(self.lifetime.clone()),
+            state: Box::new(self.model.snapshot_state()?),
         })
     }
-}
-
-fn dense(
-    x: Tensor<CpuBackend, 2>,
-    layer: &DenseGenome,
-    device: &<CpuBackend as burn::tensor::backend::Backend>::Device,
-) -> Tensor<CpuBackend, 2> {
-    let w = Tensor::from_data(
-        TensorData::new(layer.weights.clone(), [layer.inputs, layer.outputs]),
-        device,
-    );
-    let b = Tensor::from_data(
-        TensorData::new(layer.bias.clone(), [1, layer.outputs]),
-        device,
-    );
-    x.matmul(w) + b
-}
-fn activate(x: Tensor<CpuBackend, 2>, kind: Activation) -> Tensor<CpuBackend, 2> {
-    match kind {
-        Activation::Relu => activation::relu(x),
-        Activation::Gelu => activation::gelu(x),
-        Activation::Silu => activation::silu(x),
+    fn reset_episode_state(&mut self) {
+        self.model.reset_memory()
     }
-}
-
-fn masked_softmax(logits: &[f32], tradable: &[bool], max: f64) -> Vec<f64> {
-    if tradable.iter().all(|v| !*v) {
-        return cash(tradable.len(), true).allocations;
-    }
-    let mut allowed = vec![true];
-    allowed.extend_from_slice(tradable);
-    let peak = logits
-        .iter()
-        .zip(&allowed)
-        .filter(|(_, a)| **a)
-        .map(|(v, _)| *v)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let mut out = logits
-        .iter()
-        .zip(&allowed)
-        .map(|(v, a)| if *a { ((*v - peak) as f64).exp() } else { 0.0 })
-        .collect::<Vec<_>>();
-    let sum = out.iter().sum::<f64>();
-    for v in &mut out {
-        *v /= sum
-    }
-    for _ in 0..out.len() {
-        let mut excess = 0.0;
-        let mut open = 0;
-        for i in 1..out.len() {
-            if out[i] > max {
-                excess += out[i] - max;
-                out[i] = max
-            } else if allowed[i] {
-                open += 1
-            }
-        }
-        if excess <= 1e-12 {
-            break;
-        }
-        if open == 0 {
-            out[0] += excess
-        } else {
-            let cash_share = excess / (open + 1) as f64;
-            out[0] += cash_share;
-            for i in 1..out.len() {
-                if allowed[i] && out[i] < max {
-                    out[i] += cash_share
-                }
-            }
-        }
-    }
-    let sum = out.iter().sum::<f64>();
-    for v in &mut out {
-        *v /= sum
-    }
-    out
-}
-
-fn cash(assets: usize, valid: bool) -> PolicyOutput {
-    let mut allocations = vec![0.0; assets + 1];
-    allocations[0] = 1.0;
-    PolicyOutput {
-        allocations,
-        value: 0.0,
-        valid,
-        rebalance: true,
+    fn policy_blueprint(&self) -> PolicyBlueprint {
+        PolicyBlueprint::Neural
     }
 }
 pub struct CashPolicy;
 impl Policy for CashPolicy {
-    fn act(&mut self, input: PolicyInput<'_>) -> Result<PolicyOutput> {
-        Ok(cash(input.tradable.len(), true))
+    fn propose_action(
+        &mut self,
+        _observation: &Observation,
+        c: &PolicyContext<'_>,
+    ) -> Result<ProposedAllocation> {
+        let mut w = vec![0.0; c.tradable.len() + 1];
+        w[0] = 1.0;
+        Ok(ProposedAllocation::rebalance(w))
     }
     fn snapshot(&self) -> Result<PolicySnapshot> {
         Ok(PolicySnapshot::Cash)
     }
+    fn reset_episode_state(&mut self) {}
+    fn policy_blueprint(&self) -> PolicyBlueprint {
+        PolicyBlueprint::Cash
+    }
 }
 pub struct EqualWeightPolicy;
 impl Policy for EqualWeightPolicy {
-    fn act(&mut self, input: PolicyInput<'_>) -> Result<PolicyOutput> {
-        let n = input.tradable.iter().filter(|v| **v).count();
+    fn propose_action(
+        &mut self,
+        observation: &Observation,
+        c: &PolicyContext<'_>,
+    ) -> Result<ProposedAllocation> {
+        let n = c.tradable.iter().filter(|v| **v).count();
         if n == 0 {
-            return Ok(cash(input.tradable.len(), true));
+            return CashPolicy.propose_action(observation, c);
         }
-        let mut a = vec![0.0; input.tradable.len() + 1];
-        for (i, t) in input.tradable.iter().enumerate() {
+        let mut w = vec![0.0; c.tradable.len() + 1];
+        for (i, t) in c.tradable.iter().enumerate() {
             if *t {
-                a[i + 1] = 1.0 / n as f64
+                w[i + 1] = 1.0 / n as f64
             }
         }
-        Ok(PolicyOutput {
-            allocations: a,
-            value: 0.0,
-            valid: true,
-            rebalance: true,
-        })
+        Ok(ProposedAllocation::rebalance(w))
     }
     fn snapshot(&self) -> Result<PolicySnapshot> {
         Ok(PolicySnapshot::EqualWeight)
+    }
+    fn reset_episode_state(&mut self) {}
+    fn policy_blueprint(&self) -> PolicyBlueprint {
+        PolicyBlueprint::EqualWeight
     }
 }
 pub struct RandomPolicy {
@@ -413,30 +526,25 @@ impl RandomPolicy {
     }
 }
 impl Policy for RandomPolicy {
-    fn act(&mut self, input: PolicyInput<'_>) -> Result<PolicyOutput> {
-        let mut x = vec![self.rng.gen_range(0.0001..1.0)];
-        x.extend(input.tradable.iter().map(|t| {
-            if *t {
-                self.rng.gen_range(0.0001..1.0)
-            } else {
-                0.0
-            }
-        }));
-        let s = x.iter().sum::<f64>();
-        for v in &mut x {
-            *v /= s
-        }
-        Ok(PolicyOutput {
-            allocations: x,
-            value: 0.0,
-            valid: true,
-            rebalance: true,
-        })
+    fn propose_action(
+        &mut self,
+        _: &Observation,
+        c: &PolicyContext<'_>,
+    ) -> Result<ProposedAllocation> {
+        Ok(ProposedAllocation::rebalance(
+            (0..=c.tradable.len())
+                .map(|_| self.rng.gen_range(0.0001..1.0))
+                .collect(),
+        ))
     }
     fn snapshot(&self) -> Result<PolicySnapshot> {
         Ok(PolicySnapshot::Random {
             rng: self.rng.clone(),
         })
+    }
+    fn reset_episode_state(&mut self) {}
+    fn policy_blueprint(&self) -> PolicyBlueprint {
+        PolicyBlueprint::Random
     }
 }
 pub struct BuyAndHoldPolicy {
@@ -452,39 +560,36 @@ impl BuyAndHoldPolicy {
     }
 }
 impl Policy for BuyAndHoldPolicy {
-    fn act(&mut self, input: PolicyInput<'_>) -> Result<PolicyOutput> {
+    fn propose_action(
+        &mut self,
+        _: &Observation,
+        c: &PolicyContext<'_>,
+    ) -> Result<ProposedAllocation> {
         if self.initialized {
-            return Ok(PolicyOutput {
-                allocations: input.current_allocations.to_vec(),
-                value: 0.0,
-                valid: true,
-                rebalance: false,
-            });
+            return Ok(ProposedAllocation::hold(c.current_allocations.to_vec()));
         }
         self.initialized = true;
-        if input
-            .tradable
-            .get(self.target_asset)
-            .copied()
-            .unwrap_or(false)
-        {
-            let mut a = vec![0.0; input.tradable.len() + 1];
-            a[self.target_asset + 1] = 1.0;
-            Ok(PolicyOutput {
-                allocations: a,
-                value: 0.0,
-                valid: true,
-                rebalance: true,
-            })
+        let mut w = vec![0.0; c.tradable.len() + 1];
+        if c.tradable.get(self.target_asset).copied().unwrap_or(false) {
+            w[self.target_asset + 1] = 1.0
         } else {
-            Ok(cash(input.tradable.len(), true))
+            w[0] = 1.0
         }
+        Ok(ProposedAllocation::rebalance(w))
     }
     fn snapshot(&self) -> Result<PolicySnapshot> {
         Ok(PolicySnapshot::BuyAndHold {
             initialized: self.initialized,
             target_asset: self.target_asset,
         })
+    }
+    fn reset_episode_state(&mut self) {
+        self.initialized = false
+    }
+    fn policy_blueprint(&self) -> PolicyBlueprint {
+        PolicyBlueprint::BuyAndHold {
+            target_asset: self.target_asset,
+        }
     }
 }
 
@@ -497,7 +602,7 @@ impl LearningStrategy for NoLearning {
     fn name(&self) -> &'static str {
         "no_learning"
     }
-    fn observe(&mut self, _reward: f32, _terminal: bool) -> Result<()> {
+    fn observe(&mut self, _: f32, _: bool) -> Result<()> {
         Ok(())
     }
 }
