@@ -1,0 +1,13 @@
+[package]
+name = "midas-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+midas-core = { path = "../midas-core" }
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,68 @@
+[market]
+assets = ["SPY", "AAA", "BBB"]
+benchmark_asset = "SPY"
+
+[data]
+path = "data/raw/synthetic.csv"
+format = "csv"
+
+[splits.training]
+start = "2020-01-02"
+end = "2020-01-13"
+[splits.validation]
+start = "2020-01-14"
+end = "2020-01-23"
+[splits.test]
+start = "2020-01-24"
+end = "2020-02-05"
+
+[simulation]
+population_size = 4
+starting_cash = 10000.0
+bankruptcy_threshold = 0.01
+daily_survival_cost = 2.0
+minimum_trade_value = 1.0
+seed = 42
+forced_liquidation = false
+
+[execution]
+commission_fixed = 0.0
+commission_rate = 0.0005
+spread_rate = 0.001
+slippage_rate = 0.0002
+
+[features]
+schema_version = 1
+features = ["return1", "return5", "return20", "price_to_ma20", "price_to_ma50", "volatility20", "volume_change", "volume_to_ma20", "distance_high20", "tradable"]
+clip = 10.0
+
+[brain]
+architecture_version = 1
+hidden_layers = [32, 16]
+memory_size = 8
+maximum_allocation = 0.5
+activation = "gelu"
+policy = "burn_actor_critic"
+
+[learning]
+implementation = "no_learning"
+learning_rate = 0.0003
+gamma = 0.99
+gae_lambda = 0.95
+ppo_clip = 0.2
+critic_coefficient = 0.5
+entropy_coefficient = 0.01
+gradient_clip = 1.0
+rollout_length = 128
+optimisation_epochs = 4
+
+[backend]
+kind = "cpu"
+device = "default"
+
+[replacement]
+strategy = "non_evolutionary_random_genome"
+
+[checkpoint]
+path = "checkpoints/latest.bin"
+every_steps = 0
