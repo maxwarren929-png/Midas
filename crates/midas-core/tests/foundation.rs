@@ -12,8 +12,8 @@ use midas_core::{
         NeuralModel, NeuralModelFactory, NeuralModelState, NeuralOutput, PolicyBlueprint,
     },
     config::{
-        Config, CorporateActionConfig, CorporateActionMode, DeathHandling, ObservationFeatureKind,
-        PolicyFailureBehavior, PolicyKind,
+        Config, CorporateActionConfig, CorporateActionMode, DeathHandling, LearningKind,
+        ObservationFeatureKind, PolicyFailureBehavior, PolicyKind,
     },
     execution::{
         CostExecutionEngine, ExecutionApplier, ExecutionPlanner, ExecutionSnapshot, Portfolio,
@@ -955,6 +955,26 @@ fn backend_identity_is_configuration_driven_and_checkpoint_checked() {
     assert!(error.to_string().contains("unsupported CPU NdArray device"));
 }
 
+#[test]
+fn checkpoint_v6_is_rejected_as_bias_only_optimizer_layout() {
+    let c = config();
+    let data = loaded(&c);
+    let mut engine =
+        SimulationEngine::new(c.clone(), data.clone(), DatasetSplit::Training).unwrap();
+    engine.run_steps(1).unwrap();
+    let file = tempfile::NamedTempFile::new().unwrap();
+    engine.save_checkpoint(file.path()).unwrap();
+    let mut bytes = fs::read(file.path()).unwrap();
+    assert_eq!(bytes.first().copied(), Some(7));
+    bytes[0] = 6;
+    fs::write(file.path(), bytes).unwrap();
+    let error = match SimulationEngine::resume(c, data, file.path()) {
+        Ok(_) => panic!("checkpoint 6 was accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("bias-only optimizer"));
+}
+
 struct MockModel {
     schema: String,
     size: usize,
@@ -983,6 +1003,14 @@ impl NeuralModel for MockModel {
             kind: "mock".into(),
             state: vec![self.memory],
         })
+    }
+    fn fork(&self) -> midas_core::Result<Box<dyn NeuralModel>> {
+        Ok(Box::new(Self {
+            schema: self.schema.clone(),
+            size: self.size,
+            memory: self.memory,
+            fail: self.fail,
+        }))
     }
 }
 struct MockFactory {
@@ -1019,6 +1047,71 @@ impl NeuralModelFactory for MockFactory {
             size: a.actor_output_size,
             memory: state[0],
             fail: self.fail,
+        }))
+    }
+}
+
+struct BootstrapForkFailureModel {
+    schema: String,
+    size: usize,
+    fork_count: u32,
+}
+impl NeuralModel for BootstrapForkFailureModel {
+    fn forward(&mut self, input: &NeuralInput<'_>) -> midas_core::Result<NeuralOutput> {
+        assert_eq!(input.observation.schema_hash, self.schema);
+        Ok(NeuralOutput {
+            logits: vec![0.0; self.size],
+            value: 0.0,
+        })
+    }
+    fn reset_memory(&mut self) {}
+    fn snapshot_state(&self) -> midas_core::Result<NeuralModelState> {
+        Ok(NeuralModelState::External {
+            kind: "bootstrap-fork-failure".into(),
+            state: vec![self.fork_count as f32],
+        })
+    }
+    fn fork(&self) -> midas_core::Result<Box<dyn NeuralModel>> {
+        if self.fork_count >= 1 {
+            return Err(MidasError::Policy(
+                "injected next-value fork failure".into(),
+            ));
+        }
+        Ok(Box::new(Self {
+            schema: self.schema.clone(),
+            size: self.size,
+            fork_count: self.fork_count + 1,
+        }))
+    }
+}
+struct BootstrapForkFailureFactory;
+impl NeuralModelFactory for BootstrapForkFailureFactory {
+    fn build(
+        &self,
+        _: &BrainGenome,
+        a: &BrainArchitecture,
+        _: &ComputeDevice,
+    ) -> midas_core::Result<Box<dyn NeuralModel>> {
+        Ok(Box::new(BootstrapForkFailureModel {
+            schema: a.observation_schema_hash.clone(),
+            size: a.actor_output_size,
+            fork_count: 0,
+        }))
+    }
+    fn restore(
+        &self,
+        _: &BrainGenome,
+        a: &BrainArchitecture,
+        state: NeuralModelState,
+        _: &ComputeDevice,
+    ) -> midas_core::Result<Box<dyn NeuralModel>> {
+        let NeuralModelState::External { state, .. } = state else {
+            return Err(MidasError::Policy("wrong bootstrap failure state".into()));
+        };
+        Ok(Box::new(BootstrapForkFailureModel {
+            schema: a.observation_schema_hash.clone(),
+            size: a.actor_output_size,
+            fork_count: state.first().copied().unwrap_or(0.0) as u32,
         }))
     }
 }
@@ -1066,6 +1159,16 @@ impl NeuralModel for SequencedModel {
             kind: "sequenced".into(),
             state: vec![self.memory, self.calls as f32],
         })
+    }
+    fn fork(&self) -> midas_core::Result<Box<dyn NeuralModel>> {
+        Ok(Box::new(Self {
+            schema: self.schema.clone(),
+            size: self.size,
+            memory: self.memory,
+            calls: self.calls,
+            fail_calls: self.fail_calls.clone(),
+            invalid_calls: self.invalid_calls.clone(),
+        }))
     }
 }
 impl NeuralModelFactory for SequencedFactory {
@@ -1147,6 +1250,37 @@ fn simulation_runs_mock_and_burn_neural_models() {
     burn.run_steps(2).unwrap();
     assert!(burn.metrics.agents.values().all(|m| m.survival_days == 2));
     assert!(!include_str!("../src/simulation.rs").contains("burn::"));
+}
+
+#[test]
+fn continuing_bootstrap_fork_failure_is_transactional_and_not_zero() {
+    let mut c = config();
+    c.simulation.population_size = 1;
+    c.learning.implementation = LearningKind::Ppo;
+    c.learning.rollout_length = 1;
+    c.learning.minibatch_size = 1;
+    c.learning.sequence_length = 1;
+    c.learning.optimisation_epochs = 1;
+    let data = loaded(&c);
+    let factory = StandardAgentFactory::with_neural_factory(Box::new(BootstrapForkFailureFactory));
+    let mut engine =
+        SimulationEngine::new_with_factory(c, data, DatasetSplit::Training, Box::new(factory))
+            .unwrap();
+    let before_agents = engine.agents().cloned().collect::<Vec<_>>();
+    let before_events = engine.domain_events.clone();
+    let error = engine.run_steps(1).unwrap_err();
+    assert!(error.to_string().contains("next-value policy fork failed"));
+    assert!(matches!(
+        engine.lifecycle(),
+        SimulationLifecycle::Failed { .. }
+    ));
+    assert_eq!(engine.report().steps, 0);
+    assert_eq!(engine.agents().cloned().collect::<Vec<_>>(), before_agents);
+    assert_eq!(engine.domain_events, before_events);
+    let repeated = engine.run_steps(1).unwrap_err();
+    assert_eq!(repeated.to_string(), error.to_string());
+    assert_eq!(engine.agents().cloned().collect::<Vec<_>>(), before_agents);
+    assert_eq!(engine.domain_events, before_events);
 }
 
 #[test]

@@ -9,7 +9,7 @@ use crate::{
         StandardAgentFactory, configured_blueprint,
     },
     brain::{BrainArchitecture, BrainGenome, ComputeDevice, PolicyContext, PolicySnapshot},
-    config::{Config, DateRange, DeathHandling, PolicyFailureBehavior},
+    config::{Config, DateRange, DeathHandling, LearningKind, PolicyFailureBehavior},
     evolution::{CompletedLifeSummary, DefaultFitnessFunction, EvolutionState},
     execution::{
         CostExecutionEngine, ExecutionApplier, ExecutionPlanner, ExecutionSnapshot, PlannedTrade,
@@ -31,9 +31,10 @@ use crate::{
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
-// Version 6 adds mutation diagnostics, genome creation reasons, and policy
-// temperature runtime state to the Prompt 2 learning/evolution checkpoint.
-pub const CHECKPOINT_VERSION: u32 = 6;
+// Version 7 adds shape-complete optimizer state for full actor/critic head
+// training. Checkpoint 6 cannot be safely migrated because its momentum
+// vectors contain output biases only.
+pub const CHECKPOINT_VERSION: u32 = 7;
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum DatasetSplit {
     Training,
@@ -261,6 +262,22 @@ impl From<MidasError> for StepAbort {
     }
 }
 impl SimulationEngine {
+    fn lifecycle_error(reason: &str) -> MidasError {
+        if let Some(message) = reason.strip_prefix("configuration error: ") {
+            MidasError::Config(message.into())
+        } else if let Some(message) = reason.strip_prefix("market data error: ") {
+            MidasError::Data(message.into())
+        } else if let Some(message) = reason.strip_prefix("accounting invariant failed: ") {
+            MidasError::Accounting(message.into())
+        } else if let Some(message) = reason.strip_prefix("policy error: ") {
+            MidasError::Policy(message.into())
+        } else if let Some(message) = reason.strip_prefix("checkpoint error: ") {
+            MidasError::Checkpoint(message.into())
+        } else {
+            MidasError::Policy(reason.into())
+        }
+    }
+
     pub fn new(config: Config, data: MarketDataset, split: DatasetSplit) -> Result<Self> {
         Self::new_with_factory(
             config,
@@ -406,6 +423,25 @@ impl SimulationEngine {
             .iter()
             .map(|agent| (agent.state.id, agent.policy.policy_blueprint()))
     }
+    pub fn agent_lifetime_parameters(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<Option<crate::brain::LifetimeParameters>> {
+        let agent = self
+            .agents
+            .iter()
+            .find(|agent| agent.state.id == agent_id)
+            .ok_or_else(|| MidasError::Policy(format!("agent {agent_id:?} is not present")))?;
+        agent.policy.lifetime_parameters()
+    }
+    pub fn agent_policy_snapshot(&self, agent_id: AgentId) -> Result<PolicySnapshot> {
+        let agent = self
+            .agents
+            .iter()
+            .find(|agent| agent.state.id == agent_id)
+            .ok_or_else(|| MidasError::Policy(format!("agent {agent_id:?} is not present")))?;
+        agent.policy.snapshot()
+    }
     pub fn observation_schema(&self) -> &ObservationSchema {
         &self.observation_schema
     }
@@ -422,7 +458,7 @@ impl SimulationEngine {
         match &self.lifecycle {
             SimulationLifecycle::Completed => return Ok(self.report()),
             SimulationLifecycle::Failed { reason } => {
-                return Err(MidasError::Policy(reason.clone()));
+                return Err(Self::lifecycle_error(reason));
             }
             SimulationLifecycle::Initialized | SimulationLifecycle::Running => {}
         }
@@ -445,7 +481,7 @@ impl SimulationEngine {
         match &self.lifecycle {
             SimulationLifecycle::Completed => return Ok(()),
             SimulationLifecycle::Failed { reason } => {
-                return Err(MidasError::Policy(reason.clone()));
+                return Err(Self::lifecycle_error(reason));
             }
             SimulationLifecycle::Initialized | SimulationLifecycle::Running => {}
         }
@@ -688,7 +724,9 @@ impl SimulationEngine {
                         false,
                     )?;
                     transaction.events.extend(events);
-                    let next_value = if death.is_none() {
+                    let next_value = if death.is_none()
+                        && self.config.learning.implementation == LearningKind::Ppo
+                    {
                         self.next_value_estimate(agent, t + 1, &next_prices, &next_tradable)?
                     } else {
                         0.0
@@ -1065,10 +1103,9 @@ impl SimulationEngine {
         ) {
             return Ok(0.0);
         }
-        let mut policy = match agent.policy.fork() {
-            Ok(policy) => policy,
-            Err(_) => return Ok(0.0),
-        };
+        let mut policy = agent.policy.fork().map_err(|error| {
+            MidasError::Policy(format!("next-value policy fork failed: {error}"))
+        })?;
         let market = self
             .features
             .get(step)
@@ -1522,13 +1559,18 @@ impl SimulationEngine {
         let bytes = fs::read(path)?;
         let cp: Checkpoint = bincode::deserialize(&bytes).map_err(|_| {
             MidasError::Checkpoint(format!(
-                "incompatible checkpoint; expected format version {CHECKPOINT_VERSION}"
+                "incompatible checkpoint; expected format version {CHECKPOINT_VERSION}; older files such as format 6 may contain bias-only optimizer state"
             ))
         })?;
         if cp.version != CHECKPOINT_VERSION {
+            let detail = if cp.version == 6 {
+                "; checkpoint 6 contains bias-only optimizer state and cannot be migrated safely"
+            } else {
+                ""
+            };
             return Err(MidasError::Checkpoint(format!(
-                "checkpoint version {} is incompatible with {CHECKPOINT_VERSION}",
-                cp.version
+                "checkpoint version {} is incompatible with {CHECKPOINT_VERSION}{detail}",
+                cp.version,
             )));
         }
         if cp.dataset_identity != data.identity {

@@ -45,10 +45,62 @@ fn ppo_learning_and_checkpoint_resume_are_deterministic() {
         uninterrupted.agents().collect::<Vec<_>>(),
         resumed.agents().collect::<Vec<_>>()
     );
+    for state in uninterrupted.agents() {
+        assert_eq!(
+            uninterrupted.agent_lifetime_parameters(state.id).unwrap(),
+            resumed.agent_lifetime_parameters(state.id).unwrap()
+        );
+        assert_eq!(
+            uninterrupted.agent_policy_snapshot(state.id).unwrap(),
+            resumed.agent_policy_snapshot(state.id).unwrap()
+        );
+    }
     assert_eq!(resumed.lifecycle(), SimulationLifecycle::Completed);
     let before = resumed.domain_events.len();
     resumed.run().unwrap();
     assert_eq!(before, resumed.domain_events.len());
+}
+
+#[test]
+fn prompt2_ppo_updates_full_heads_with_a_frozen_encoder() {
+    let config = prompt2_config();
+    let data = PolarsDataSource.load(&config).unwrap();
+    let mut engine = SimulationEngine::new(config, data, DatasetSplit::Training).unwrap();
+    let agent_id = engine.agents().next().unwrap().id;
+    let before = engine
+        .agent_lifetime_parameters(agent_id)
+        .unwrap()
+        .expect("neural agent lifetime parameters");
+    let birth_genome = engine
+        .agents()
+        .find(|state| state.id == agent_id)
+        .unwrap()
+        .genome
+        .clone()
+        .unwrap();
+
+    engine.run_steps(4).unwrap();
+
+    let after = engine
+        .agent_lifetime_parameters(agent_id)
+        .unwrap()
+        .expect("neural agent lifetime parameters");
+    assert_ne!(before.actor.weights, after.actor.weights);
+    assert_ne!(before.actor.bias, after.actor.bias);
+    assert_ne!(before.critic.weights, after.critic.weights);
+    assert_ne!(before.critic.bias, after.critic.bias);
+    assert_eq!(before.hidden, after.hidden);
+    assert_eq!(before.recurrent, after.recurrent);
+    assert_eq!(
+        birth_genome,
+        engine
+            .agents()
+            .find(|state| state.id == agent_id)
+            .unwrap()
+            .genome
+            .clone()
+            .unwrap()
+    );
 }
 
 #[test]

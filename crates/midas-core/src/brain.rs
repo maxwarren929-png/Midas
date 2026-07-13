@@ -321,18 +321,67 @@ pub enum NeuralModelState {
     },
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct DenseOptimizerState {
+    pub weight_momentum: Vec<f32>,
+    pub bias_momentum: Vec<f32>,
+}
+impl DenseOptimizerState {
+    fn empty(inputs: usize, outputs: usize) -> Self {
+        Self {
+            weight_momentum: vec![0.0; inputs * outputs],
+            bias_momentum: vec![0.0; outputs],
+        }
+    }
+
+    fn validate(&self, inputs: usize, outputs: usize, label: &str) -> Result<()> {
+        if self.weight_momentum.len() != inputs * outputs
+            || self.bias_momentum.len() != outputs
+            || self
+                .weight_momentum
+                .iter()
+                .chain(&self.bias_momentum)
+                .any(|value| !value.is_finite())
+        {
+            return Err(MidasError::Checkpoint(format!(
+                "neural optimizer {label} state shape or finiteness mismatch"
+            )));
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct OptimizerState {
     pub step: u64,
-    pub actor_momentum: Vec<f32>,
-    pub critic_momentum: Vec<f32>,
+    pub actor: DenseOptimizerState,
+    pub critic: DenseOptimizerState,
 }
 impl OptimizerState {
     pub fn empty(architecture: &BrainArchitecture) -> Self {
         Self {
             step: 0,
-            actor_momentum: vec![0.0; architecture.actor_output_size],
-            critic_momentum: vec![0.0; architecture.critic_output_size],
+            actor: DenseOptimizerState::empty(
+                architecture.memory.size,
+                architecture.actor_output_size,
+            ),
+            critic: DenseOptimizerState::empty(
+                architecture.memory.size,
+                architecture.critic_output_size,
+            ),
         }
+    }
+
+    fn validate(&self, architecture: &BrainArchitecture) -> Result<()> {
+        self.actor.validate(
+            architecture.memory.size,
+            architecture.actor_output_size,
+            "actor",
+        )?;
+        self.critic.validate(
+            architecture.memory.size,
+            architecture.critic_output_size,
+            "critic",
+        )?;
+        Ok(())
     }
 }
 pub trait NeuralModel: Send {
@@ -448,6 +497,20 @@ impl BurnRuntimeParameters {
             builds: 1,
         }
     }
+
+    fn with_updated_heads(
+        &self,
+        lifetime: &LifetimeParameters,
+        d: &<CpuBackend as burn::tensor::backend::Backend>::Device,
+    ) -> Self {
+        Self {
+            hidden: self.hidden.clone(),
+            recurrent: self.recurrent.clone(),
+            actor: runtime_dense(&lifetime.actor, d),
+            critic: runtime_dense(&lifetime.critic, d),
+            builds: self.builds.saturating_add(1),
+        }
+    }
 }
 fn runtime_dense(
     l: &DenseGenome,
@@ -503,23 +566,14 @@ impl NeuralModelFactory for BurnNeuralModelFactory {
         };
         let lifetime = *parameters;
         lifetime.validate(a)?;
-        if runtime.memory.len() != a.memory.size {
-            return Err(MidasError::Checkpoint(
-                "neural runtime memory size mismatch".into(),
-            ));
-        }
-        if optimizer.actor_momentum.len() != a.actor_output_size
-            || optimizer.critic_momentum.len() != a.critic_output_size
-            || optimizer
-                .actor_momentum
-                .iter()
-                .chain(&optimizer.critic_momentum)
-                .any(|value| !value.is_finite())
+        if runtime.memory.len() != a.memory.size
+            || runtime.memory.iter().any(|value| !value.is_finite())
         {
             return Err(MidasError::Checkpoint(
-                "neural optimizer state shape or finiteness mismatch".into(),
+                "neural runtime memory size or finiteness mismatch".into(),
             ));
         }
+        optimizer.validate(a)?;
         let burn_device = Default::default();
         Ok(Box::new(BurnNeuralModel {
             architecture: a.clone(),
@@ -530,47 +584,16 @@ impl NeuralModelFactory for BurnNeuralModelFactory {
         }))
     }
 }
+struct EncodedState {
+    representation: Vec<f32>,
+    next_runtime_state: NeuralRuntimeState,
+}
 impl NeuralModel for BurnNeuralModel {
     fn forward(&mut self, input: &NeuralInput<'_>) -> Result<NeuralOutput> {
-        if input.observation.schema_hash != self.architecture.observation_schema_hash
-            || input.observation.values.len() != self.architecture.observation_size
-            || input.observation.values.iter().any(|v| !v.is_finite())
-        {
-            return Err(MidasError::Policy("invalid neural observation".into()));
-        }
-        let device = Default::default();
-        let mut x = Tensor::<CpuBackend, 2>::from_data(
-            TensorData::new(
-                input.observation.values.clone(),
-                [1, self.architecture.observation_size],
-            ),
-            &device,
-        );
-        for l in &self.cached.hidden {
-            x = activate(dense_runtime(x, l), self.architecture.activation);
-        }
-        let memory = Tensor::<CpuBackend, 2>::from_data(
-            TensorData::new(
-                self.runtime.memory.clone(),
-                [1, self.architecture.memory.size],
-            ),
-            &device,
-        );
-        let next = activation::silu(dense_runtime(
-            Tensor::cat(vec![x, memory], 1),
-            &self.cached.recurrent,
-        ));
-        let logits = to_vec(dense_runtime(next.clone(), &self.cached.actor))?;
-        let value = to_vec(dense_runtime(next.clone(), &self.cached.critic))?[0];
-        self.runtime.memory = to_vec(next)?;
-        self.runtime.inference_steps += 1;
-        if logits.iter().any(|v| !v.is_finite())
-            || !value.is_finite()
-            || self.runtime.memory.iter().any(|v| !v.is_finite())
-        {
-            return Err(MidasError::Policy("non-finite neural output".into()));
-        }
-        Ok(NeuralOutput { logits, value })
+        let encoded = self.encode_observation(input.observation, &self.runtime)?;
+        let output = self.evaluate_representation(&encoded.representation)?;
+        self.runtime = encoded.next_runtime_state;
+        Ok(output)
     }
     fn reset_memory(&mut self) {
         self.runtime.memory.fill(0.0)
@@ -609,6 +632,93 @@ impl NeuralModel for BurnNeuralModel {
     }
     fn runtime_state(&self) -> Option<NeuralRuntimeState> {
         Some(self.runtime.clone())
+    }
+}
+impl BurnNeuralModel {
+    fn encode_observation(
+        &self,
+        observation: &Observation,
+        recurrent_state: &NeuralRuntimeState,
+    ) -> Result<EncodedState> {
+        if observation.schema_hash != self.architecture.observation_schema_hash
+            || observation.values.len() != self.architecture.observation_size
+            || observation.values.iter().any(|value| !value.is_finite())
+            || recurrent_state.memory.len() != self.architecture.memory.size
+            || recurrent_state
+                .memory
+                .iter()
+                .any(|value| !value.is_finite())
+        {
+            return Err(MidasError::Policy(
+                "invalid neural observation or recurrent state".into(),
+            ));
+        }
+        let device = Default::default();
+        let mut x = Tensor::<CpuBackend, 2>::from_data(
+            TensorData::new(
+                observation.values.clone(),
+                [1, self.architecture.observation_size],
+            ),
+            &device,
+        );
+        for l in &self.cached.hidden {
+            x = activate(dense_runtime(x, l), self.architecture.activation);
+        }
+        let memory = Tensor::<CpuBackend, 2>::from_data(
+            TensorData::new(
+                recurrent_state.memory.clone(),
+                [1, self.architecture.memory.size],
+            ),
+            &device,
+        );
+        let next = activation::silu(dense_runtime(
+            Tensor::cat(vec![x, memory], 1),
+            &self.cached.recurrent,
+        ));
+        let representation = to_vec(next)?;
+        if representation.len() != self.architecture.memory.size
+            || representation.iter().any(|value| !value.is_finite())
+        {
+            return Err(MidasError::Policy(
+                "non-finite or incorrectly sized recurrent representation".into(),
+            ));
+        }
+        Ok(EncodedState {
+            representation: representation.clone(),
+            next_runtime_state: NeuralRuntimeState {
+                memory: representation.clone(),
+                inference_steps: recurrent_state.inference_steps.saturating_add(1),
+            },
+        })
+    }
+
+    fn evaluate_representation(&self, representation: &[f32]) -> Result<NeuralOutput> {
+        if representation.len() != self.architecture.memory.size
+            || representation.iter().any(|value| !value.is_finite())
+        {
+            return Err(MidasError::Policy(
+                "invalid encoded neural representation".into(),
+            ));
+        }
+        let device = Default::default();
+        let state = Tensor::<CpuBackend, 2>::from_data(
+            TensorData::new(representation.to_vec(), [1, self.architecture.memory.size]),
+            &device,
+        );
+        let logits = to_vec(dense_runtime(state.clone(), &self.cached.actor))?;
+        let critic = to_vec(dense_runtime(state, &self.cached.critic))?;
+        if critic.len() != self.architecture.critic_output_size
+            || self.architecture.critic_output_size != 1
+        {
+            return Err(MidasError::Policy(
+                "critic output must contain exactly one value".into(),
+            ));
+        }
+        let value = critic[0];
+        if logits.iter().any(|v| !v.is_finite()) || !value.is_finite() {
+            return Err(MidasError::Policy("non-finite neural output".into()));
+        }
+        Ok(NeuralOutput { logits, value })
     }
 }
 fn dense_runtime(x: Tensor<CpuBackend, 2>, l: &BurnRuntimeDense) -> Tensor<CpuBackend, 2> {
@@ -704,8 +814,19 @@ fn train_burn_heads_inner(
             "invalid PPO update configuration".into(),
         ));
     }
-    let mut actor_gradient = vec![0.0_f32; model.architecture.actor_output_size];
-    let mut critic_gradient = vec![0.0_f32; model.architecture.critic_output_size];
+    let actor_inputs = model.architecture.memory.size;
+    let actor_outputs = model.architecture.actor_output_size;
+    let critic_inputs = model.architecture.memory.size;
+    let critic_outputs = model.architecture.critic_output_size;
+    if critic_outputs != 1 {
+        return Err(MidasError::Policy(
+            "PPO head training requires a one-output critic".into(),
+        ));
+    }
+    let mut actor_weight_gradient = vec![0.0_f32; actor_inputs * actor_outputs];
+    let mut actor_bias_gradient = vec![0.0_f32; actor_outputs];
+    let mut critic_weight_gradient = vec![0.0_f32; critic_inputs * critic_outputs];
+    let mut critic_bias_gradient = vec![0.0_f32; critic_outputs];
     let mut policy_loss = 0.0_f32;
     let mut value_loss = 0.0_f32;
     let mut entropy = 0.0_f32;
@@ -719,17 +840,22 @@ fn train_burn_heads_inner(
                 "PPO sample does not match neural architecture".into(),
             ));
         }
-        model.runtime = sample.recurrent_state.clone();
-        let output = model.forward(&NeuralInput {
-            observation: &sample.observation,
-        })?;
-        let probabilities = categorical_probabilities(
+        let encoded = model.encode_observation(&sample.observation, &sample.recurrent_state)?;
+        let output = model.evaluate_representation(&encoded.representation)?;
+        let probabilities = single_asset_capped_categorical_probabilities(
             &output.logits,
             &sample.tradable,
             model.architecture.asset_count,
             sample.temperature,
         )?;
-        let new_log_probability = probabilities[sample.action_index].ln();
+        let selected_probability = probabilities
+            .get(sample.action_index)
+            .copied()
+            .filter(|probability| probability.is_finite() && *probability > 0.0)
+            .ok_or_else(|| {
+                MidasError::Policy("PPO sample selected an unavailable action".into())
+            })?;
+        let new_log_probability = selected_probability.ln();
         let sample_entropy = probabilities
             .iter()
             .filter(|probability| **probability > 0.0)
@@ -759,16 +885,18 @@ fn train_burn_heads_inner(
         } else {
             clipped > unclipped
         };
+        let mut actor_output_gradient = vec![0.0_f32; actor_outputs];
         if !clipped_active {
             let coefficient = ratio * sample.advantage;
             for (index, probability) in probabilities.iter().enumerate() {
-                actor_gradient[index] += coefficient
+                actor_output_gradient[index] += coefficient
                     * (*probability as f32
                         - if index == sample.action_index {
                             1.0
                         } else {
                             0.0
-                        });
+                        })
+                    / sample.temperature;
             }
         }
         // The entropy derivative is the exact derivative of the categorical
@@ -776,26 +904,46 @@ fn train_burn_heads_inner(
         if config.entropy_coefficient > 0.0 {
             for (index, probability) in probabilities.iter().enumerate() {
                 if *probability > 0.0 {
-                    actor_gradient[index] += config.entropy_coefficient
+                    actor_output_gradient[index] += config.entropy_coefficient
                         * (*probability as f32)
-                        * (probability.ln() as f32 + sample_entropy);
+                        * (probability.ln() as f32 + sample_entropy)
+                        / sample.temperature;
                 }
             }
         }
-        critic_gradient[0] +=
-            2.0 * config.critic_coefficient * (output.value - sample.return_value);
+        accumulate_dense_gradient(
+            &encoded.representation,
+            &actor_output_gradient,
+            &mut actor_weight_gradient,
+            &mut actor_bias_gradient,
+        )?;
+        let critic_output_gradient =
+            [2.0 * config.critic_coefficient * (output.value - sample.return_value)];
+        accumulate_dense_gradient(
+            &encoded.representation,
+            &critic_output_gradient,
+            &mut critic_weight_gradient,
+            &mut critic_bias_gradient,
+        )?;
     }
 
     let count = batch.samples.len() as f32;
-    for gradient in actor_gradient.iter_mut().chain(critic_gradient.iter_mut()) {
+    for gradient in actor_weight_gradient
+        .iter_mut()
+        .chain(actor_bias_gradient.iter_mut())
+        .chain(critic_weight_gradient.iter_mut())
+        .chain(critic_bias_gradient.iter_mut())
+    {
         *gradient /= count;
         if !gradient.is_finite() {
             return Err(MidasError::Policy("non-finite PPO gradient".into()));
         }
     }
-    let mut gradient_norm = actor_gradient
+    let mut gradient_norm = actor_weight_gradient
         .iter()
-        .chain(&critic_gradient)
+        .chain(&actor_bias_gradient)
+        .chain(&critic_weight_gradient)
+        .chain(&critic_bias_gradient)
         .map(|gradient| gradient * gradient)
         .sum::<f32>()
         .sqrt();
@@ -804,7 +952,12 @@ fn train_burn_heads_inner(
     }
     if config.gradient_clip > 0.0 && gradient_norm > config.gradient_clip {
         let scale = config.gradient_clip / gradient_norm;
-        for gradient in actor_gradient.iter_mut().chain(critic_gradient.iter_mut()) {
+        for gradient in actor_weight_gradient
+            .iter_mut()
+            .chain(actor_bias_gradient.iter_mut())
+            .chain(critic_weight_gradient.iter_mut())
+            .chain(critic_bias_gradient.iter_mut())
+        {
             *gradient *= scale;
         }
         gradient_norm = config.gradient_clip;
@@ -813,43 +966,75 @@ fn train_burn_heads_inner(
     let mut next_optimizer = model.optimizer.clone();
     next_optimizer.step = next_optimizer.step.saturating_add(1);
     let momentum = 0.9_f32;
-    for (index, gradient) in actor_gradient.iter().enumerate() {
-        next_optimizer.actor_momentum[index] =
-            momentum * next_optimizer.actor_momentum[index] + (1.0 - momentum) * gradient;
+    for (state, gradient) in next_optimizer
+        .actor
+        .weight_momentum
+        .iter_mut()
+        .zip(&actor_weight_gradient)
+    {
+        *state = momentum * *state + (1.0 - momentum) * gradient;
     }
-    for (index, gradient) in critic_gradient.iter().enumerate() {
-        next_optimizer.critic_momentum[index] =
-            momentum * next_optimizer.critic_momentum[index] + (1.0 - momentum) * gradient;
+    for (state, gradient) in next_optimizer
+        .actor
+        .bias_momentum
+        .iter_mut()
+        .zip(&actor_bias_gradient)
+    {
+        *state = momentum * *state + (1.0 - momentum) * gradient;
+    }
+    for (state, gradient) in next_optimizer
+        .critic
+        .weight_momentum
+        .iter_mut()
+        .zip(&critic_weight_gradient)
+    {
+        *state = momentum * *state + (1.0 - momentum) * gradient;
+    }
+    for (state, gradient) in next_optimizer
+        .critic
+        .bias_momentum
+        .iter_mut()
+        .zip(&critic_bias_gradient)
+    {
+        *state = momentum * *state + (1.0 - momentum) * gradient;
     }
     let mut next_lifetime = model.lifetime.clone();
+    for (weight, update) in next_lifetime
+        .actor
+        .weights
+        .iter_mut()
+        .zip(&next_optimizer.actor.weight_momentum)
+    {
+        *weight -= config.learning_rate * update;
+    }
     for (bias, update) in next_lifetime
         .actor
         .bias
         .iter_mut()
-        .zip(&next_optimizer.actor_momentum)
+        .zip(&next_optimizer.actor.bias_momentum)
     {
         *bias -= config.learning_rate * update;
+    }
+    for (weight, update) in next_lifetime
+        .critic
+        .weights
+        .iter_mut()
+        .zip(&next_optimizer.critic.weight_momentum)
+    {
+        *weight -= config.learning_rate * update;
     }
     for (bias, update) in next_lifetime
         .critic
         .bias
         .iter_mut()
-        .zip(&next_optimizer.critic_momentum)
+        .zip(&next_optimizer.critic.bias_momentum)
     {
         *bias -= config.learning_rate * update;
     }
     next_lifetime.validate(&model.architecture)?;
-    if next_lifetime
-        .actor
-        .bias
-        .iter()
-        .chain(&next_lifetime.critic.bias)
-        .any(|value| !value.is_finite())
-    {
-        return Err(MidasError::Policy("non-finite PPO parameters".into()));
-    }
+    next_optimizer.validate(&model.architecture)?;
     let device = Default::default();
-    model.cached = BurnRuntimeParameters::from_lifetime(&next_lifetime, &device);
+    model.cached = model.cached.with_updated_heads(&next_lifetime, &device);
     model.lifetime = next_lifetime;
     model.optimizer = next_optimizer;
     Ok(crate::learning::TrainingMetrics {
@@ -861,6 +1046,43 @@ fn train_burn_heads_inner(
         gradient_norm,
         update_index: model.optimizer.step,
     })
+}
+
+fn accumulate_dense_gradient(
+    representation: &[f32],
+    output_gradient: &[f32],
+    weight_gradient: &mut [f32],
+    bias_gradient: &mut [f32],
+) -> Result<()> {
+    if weight_gradient.len() != representation.len() * output_gradient.len()
+        || bias_gradient.len() != output_gradient.len()
+    {
+        return Err(MidasError::Policy(
+            "dense gradient dimensions do not match head dimensions".into(),
+        ));
+    }
+    for (output, gradient) in output_gradient.iter().enumerate() {
+        if !gradient.is_finite() {
+            return Err(MidasError::Policy(
+                "non-finite dense output gradient".into(),
+            ));
+        }
+        bias_gradient[output] += *gradient;
+        for (input, value) in representation.iter().enumerate() {
+            if !value.is_finite() {
+                return Err(MidasError::Policy("non-finite dense representation".into()));
+            }
+            weight_gradient[input * output_gradient.len() + output] += value * gradient;
+        }
+    }
+    if weight_gradient
+        .iter()
+        .chain(bias_gradient.iter())
+        .any(|value| !value.is_finite())
+    {
+        return Err(MidasError::Policy("non-finite dense gradient".into()));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, Serialize, Deserialize, PartialEq)]
@@ -993,7 +1215,7 @@ impl Policy for NeuralPolicy {
         maximum_asset_allocation: f64,
     ) -> Result<PolicyEvaluation> {
         let out = self.model.forward(&NeuralInput { observation: o })?;
-        let evaluation = categorical_evaluation(
+        let evaluation = single_asset_capped_categorical_evaluation(
             out,
             c.tradable,
             maximum_asset_allocation,
@@ -1048,12 +1270,12 @@ impl Policy for NeuralPolicy {
     }
 }
 
-/// The training distribution is categorical over cash and each tradable
-/// asset. An asset draw maps to a legal allocation of `maximum_allocation` in
-/// that asset and the remainder in cash; a cash draw is all cash. This keeps
-/// the sampled action and its probability in the same constrained action
-/// space, unlike post-hoc clipping of a continuous simplex sample.
-fn categorical_evaluation(
+/// The training distribution is a single-asset capped categorical action
+/// space: cash, or one tradable asset at the configured maximum allocation
+/// with the remainder in cash. It is deliberately not a general multi-asset
+/// simplex distribution. The sampled action and log probability therefore
+/// remain in the same legal action space without post-hoc clipping.
+fn single_asset_capped_categorical_evaluation(
     output: NeuralOutput,
     tradable: &[bool],
     maximum_asset_allocation: f64,
@@ -1069,11 +1291,15 @@ fn categorical_evaluation(
         || !(0.0..=1.0).contains(&maximum_asset_allocation)
     {
         return Err(MidasError::Policy(
-            "invalid categorical policy output or action bounds".into(),
+            "invalid single-asset capped categorical output or action bounds".into(),
         ));
     }
-    let probabilities =
-        categorical_probabilities(&output.logits, tradable, tradable.len(), temperature)?;
+    let probabilities = single_asset_capped_categorical_probabilities(
+        &output.logits,
+        tradable,
+        tradable.len(),
+        temperature,
+    )?;
     let entropy = probabilities
         .iter()
         .filter(|probability| **probability > 0.0)
@@ -1121,7 +1347,7 @@ fn categorical_evaluation(
     })
 }
 
-fn categorical_probabilities(
+fn single_asset_capped_categorical_probabilities(
     logits: &[f32],
     tradable: &[bool],
     asset_count: usize,
@@ -1129,12 +1355,12 @@ fn categorical_probabilities(
 ) -> Result<Vec<f64>> {
     if logits.len() != asset_count + 1 || tradable.len() != asset_count {
         return Err(MidasError::Policy(
-            "categorical logits and tradability dimensions mismatch".into(),
+            "single-asset capped categorical dimensions mismatch".into(),
         ));
     }
     if !temperature.is_finite() || temperature <= 0.0 {
         return Err(MidasError::Policy(
-            "categorical temperature is invalid".into(),
+            "single-asset capped categorical temperature is invalid".into(),
         ));
     }
     let scaled = logits
@@ -1149,7 +1375,9 @@ fn categorical_probabilities(
         })
         .collect::<Vec<_>>();
     if scaled.iter().any(|value| value.is_nan()) {
-        return Err(MidasError::Policy("non-finite categorical logits".into()));
+        return Err(MidasError::Policy(
+            "non-finite single-asset capped categorical logits".into(),
+        ));
     }
     let peak = scaled.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let mut probabilities = scaled
@@ -1165,7 +1393,7 @@ fn categorical_probabilities(
     let sum = probabilities.iter().sum::<f64>();
     if !sum.is_finite() || sum <= 0.0 {
         return Err(MidasError::Policy(
-            "categorical probabilities are invalid".into(),
+            "single-asset capped categorical probabilities are invalid".into(),
         ));
     }
     for probability in &mut probabilities {
@@ -1355,6 +1583,77 @@ mod tests {
         }
     }
 
+    fn ppo_sample(
+        values: Vec<f32>,
+        action_index: usize,
+        advantage: f32,
+        return_value: f32,
+        old_log_probability: f32,
+    ) -> PpoTrainingSample {
+        PpoTrainingSample {
+            observation: Observation {
+                schema_hash: "schema".into(),
+                values,
+            },
+            action_index,
+            old_log_probability,
+            advantage,
+            return_value,
+            value_estimate: 0.0,
+            recurrent_state: NeuralRuntimeState {
+                memory: vec![0.0],
+                inference_steps: 0,
+            },
+            tradable: vec![true],
+            temperature: 1.0,
+        }
+    }
+
+    fn deterministic_head_model() -> BurnNeuralModel {
+        let mut architecture = architecture();
+        architecture.activation = Activation::Silu;
+        let genome =
+            BrainGenome::random(&architecture, &EvolvableTraitsConfig::default(), 31).unwrap();
+        let lifetime = LifetimeParameters {
+            hidden: vec![DenseGenome {
+                inputs: 2,
+                outputs: 2,
+                weights: vec![1.0, 0.0, 0.0, 1.0],
+                bias: vec![0.0, 0.0],
+            }],
+            recurrent: DenseGenome {
+                inputs: 3,
+                outputs: 1,
+                weights: vec![1.0, 0.0, 0.0],
+                bias: vec![0.0],
+            },
+            actor: DenseGenome {
+                inputs: 1,
+                outputs: 2,
+                weights: vec![0.0, 0.0],
+                bias: vec![0.0, 0.0],
+            },
+            critic: DenseGenome {
+                inputs: 1,
+                outputs: 1,
+                weights: vec![0.0],
+                bias: vec![0.0],
+            },
+        };
+        lifetime.validate(&architecture).unwrap();
+        let burn_device = Default::default();
+        BurnNeuralModel {
+            architecture,
+            cached: BurnRuntimeParameters::from_lifetime(&lifetime, &burn_device),
+            lifetime,
+            runtime: NeuralRuntimeState {
+                memory: vec![0.0],
+                inference_steps: 0,
+            },
+            optimizer: OptimizerState::empty(&genome.architecture),
+        }
+    }
+
     #[test]
     fn burn_training_changes_lifetime_parameters_without_changing_genome() {
         let architecture = architecture();
@@ -1396,6 +1695,297 @@ mod tests {
     }
 
     #[test]
+    fn ppo_head_learning_changes_actor_weights_regression() {
+        let architecture = architecture();
+        let traits = EvolvableTraitsConfig::default();
+        let genome = BrainGenome::random(&architecture, &traits, 11).unwrap();
+        let device = ComputeDevice::CpuNdArray {
+            device: "default".into(),
+        };
+        let mut model = BurnNeuralModelFactory
+            .build(&genome, &architecture, &device)
+            .unwrap();
+        let before = model.lifetime_parameters().unwrap();
+        let batch = PpoTrainingBatch {
+            samples: vec![PpoTrainingSample {
+                observation: Observation {
+                    schema_hash: "schema".into(),
+                    values: vec![0.8, -0.3],
+                },
+                action_index: 1,
+                old_log_probability: -0.7,
+                advantage: 1.0,
+                return_value: 0.5,
+                value_estimate: 0.0,
+                recurrent_state: NeuralRuntimeState {
+                    memory: vec![0.0],
+                    inference_steps: 0,
+                },
+                tradable: vec![true],
+                temperature: 1.0,
+            }],
+            sequence_length: 1,
+        };
+
+        model.train_batch(&batch, &learning_config()).unwrap();
+        let after = model.lifetime_parameters().unwrap();
+        assert_ne!(
+            before.actor.weights, after.actor.weights,
+            "PPO must update the actor output weight matrix, not only its bias"
+        );
+    }
+
+    #[test]
+    fn full_head_training_updates_heads_but_freezes_encoder_and_genome() {
+        let architecture = architecture();
+        let genome =
+            BrainGenome::random(&architecture, &EvolvableTraitsConfig::default(), 41).unwrap();
+        let before_genome = genome.clone();
+        let device = ComputeDevice::CpuNdArray {
+            device: "default".into(),
+        };
+        let mut model = BurnNeuralModelFactory
+            .build(&genome, &architecture, &device)
+            .unwrap();
+        let before = model.lifetime_parameters().unwrap();
+        let builds_before = model.runtime_parameter_builds();
+        let batch = PpoTrainingBatch {
+            samples: vec![ppo_sample(vec![0.6, -0.2], 1, 1.0, 2.0, -0.7)],
+            sequence_length: 1,
+        };
+        model.train_batch(&batch, &learning_config()).unwrap();
+        let after = model.lifetime_parameters().unwrap();
+        assert_ne!(before.actor.weights, after.actor.weights);
+        assert_ne!(before.actor.bias, after.actor.bias);
+        assert_ne!(before.critic.weights, after.critic.weights);
+        assert_ne!(before.critic.bias, after.critic.bias);
+        assert_eq!(before.hidden, after.hidden);
+        assert_eq!(before.recurrent, after.recurrent);
+        assert_eq!(before_genome, genome);
+
+        let optimizer = model.optimizer_state().unwrap();
+        assert_eq!(
+            optimizer.actor.weight_momentum.len(),
+            architecture.memory.size * architecture.actor_output_size
+        );
+        assert_eq!(
+            optimizer.actor.bias_momentum.len(),
+            architecture.actor_output_size
+        );
+        assert_eq!(
+            optimizer.critic.weight_momentum.len(),
+            architecture.memory.size * architecture.critic_output_size
+        );
+        assert_eq!(
+            optimizer.critic.bias_momentum.len(),
+            architecture.critic_output_size
+        );
+        assert_eq!(model.runtime_parameter_builds(), builds_before + 1);
+    }
+
+    #[test]
+    fn dense_gradient_matches_outer_product_exactly() {
+        let representation = [2.0_f32, -1.0];
+        let output_gradient = [0.5_f32, -0.25];
+        let mut weight_gradient = vec![0.0; 4];
+        let mut bias_gradient = vec![0.0; 2];
+        accumulate_dense_gradient(
+            &representation,
+            &output_gradient,
+            &mut weight_gradient,
+            &mut bias_gradient,
+        )
+        .unwrap();
+        assert_eq!(weight_gradient, vec![1.0, -0.5, -0.5, 0.25]);
+        assert_eq!(bias_gradient, vec![0.5, -0.25]);
+    }
+
+    #[test]
+    fn clipped_policy_gradient_suppresses_head_update_but_keeps_objective_valid() {
+        let mut model = deterministic_head_model();
+        let before = model.lifetime_parameters().unwrap();
+        let mut config = learning_config();
+        config.critic_coefficient = 0.0;
+        config.entropy_coefficient = 0.0;
+        let sample = ppo_sample(vec![1.0, 0.0], 1, 1.0, 0.0, -2.0 * std::f32::consts::LN_2);
+        let metrics = model
+            .train_batch(
+                &PpoTrainingBatch {
+                    samples: vec![sample],
+                    sequence_length: 1,
+                },
+                &config,
+            )
+            .unwrap();
+        let after = model.lifetime_parameters().unwrap();
+        assert_eq!(before.actor, after.actor);
+        assert_eq!(before.critic, after.critic);
+        assert_eq!(metrics.gradient_norm, 0.0);
+    }
+
+    #[test]
+    fn actor_learning_is_state_dependent_for_two_encoded_states() {
+        let mut model = deterministic_head_model();
+        let mut config = learning_config();
+        config.learning_rate = 0.4;
+        config.ppo_clip = 10.0;
+        config.critic_coefficient = 0.0;
+        config.entropy_coefficient = 0.0;
+        config.gradient_clip = 100.0;
+        config.optimisation_epochs = 8;
+        config.minibatch_size = 2;
+        let batch = PpoTrainingBatch {
+            samples: vec![
+                ppo_sample(vec![1.0, 0.0], 1, 1.0, 0.0, -std::f32::consts::LN_2),
+                ppo_sample(vec![-1.0, 0.0], 0, 1.0, 0.0, -std::f32::consts::LN_2),
+            ],
+            sequence_length: 1,
+        };
+        model.train_batch(&batch, &config).unwrap();
+        let zero = NeuralRuntimeState {
+            memory: vec![0.0],
+            inference_steps: 0,
+        };
+        let state_a = model
+            .encode_observation(
+                &Observation {
+                    schema_hash: "schema".into(),
+                    values: vec![1.0, 0.0],
+                },
+                &zero,
+            )
+            .unwrap();
+        let state_b = model
+            .encode_observation(
+                &Observation {
+                    schema_hash: "schema".into(),
+                    values: vec![-1.0, 0.0],
+                },
+                &zero,
+            )
+            .unwrap();
+        let output_a = model
+            .evaluate_representation(&state_a.representation)
+            .unwrap();
+        let output_b = model
+            .evaluate_representation(&state_b.representation)
+            .unwrap();
+        let probabilities_a =
+            single_asset_capped_categorical_probabilities(&output_a.logits, &[true], 1, 1.0)
+                .unwrap();
+        let probabilities_b =
+            single_asset_capped_categorical_probabilities(&output_b.logits, &[true], 1, 1.0)
+                .unwrap();
+        assert!(probabilities_a[1] > probabilities_a[0]);
+        assert!(probabilities_b[0] > probabilities_b[1]);
+        assert!(probabilities_a[1] > probabilities_b[1] + 1e-4);
+    }
+
+    #[test]
+    fn critic_learning_is_state_dependent_for_two_encoded_states() {
+        let mut model = deterministic_head_model();
+        let mut config = learning_config();
+        config.learning_rate = 0.4;
+        config.ppo_clip = 10.0;
+        config.critic_coefficient = 1.0;
+        config.entropy_coefficient = 0.0;
+        config.gradient_clip = 100.0;
+        config.optimisation_epochs = 8;
+        config.minibatch_size = 2;
+        let batch = PpoTrainingBatch {
+            samples: vec![
+                ppo_sample(vec![1.0, 0.0], 0, 0.0, 2.0, -std::f32::consts::LN_2),
+                ppo_sample(vec![-1.0, 0.0], 0, 0.0, -2.0, -std::f32::consts::LN_2),
+            ],
+            sequence_length: 1,
+        };
+        model.train_batch(&batch, &config).unwrap();
+        let zero = NeuralRuntimeState {
+            memory: vec![0.0],
+            inference_steps: 0,
+        };
+        let state_a = model
+            .encode_observation(
+                &Observation {
+                    schema_hash: "schema".into(),
+                    values: vec![1.0, 0.0],
+                },
+                &zero,
+            )
+            .unwrap();
+        let state_b = model
+            .encode_observation(
+                &Observation {
+                    schema_hash: "schema".into(),
+                    values: vec![-1.0, 0.0],
+                },
+                &zero,
+            )
+            .unwrap();
+        let value_a = model
+            .evaluate_representation(&state_a.representation)
+            .unwrap()
+            .value;
+        let value_b = model
+            .evaluate_representation(&state_b.representation)
+            .unwrap()
+            .value;
+        assert!(value_a > value_b);
+    }
+
+    #[test]
+    fn malformed_full_head_optimizer_state_is_rejected_on_restore() {
+        let architecture = architecture();
+        let genome =
+            BrainGenome::random(&architecture, &EvolvableTraitsConfig::default(), 51).unwrap();
+        let device = ComputeDevice::CpuNdArray {
+            device: "default".into(),
+        };
+        let model = BurnNeuralModelFactory
+            .build(&genome, &architecture, &device)
+            .unwrap();
+        let base_state = model.snapshot_state().unwrap();
+        for invalid in 0..4 {
+            let NeuralModelState::Burn {
+                parameters,
+                runtime,
+                mut optimizer,
+            } = base_state.clone()
+            else {
+                panic!("expected Burn state")
+            };
+            match invalid {
+                0 => {
+                    optimizer.actor.weight_momentum.pop();
+                }
+                1 => {
+                    optimizer.actor.bias_momentum.pop();
+                }
+                2 => {
+                    optimizer.critic.weight_momentum.pop();
+                }
+                _ => {
+                    optimizer.critic.bias_momentum[0] = f32::NAN;
+                }
+            }
+            let error = match BurnNeuralModelFactory.restore(
+                &genome,
+                &architecture,
+                NeuralModelState::Burn {
+                    parameters,
+                    runtime,
+                    optimizer,
+                },
+                &device,
+            ) {
+                Ok(_) => panic!("shape-invalid optimizer state was accepted"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("optimizer"));
+        }
+    }
+
+    #[test]
     fn genome_validation_rejects_hidden_layout_changes() {
         let architecture = architecture();
         let mut genome =
@@ -1411,7 +2001,7 @@ mod tests {
             value: 0.0,
         };
         let mut deterministic_rng = ChaCha8Rng::seed_from_u64(1);
-        let deterministic = categorical_evaluation(
+        let deterministic = single_asset_capped_categorical_evaluation(
             output.clone(),
             &[true, false],
             0.5,
@@ -1433,11 +2023,24 @@ mod tests {
         assert_eq!(deterministic.proposed_allocation.weights()[2], 0.0);
         let mut left_rng = ChaCha8Rng::seed_from_u64(5);
         let mut right_rng = ChaCha8Rng::seed_from_u64(5);
-        let left =
-            categorical_evaluation(output.clone(), &[true, true], 0.5, true, 1.0, &mut left_rng)
-                .unwrap();
-        let right =
-            categorical_evaluation(output, &[true, true], 0.5, true, 1.0, &mut right_rng).unwrap();
+        let left = single_asset_capped_categorical_evaluation(
+            output.clone(),
+            &[true, true],
+            0.5,
+            true,
+            1.0,
+            &mut left_rng,
+        )
+        .unwrap();
+        let right = single_asset_capped_categorical_evaluation(
+            output,
+            &[true, true],
+            0.5,
+            true,
+            1.0,
+            &mut right_rng,
+        )
+        .unwrap();
         assert_eq!(left, right);
     }
 }
