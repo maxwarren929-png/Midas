@@ -2,11 +2,14 @@ pub mod action;
 pub mod agent;
 pub mod brain;
 pub mod config;
+pub mod evolution;
 pub mod execution;
+pub mod learning;
 pub mod market;
 pub mod metrics;
 pub mod observation;
 pub mod replacement;
+pub mod reward;
 pub mod simulation;
 
 use serde::{Deserialize, Serialize};

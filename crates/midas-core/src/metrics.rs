@@ -27,6 +27,10 @@ pub struct MetricsCollector {
     pub policy_failures: u64,
     pub deaths: u64,
     pub births: u64,
+    pub learning_updates: u64,
+    pub fitness_assignments: u64,
+    pub reproductions: u64,
+    pub evolution_fallbacks: u64,
 }
 impl EventSink for MetricsCollector {
     fn on_event(&mut self, event: &DomainEvent) {
@@ -55,10 +59,17 @@ impl EventSink for MetricsCollector {
             } => add_trade(self.agents.entry(*agent_id).or_default(), trade),
             DomainEvent::ActionFallback { .. } => self.invalid_actions += 1,
             DomainEvent::PolicyFailure { .. } => self.policy_failures += 1,
+            DomainEvent::LearningUpdate { .. } => self.learning_updates += 1,
+            DomainEvent::FitnessAssigned { .. } => self.fitness_assignments += 1,
+            DomainEvent::ParentsSelected { .. } => self.reproductions += 1,
+            DomainEvent::EvolutionFallback { .. } => self.evolution_fallbacks += 1,
             DomainEvent::TradeRejected { .. } => self.rejected_trades += 1,
-            DomainEvent::AgentDied { agent_id, .. } => {
+            DomainEvent::AgentDied {
+                agent_id, cause, ..
+            } => {
                 self.deaths += 1;
-                self.agents.entry(*agent_id).or_default().bankrupt = true
+                self.agents.entry(*agent_id).or_default().bankrupt =
+                    matches!(cause, crate::simulation::DeathCause::Bankruptcy)
             }
             _ => {}
         }

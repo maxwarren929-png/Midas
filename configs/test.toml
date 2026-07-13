@@ -112,6 +112,9 @@ critic_coefficient = 0.5
 entropy_coefficient = 0.01
 gradient_clip = 1.0
 rollout_length = 128
+minibatch_size = 32
+sequence_length = 16
+normalize_advantages = true
 optimisation_epochs = 4
 
 [backend]

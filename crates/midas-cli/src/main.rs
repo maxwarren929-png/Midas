@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use midas_core::{
-    config::{Config, PolicyKind},
+    config::{Config, LearningKind, PolicyKind},
     market::{MarketDataSource, PolarsDataSource},
     simulation::{DatasetSplit, SimulationEngine},
 };
@@ -43,6 +43,12 @@ enum Command {
         checkpoint: PathBuf,
     },
     Benchmark {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, value_enum, default_value = "test")]
+        split: SplitArg,
+    },
+    EvolutionReport {
         #[arg(long)]
         config: PathBuf,
         #[arg(long, value_enum, default_value = "test")]
@@ -113,6 +119,8 @@ fn main() -> Result<()> {
             ] {
                 let mut c = base.clone();
                 c.brain.policy = policy;
+                c.learning.implementation = LearningKind::NoLearning;
+                c.evolution.enabled = false;
                 let name = format!("{policy:?}");
                 let mut engine = SimulationEngine::new(c, data.clone(), split.into())?;
                 let report = engine.run()?;
@@ -123,6 +131,19 @@ fn main() -> Result<()> {
                     .unwrap_or_default();
                 println!("{name}: ending_net_worth={ending:.4}");
             }
+        }
+        Command::EvolutionReport { config, split } => {
+            let c = Config::load(&config)?;
+            let d = PolarsDataSource.load(&c)?;
+            let mut engine = SimulationEngine::new(c, d, split.into())?;
+            let report = engine.run()?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "simulation": report,
+                    "evolution": engine.evolution_state(),
+                }))?
+            );
         }
     }
     Ok(())

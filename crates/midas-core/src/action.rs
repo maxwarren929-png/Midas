@@ -20,6 +20,9 @@ impl ProposedAllocation {
             rebalance: false,
         }
     }
+    pub fn weights(&self) -> &[f64] {
+        &self.weights
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

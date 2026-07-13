@@ -10,9 +10,11 @@ use crate::{
     },
     brain::{BrainArchitecture, BrainGenome, ComputeDevice, PolicyContext, PolicySnapshot},
     config::{Config, DateRange, DeathHandling, PolicyFailureBehavior},
+    evolution::{CompletedLifeSummary, DefaultFitnessFunction, EvolutionState},
     execution::{
         CostExecutionEngine, ExecutionApplier, ExecutionPlanner, ExecutionSnapshot, PlannedTrade,
     },
+    learning::{EpisodeEndContext, LearningUpdate, Transition},
     market::{
         BackwardFeaturePipeline, CorporateAction, FeaturePipeline, FeatureRow, MarketDataset,
     },
@@ -24,12 +26,14 @@ use crate::{
         LivingAgentSummary, NonEvolutionaryRandomGenomeReplacement, ReplacementContext,
         ReplacementStrategy,
     },
+    reward::{RewardContext, RewardFunction, configured_reward},
 };
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
-// Version 4 includes failed lifecycle metadata and transactional step semantics.
-pub const CHECKPOINT_VERSION: u32 = 4;
+// Version 6 adds mutation diagnostics, genome creation reasons, and policy
+// temperature runtime state to the Prompt 2 learning/evolution checkpoint.
+pub const CHECKPOINT_VERSION: u32 = 6;
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum DatasetSplit {
     Training,
@@ -73,6 +77,42 @@ pub enum DomainEvent {
     ActionFallback {
         agent_id: AgentId,
         date: NaiveDate,
+    },
+    LearningUpdate {
+        agent_id: AgentId,
+        date: NaiveDate,
+        rollout_size: usize,
+        policy_loss: f32,
+        value_loss: f32,
+        entropy: f32,
+        gradient_norm: f32,
+    },
+    FitnessAssigned {
+        agent_id: AgentId,
+        genome_id: Option<crate::evolution::GenomeId>,
+        fitness: f64,
+    },
+    ParentsSelected {
+        child_agent_id: AgentId,
+        parent_agent_ids: Vec<AgentId>,
+    },
+    GenomeCrossed {
+        child_agent_id: AgentId,
+        method: crate::config::CrossoverMethod,
+    },
+    GenomeMutated {
+        child_agent_id: AgentId,
+        weight_changes: u64,
+        bias_changes: u64,
+        trait_changes: u64,
+        reset_changes: u64,
+    },
+    EvolutionFallback {
+        reason: String,
+    },
+    LineageCreated {
+        lineage_id: crate::evolution::LineageId,
+        parent_lineages: Vec<crate::evolution::LineageId>,
     },
     PolicyFailure {
         agent_id: AgentId,
@@ -133,6 +173,7 @@ pub enum OperationalEvent {
 struct AgentCheckpoint {
     state: crate::agent::AgentState,
     policy: PolicySnapshot,
+    learning: crate::learning::LearningStrategyState,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Checkpoint {
@@ -150,6 +191,7 @@ struct Checkpoint {
     domain_events: Vec<DomainEvent>,
     accessed_through: Option<NaiveDate>,
     backend_identity: String,
+    evolution: EvolutionState,
 }
 
 pub struct SimulationEngine {
@@ -167,6 +209,8 @@ pub struct SimulationEngine {
     validator: Box<dyn ActionValidator>,
     factory: Box<dyn AgentFactory>,
     replacement: Box<dyn ReplacementStrategy>,
+    reward_function: Box<dyn RewardFunction>,
+    evolution: EvolutionState,
     pub metrics: MetricsCollector,
     pub domain_events: Vec<DomainEvent>,
     pub operational_events: Vec<OperationalEvent>,
@@ -180,18 +224,25 @@ struct StepTransaction {
     next_agent_id: u64,
     events: Vec<DomainEvent>,
     replacement: Option<Box<dyn ReplacementStrategy>>,
+    evolution: EvolutionState,
 }
-type AdvanceResult = (Vec<DomainEvent>, Option<(AgentId, NaiveDate)>);
+type AdvanceResult = (Vec<DomainEvent>, Option<(AgentId, NaiveDate)>, f32);
 #[derive(Clone, Debug)]
 struct PolicyFailureIncident {
     category: PolicyFailureCategory,
     message: String,
 }
 enum PolicyDecisionOutcome {
-    Valid(crate::action::ValidatedAllocation),
+    Valid {
+        validated: crate::action::ValidatedAllocation,
+        observation: crate::observation::Observation,
+        evaluation: crate::brain::PolicyEvaluation,
+        runtime_before: Option<crate::brain::NeuralRuntimeState>,
+    },
     RecoverableFailure {
         incident: PolicyFailureIncident,
         fallback: crate::action::ValidatedAllocation,
+        observation: Option<crate::observation::Observation>,
     },
     FatalAgentFailure {
         incident: PolicyFailureIncident,
@@ -250,6 +301,7 @@ impl SimulationEngine {
         let first = features[0].date;
         let blueprint = configured_blueprint(&config)?;
         let mut agents = Vec::new();
+        let mut evolution = EvolutionState::new(config.simulation.seed ^ 0x243f6a8885a308d3);
         let mut metrics = MetricsCollector::default();
         let mut domain_events = Vec::new();
         for i in 0..config.simulation.population_size {
@@ -271,7 +323,7 @@ impl SimulationEngine {
                     reason: "initial_population".into(),
                 },
             };
-            let agent = factory.spawn(
+            let mut agent = factory.spawn(
                 request,
                 &AgentBuildContext {
                     agent_id: id,
@@ -281,6 +333,17 @@ impl SimulationEngine {
                     compute_device: &compute_device,
                 },
             )?;
+            if let Some(genome) = agent.state.genome.as_ref() {
+                let (genome_id, lineage_id) = evolution.allocate_genome_with_reason(
+                    genome,
+                    Vec::new(),
+                    0,
+                    None,
+                    "founder",
+                )?;
+                agent.state.genome_id = Some(genome_id);
+                agent.state.lineage_id = Some(lineage_id);
+            }
             let event = DomainEvent::AgentBorn {
                 agent_id: id,
                 date: first,
@@ -289,8 +352,19 @@ impl SimulationEngine {
             domain_events.push(event);
             agents.push(agent);
         }
+        let initial_genomes = agents
+            .iter()
+            .filter_map(|agent| agent.state.genome.as_ref())
+            .collect::<Vec<_>>();
+        evolution.update_diversity(&initial_genomes)?;
         let costs = CostExecutionEngine {
             costs: config.execution.clone(),
+        };
+        let reward_function = configured_reward(&config.reward);
+        let replacement: Box<dyn ReplacementStrategy> = if config.evolution.enabled {
+            Box::new(crate::replacement::EvolutionaryReplacementStrategy::default())
+        } else {
+            Box::new(NonEvolutionaryRandomGenomeReplacement)
         };
         let next_agent_id = config.simulation.population_size as u64;
         Ok(Self {
@@ -307,7 +381,9 @@ impl SimulationEngine {
             applier: Box::new(costs),
             validator: Box::new(LongOnlyActionValidator),
             factory,
-            replacement: Box::new(NonEvolutionaryRandomGenomeReplacement),
+            replacement,
+            reward_function,
+            evolution,
             metrics,
             domain_events,
             operational_events: Vec::new(),
@@ -333,6 +409,9 @@ impl SimulationEngine {
     pub fn observation_schema(&self) -> &ObservationSchema {
         &self.observation_schema
     }
+    pub fn evolution_state(&self) -> &EvolutionState {
+        &self.evolution
+    }
     pub fn add_event_sink(&mut self, sink: Box<dyn EventSink>) {
         self.event_sinks.push(sink)
     }
@@ -350,6 +429,12 @@ impl SimulationEngine {
         self.lifecycle = SimulationLifecycle::Running;
         while self.next_step + 1 < self.features.len() {
             self.step()?;
+        }
+        if let Err(error) = self.flush_learning() {
+            self.lifecycle = SimulationLifecycle::Failed {
+                reason: error.to_string(),
+            };
+            return Err(error);
         }
         self.lifecycle = SimulationLifecycle::Completed;
         let date = self.features.last().expect("validated features").date;
@@ -389,10 +474,19 @@ impl SimulationEngine {
             next_agent_id: self.next_agent_id,
             events: Vec::new(),
             replacement: None,
+            evolution: self.evolution.clone(),
         };
         let mut transaction = transaction;
         match self.execute_step(&mut transaction) {
-            Ok(()) => self.commit_step(transaction),
+            Ok(()) => match self.commit_step(transaction) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    self.lifecycle = SimulationLifecycle::Failed {
+                        reason: error.to_string(),
+                    };
+                    Err(error)
+                }
+            },
             Err(StepAbort::Error(error)) => {
                 let reason = error.to_string();
                 self.lifecycle = SimulationLifecycle::Failed {
@@ -410,6 +504,28 @@ impl SimulationEngine {
         }
     }
 
+    fn flush_learning(&mut self) -> Result<()> {
+        let mut agents = self.fork_agents()?;
+        let mut events = Vec::new();
+        let date = self.features.last().expect("validated features").date;
+        for agent in &mut agents {
+            if agent.state.alive {
+                self.finish_learning_episode(
+                    agent,
+                    date,
+                    agent.state.portfolio.net_worth,
+                    true,
+                    &mut events,
+                )?;
+            }
+        }
+        self.agents = agents;
+        for event in events {
+            self.emit(event);
+        }
+        Ok(())
+    }
+
     fn fork_agents(&self) -> Result<Vec<Agent>> {
         self.agents
             .iter()
@@ -421,7 +537,8 @@ impl SimulationEngine {
                             "transactional policy fork failed: {fork_error}; snapshot failed: {restore_error}"
                         ))
                     })?;
-                    self.factory
+                    let learning = agent.learning_snapshot()?;
+                    let mut restored = self.factory
                         .restore(
                             agent.state.clone(),
                             snapshot,
@@ -437,21 +554,46 @@ impl SimulationEngine {
                             MidasError::Policy(format!(
                                 "transactional policy fork failed: {fork_error}; restore failed: {restore_error}"
                             ))
-                        })
+                        })?;
+                    restored.restore_learning(learning)?;
+                    Ok(restored)
                 }
             })
             .collect()
     }
 
     fn commit_step(&mut self, transaction: StepTransaction) -> Result<()> {
+        let checkpoint_due = self.config.checkpoint.every_steps > 0
+            && (self.next_step + 1).is_multiple_of(self.config.checkpoint.every_steps);
+        let checkpoint_path = self.config.checkpoint.path.clone();
+        if checkpoint_due {
+            let mut candidate_metrics = self.metrics.clone();
+            for event in &transaction.events {
+                candidate_metrics.on_event(event);
+            }
+            let mut candidate_events = self.domain_events.clone();
+            candidate_events.extend(transaction.events.clone());
+            let checkpoint = self.checkpoint_from_state(
+                self.next_step + 1,
+                transaction.next_agent_id,
+                &transaction.agents,
+                candidate_metrics,
+                candidate_events,
+                transaction.evolution.clone(),
+                self.lifecycle.clone(),
+            )?;
+            self.write_checkpoint_file(&checkpoint_path, &checkpoint)?;
+        }
         let StepTransaction {
             agents,
             next_agent_id,
             events,
             replacement,
+            evolution,
         } = transaction;
         self.agents = agents;
         self.next_agent_id = next_agent_id;
+        self.evolution = evolution;
         if let Some(replacement) = replacement {
             self.replacement = replacement;
         }
@@ -459,18 +601,17 @@ impl SimulationEngine {
             self.emit(event);
         }
         self.next_step += 1;
-        if self.config.checkpoint.every_steps > 0
-            && self
-                .next_step
-                .is_multiple_of(self.config.checkpoint.every_steps)
-        {
-            let path = self.config.checkpoint.path.clone();
-            self.save_checkpoint(&path).inspect_err(|error| {
-                let reason = error.to_string();
-                self.lifecycle = SimulationLifecycle::Failed {
-                    reason: reason.clone(),
-                };
-            })?;
+        if checkpoint_due {
+            let date = self
+                .features
+                .get(self.next_step)
+                .map(|f| f.date)
+                .unwrap_or_else(|| self.features.last().expect("features").date);
+            self.operational_events
+                .push(OperationalEvent::CheckpointSaved {
+                    date,
+                    path: checkpoint_path,
+                });
         }
         Ok(())
     }
@@ -528,8 +669,13 @@ impl SimulationEngine {
                 &action_context,
             )?;
             match outcome {
-                PolicyDecisionOutcome::Valid(validated) => {
-                    let (events, death) = self.advance_agent(
+                PolicyDecisionOutcome::Valid {
+                    validated,
+                    observation,
+                    evaluation,
+                    runtime_before,
+                } => {
+                    let (events, death, reward) = self.advance_agent(
                         agent,
                         &validated,
                         observation_date,
@@ -538,13 +684,30 @@ impl SimulationEngine {
                         &next_prices,
                         &bars,
                         &actions,
+                        false,
                     )?;
                     transaction.events.extend(events);
+                    self.record_learning(
+                        agent,
+                        observation,
+                        evaluation,
+                        validated,
+                        reward,
+                        death.is_some(),
+                        observation_date,
+                        &tradable,
+                        runtime_before,
+                        &mut transaction.events,
+                    )?;
                     if let Some(death) = death {
                         deaths.push(death);
                     }
                 }
-                PolicyDecisionOutcome::RecoverableFailure { incident, fallback } => {
+                PolicyDecisionOutcome::RecoverableFailure {
+                    incident,
+                    fallback,
+                    observation,
+                } => {
                     let failure_event =
                         self.policy_failure_event(agent, observation_date, incident.clone());
                     transaction.events.push(failure_event);
@@ -552,7 +715,7 @@ impl SimulationEngine {
                         agent_id: agent.state.id,
                         date: observation_date,
                     });
-                    let (events, death) = self.advance_agent(
+                    let (events, death, _reward) = self.advance_agent(
                         agent,
                         &fallback,
                         observation_date,
@@ -561,8 +724,10 @@ impl SimulationEngine {
                         &next_prices,
                         &bars,
                         &actions,
+                        true,
                     )?;
                     transaction.events.extend(events);
+                    let _ = observation;
                     if let Some(death) = death {
                         deaths.push(death);
                     }
@@ -580,6 +745,13 @@ impl SimulationEngine {
                             .max(1.0 - final_net_worth / agent.state.maximum_net_worth);
                     }
                     agent.state.alive = false;
+                    self.finish_learning_episode(
+                        agent,
+                        observation_date,
+                        final_net_worth,
+                        false,
+                        &mut transaction.events,
+                    )?;
                     transaction.events.push(self.policy_failure_event(
                         agent,
                         observation_date,
@@ -625,7 +797,7 @@ impl SimulationEngine {
         allocations: &[f64],
         action_context: &ActionValidationContext<'_>,
     ) -> Result<PolicyDecisionOutcome> {
-        let observation = self.observation_builder.build(&ObservationContext {
+        let observation = match self.observation_builder.build(&ObservationContext {
             market,
             portfolio: &agent.state.portfolio,
             prices,
@@ -633,41 +805,84 @@ impl SimulationEngine {
             maximum_net_worth: agent.state.maximum_net_worth,
             age: agent.state.age,
             episode_steps: self.features.len() - 1,
-        });
-        let proposal = match observation {
-            Ok(observation) => agent.policy.propose_action(
-                &observation,
-                &PolicyContext {
-                    tradable,
-                    current_allocations: allocations,
-                },
-            ),
-            Err(error) => Err(MidasError::Policy(format!("invalid observation: {error}"))),
-        };
-        match proposal {
-            Ok(proposal) => {
-                let validated = self.validator.validate(proposal, action_context)?;
-                if validated.used_fallback() {
-                    let incident = PolicyFailureIncident {
-                        category: PolicyFailureCategory::InvalidOutput,
-                        message: validated
-                            .fallback_reason()
-                            .unwrap_or("invalid policy output")
-                            .to_string(),
-                    };
-                    self.failure_outcome(agent, incident, action_context, Some(validated))
-                } else {
-                    agent.state.consecutive_policy_failures = 0;
-                    Ok(PolicyDecisionOutcome::Valid(validated))
-                }
+        }) {
+            Ok(observation) => observation,
+            Err(error) => {
+                let incident = PolicyFailureIncident {
+                    category: PolicyFailureCategory::InvalidObservation,
+                    message: error.to_string(),
+                };
+                return self.failure_outcome(agent, incident, action_context, None, None);
             }
+        };
+        let stochastic = matches!(
+            self.config.learning.implementation,
+            crate::config::LearningKind::Ppo
+        ) && matches!(
+            agent.policy.policy_blueprint(),
+            crate::brain::PolicyBlueprint::Neural
+        );
+        let runtime_before = agent.policy.runtime_state();
+        let evaluation = match agent.policy.evaluate_action(
+            &observation,
+            &PolicyContext {
+                tradable,
+                current_allocations: allocations,
+            },
+            stochastic,
+            action_context.maximum_asset_allocation,
+        ) {
+            Ok(evaluation) => evaluation,
             Err(error) => {
                 let incident = PolicyFailureIncident {
                     category: classify_policy_failure(&error),
                     message: error.to_string(),
                 };
-                self.failure_outcome(agent, incident, action_context, None)
+                return self.failure_outcome(agent, incident, action_context, None, None);
             }
+        };
+        let validated = match self
+            .validator
+            .validate(evaluation.proposed_allocation.clone(), action_context)
+        {
+            Ok(validated) => validated,
+            Err(error) => {
+                let incident = PolicyFailureIncident {
+                    category: PolicyFailureCategory::InvalidOutput,
+                    message: error.to_string(),
+                };
+                return self.failure_outcome(
+                    agent,
+                    incident,
+                    action_context,
+                    None,
+                    Some(observation),
+                );
+            }
+        };
+        if validated.used_fallback() {
+            let incident = PolicyFailureIncident {
+                category: PolicyFailureCategory::InvalidOutput,
+                message: validated
+                    .fallback_reason()
+                    .unwrap_or("invalid policy output")
+                    .to_string(),
+            };
+            self.failure_outcome(
+                agent,
+                incident,
+                action_context,
+                Some(validated),
+                Some(observation),
+            )
+        } else {
+            agent.state.consecutive_policy_failures = 0;
+            Ok(PolicyDecisionOutcome::Valid {
+                validated,
+                observation,
+                evaluation,
+                runtime_before,
+            })
         }
     }
 
@@ -677,6 +892,7 @@ impl SimulationEngine {
         incident: PolicyFailureIncident,
         action_context: &ActionValidationContext<'_>,
         fallback: Option<ValidatedAllocation>,
+        observation: Option<crate::observation::Observation>,
     ) -> Result<PolicyDecisionOutcome> {
         agent.state.total_policy_failures = agent.state.total_policy_failures.saturating_add(1);
         agent.state.consecutive_policy_failures =
@@ -707,7 +923,11 @@ impl SimulationEngine {
                         "cash fallback did not produce a validated fallback allocation".into(),
                     ));
                 }
-                Ok(PolicyDecisionOutcome::RecoverableFailure { incident, fallback })
+                Ok(PolicyDecisionOutcome::RecoverableFailure {
+                    incident,
+                    fallback,
+                    observation,
+                })
             }
         }
     }
@@ -738,8 +958,10 @@ impl SimulationEngine {
         next_prices: &[Option<f64>],
         bars: &[Option<&crate::market::MarketBar>],
         actions: &[CorporateAction],
+        invalid_action: bool,
     ) -> Result<AdvanceResult> {
         let mut events = Vec::new();
+        let turnover_before = agent.state.portfolio.cumulative_turnover;
         // Actions take effect at the next open, in the canonical split then
         // dividend order supplied by MarketDataset.
         for action in actions {
@@ -782,11 +1004,7 @@ impl SimulationEngine {
             .portfolio
             .apply_survival_cost(self.config.simulation.daily_survival_cost);
         let current = agent.state.portfolio.net_worth;
-        let reward = if previous > 0.0 && current > 0.0 {
-            (current / previous).ln() as f32
-        } else {
-            -1.0
-        };
+        let bankrupt = current <= self.config.simulation.bankruptcy_threshold;
         agent.state.age += 1;
         agent.state.maximum_net_worth = agent.state.maximum_net_worth.max(current);
         if agent.state.maximum_net_worth > 0.0 {
@@ -795,6 +1013,14 @@ impl SimulationEngine {
                 .maximum_drawdown
                 .max(1.0 - current / agent.state.maximum_net_worth);
         }
+        let reward = self.reward_function.reward(&RewardContext {
+            previous_net_worth: previous,
+            current_net_worth: current,
+            maximum_drawdown: agent.state.maximum_drawdown,
+            turnover: (agent.state.portfolio.cumulative_turnover - turnover_before).max(0.0),
+            bankrupt,
+            invalid_action,
+        })?;
         events.push(DomainEvent::Valuation {
             agent_id: agent.state.id,
             date: execution_date,
@@ -802,7 +1028,7 @@ impl SimulationEngine {
             previous,
             reward,
         });
-        if current <= self.config.simulation.bankruptcy_threshold {
+        if bankrupt {
             agent.state.alive = false;
             events.push(DomainEvent::AgentDied {
                 agent_id: agent.state.id,
@@ -814,9 +1040,107 @@ impl SimulationEngine {
                 maximum_net_worth: agent.state.maximum_net_worth,
                 cause: DeathCause::Bankruptcy,
             });
-            return Ok((events, Some((agent.state.id, execution_date))));
+            return Ok((events, Some((agent.state.id, execution_date)), reward));
         }
-        Ok((events, None))
+        Ok((events, None, reward))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_learning(
+        &self,
+        agent: &mut Agent,
+        observation: crate::observation::Observation,
+        evaluation: crate::brain::PolicyEvaluation,
+        action: ValidatedAllocation,
+        reward: f32,
+        done: bool,
+        date: NaiveDate,
+        tradable: &[bool],
+        runtime_before: Option<crate::brain::NeuralRuntimeState>,
+        events: &mut Vec<DomainEvent>,
+    ) -> Result<()> {
+        let before = runtime_before.unwrap_or(crate::brain::NeuralRuntimeState {
+            memory: Vec::new(),
+            inference_steps: 0,
+        });
+        let after = agent
+            .policy
+            .runtime_state()
+            .unwrap_or_else(|| before.clone());
+        let transition = Transition {
+            observation,
+            action,
+            action_sample: evaluation.action_sample.clone(),
+            raw_policy_output: evaluation.raw_logits,
+            log_probability: evaluation.log_probability.unwrap_or(0.0),
+            temperature: evaluation.temperature,
+            value_estimate: evaluation.value_estimate,
+            reward,
+            next_value: 0.0,
+            done,
+            truncated: false,
+            recurrent_state_before: before,
+            recurrent_state_after: after,
+            date,
+            tradable: tradable.to_vec(),
+        };
+        let update = agent.learning.observe_transition(transition)?;
+        self.apply_learning_update(agent, update, date, events)?;
+        if done {
+            self.finish_learning_episode(
+                agent,
+                date,
+                agent.state.portfolio.net_worth,
+                false,
+                events,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn finish_learning_episode(
+        &self,
+        agent: &mut Agent,
+        date: NaiveDate,
+        final_value: f64,
+        truncated: bool,
+        events: &mut Vec<DomainEvent>,
+    ) -> Result<()> {
+        let update = agent.learning.end_episode(&EpisodeEndContext {
+            date,
+            final_value: final_value as f32,
+            truncated,
+        })?;
+        self.apply_learning_update(agent, update, date, events)
+    }
+
+    fn apply_learning_update(
+        &self,
+        agent: &mut Agent,
+        update: LearningUpdate,
+        date: NaiveDate,
+        events: &mut Vec<DomainEvent>,
+    ) -> Result<()> {
+        if let LearningUpdate::Ppo(batch) = update {
+            let learning_config = agent
+                .learning
+                .training_config()
+                .unwrap_or_else(|| self.config.learning.clone());
+            let metrics = agent.policy.apply_learning(&batch, &learning_config)?;
+            agent.learning.commit_update()?;
+            events.push(DomainEvent::LearningUpdate {
+                agent_id: agent.state.id,
+                date,
+                rollout_size: metrics.rollout_size,
+                policy_loss: metrics.policy_loss,
+                value_loss: metrics.value_loss,
+                entropy: metrics.entropy,
+                gradient_norm: metrics.gradient_norm,
+            });
+        } else {
+            agent.learning.commit_update()?;
+        }
+        Ok(())
     }
 
     fn handle_death_in_transaction(
@@ -825,6 +1149,46 @@ impl SimulationEngine {
         id: AgentId,
         date: NaiveDate,
     ) -> Result<()> {
+        let dead_index = transaction
+            .agents
+            .iter()
+            .position(|a| a.state.id == id)
+            .ok_or_else(|| MidasError::Accounting("dead agent missing".into()))?;
+        let dead_snapshot = transaction.agents[dead_index].state.clone();
+        let birth_step = self
+            .features
+            .iter()
+            .position(|feature| feature.date == dead_snapshot.birth_date)
+            .unwrap_or(0);
+        let life = CompletedLifeSummary {
+            agent_id: id,
+            genome_id: dead_snapshot.genome_id,
+            birth_step,
+            death_step: self.next_step,
+            age: dead_snapshot.age,
+            starting_net_worth: self.config.simulation.starting_cash,
+            final_net_worth: dead_snapshot.portfolio.net_worth,
+            maximum_drawdown: dead_snapshot.maximum_drawdown,
+            turnover: dead_snapshot.portfolio.cumulative_turnover,
+            policy_failures: dead_snapshot.total_policy_failures,
+            fitness: None,
+        };
+        let fitness_function = DefaultFitnessFunction::from_config(&self.config.evolution.fitness);
+        let fitness = transaction
+            .evolution
+            .record_life_with(life, &fitness_function)?;
+        transaction.events.push(DomainEvent::FitnessAssigned {
+            agent_id: id,
+            genome_id: dead_snapshot.genome_id,
+            fitness: fitness.0,
+        });
+        let living_genomes = transaction
+            .agents
+            .iter()
+            .filter(|candidate| candidate.state.alive)
+            .filter_map(|candidate| candidate.state.genome.as_ref())
+            .collect::<Vec<_>>();
+        transaction.evolution.update_diversity(&living_genomes)?;
         match self.config.simulation.death_handling {
             DeathHandling::LeaveVacant => Ok(()),
             DeathHandling::EndAgentOnly => {
@@ -869,12 +1233,19 @@ impl SimulationEngine {
                         architecture: &self.architecture,
                         compute_device: &self.compute_device,
                         observation_schema: &self.observation_schema,
-                        deterministic_seed: self.config.simulation.seed
+                        deterministic_seed: transaction.evolution.rng.next_u64()
+                            ^ self.config.simulation.seed
                             ^ new_id.0.wrapping_mul(0x9e3779b97f4a7c15),
+                        completed_lives: &transaction.evolution.completed_lives,
+                        genome_registry: &transaction.evolution.genome_registry,
                     })?
                 };
+                let mutation_report = replacement.mutation_report();
+                let parent_ids = request.parent_ids.clone();
+                let request_reason = request.metadata.reason.clone();
+                let child_genome = request.genome.clone();
                 transaction.replacement = Some(replacement);
-                let agent = self.factory.spawn(
+                let mut agent = self.factory.spawn(
                     request,
                     &AgentBuildContext {
                         agent_id: new_id,
@@ -884,7 +1255,102 @@ impl SimulationEngine {
                         compute_device: &self.compute_device,
                     },
                 )?;
+                if let Some(genome) = child_genome.as_ref() {
+                    let parent_genome_ids = parent_ids
+                        .iter()
+                        .filter_map(|parent_id| {
+                            transaction
+                                .agents
+                                .iter()
+                                .find(|candidate| candidate.state.id == *parent_id)
+                                .and_then(|candidate| candidate.state.genome_id)
+                        })
+                        .collect::<Vec<_>>();
+                    let parent_lineages = parent_genome_ids
+                        .iter()
+                        .filter_map(|parent_id| {
+                            transaction.evolution.genome_registry.get(parent_id)
+                        })
+                        .map(|record| record.lineage_id)
+                        .collect::<Vec<_>>();
+                    let shared_lineage = if parent_lineages.len() >= 2
+                        && parent_lineages.windows(2).all(|pair| pair[0] == pair[1])
+                    {
+                        parent_lineages.first().copied()
+                    } else {
+                        None
+                    };
+                    let (genome_id, lineage_id) =
+                        transaction.evolution.allocate_genome_with_reason(
+                            genome,
+                            parent_genome_ids,
+                            self.next_step,
+                            shared_lineage,
+                            request_reason.clone(),
+                        )?;
+                    agent.state.genome_id = Some(genome_id);
+                    agent.state.lineage_id = Some(lineage_id);
+                    if parent_lineages.len() >= 2
+                        && parent_lineages.windows(2).any(|pair| pair[0] != pair[1])
+                    {
+                        transaction.events.push(DomainEvent::LineageCreated {
+                            lineage_id,
+                            parent_lineages,
+                        });
+                    }
+                    if !parent_ids.is_empty() {
+                        transaction.evolution.metrics.reproduction_count = transaction
+                            .evolution
+                            .metrics
+                            .reproduction_count
+                            .saturating_add(1);
+                        transaction.events.push(DomainEvent::ParentsSelected {
+                            child_agent_id: new_id,
+                            parent_agent_ids: parent_ids,
+                        });
+                    }
+                    if request_reason.starts_with("evolution_two_parent:") {
+                        transaction.evolution.metrics.crossover_count = transaction
+                            .evolution
+                            .metrics
+                            .crossover_count
+                            .saturating_add(1);
+                        transaction.evolution.metrics.mutation_count = transaction
+                            .evolution
+                            .metrics
+                            .mutation_count
+                            .saturating_add(1);
+                        transaction.events.push(DomainEvent::GenomeCrossed {
+                            child_agent_id: new_id,
+                            method: self.config.evolution.crossover.method,
+                        });
+                        let report = mutation_report.unwrap_or_default();
+                        transaction.events.push(DomainEvent::GenomeMutated {
+                            child_agent_id: new_id,
+                            weight_changes: report.weight_changes,
+                            bias_changes: report.bias_changes,
+                            trait_changes: report.trait_changes,
+                            reset_changes: report.reset_changes,
+                        });
+                    } else if request_reason.contains("fallback") {
+                        transaction.evolution.metrics.random_fallback_births = transaction
+                            .evolution
+                            .metrics
+                            .random_fallback_births
+                            .saturating_add(1);
+                        transaction.events.push(DomainEvent::EvolutionFallback {
+                            reason: request_reason,
+                        });
+                    }
+                }
                 transaction.agents[slot] = agent;
+                let living_genomes = transaction
+                    .agents
+                    .iter()
+                    .filter(|candidate| candidate.state.alive)
+                    .filter_map(|candidate| candidate.state.genome.as_ref())
+                    .collect::<Vec<_>>();
+                transaction.evolution.update_diversity(&living_genomes)?;
                 transaction.events.push(DomainEvent::AgentBorn {
                     agent_id: new_id,
                     date,
@@ -905,36 +1371,65 @@ impl SimulationEngine {
         }
         self.domain_events.push(event)
     }
-    pub fn save_checkpoint(&mut self, path: impl AsRef<Path>) -> Result<()> {
-        let checkpoint = Checkpoint {
+
+    #[allow(clippy::too_many_arguments)]
+    fn checkpoint_from_state(
+        &self,
+        next_step: usize,
+        next_agent_id: u64,
+        agents: &[Agent],
+        metrics: MetricsCollector,
+        domain_events: Vec<DomainEvent>,
+        evolution: EvolutionState,
+        lifecycle: SimulationLifecycle,
+    ) -> Result<Checkpoint> {
+        Ok(Checkpoint {
             version: CHECKPOINT_VERSION,
             config_hash: self.config.hash()?,
             dataset_identity: self.data.identity.clone(),
             observation_schema_hash: self.observation_schema.identity(self.data.assets.len())?,
             architecture: self.architecture.clone(),
             split: self.split,
-            next_step: self.next_step,
-            next_agent_id: self.next_agent_id,
-            lifecycle: self.lifecycle.clone(),
-            agents: self
-                .agents
+            next_step,
+            next_agent_id,
+            lifecycle,
+            agents: agents
                 .iter()
-                .map(|a| {
+                .map(|agent| {
                     Ok(AgentCheckpoint {
-                        state: a.state.clone(),
-                        policy: a.policy.snapshot()?,
+                        state: agent.state.clone(),
+                        policy: agent.policy.snapshot()?,
+                        learning: agent.learning_snapshot()?,
                     })
                 })
                 .collect::<Result<_>>()?,
-            metrics: self.metrics.clone(),
-            domain_events: self.domain_events.clone(),
-            accessed_through: self.features.get(self.next_step).map(|f| f.date),
+            metrics,
+            domain_events,
+            accessed_through: self.features.get(next_step).map(|f| f.date),
             backend_identity: self.compute_device.identity(),
-        };
+            evolution,
+        })
+    }
+
+    fn write_checkpoint_file(&self, path: impl AsRef<Path>, checkpoint: &Checkpoint) -> Result<()> {
         if let Some(parent) = path.as_ref().parent() {
             fs::create_dir_all(parent)?
         }
-        fs::write(path.as_ref(), bincode::serialize(&checkpoint)?)?;
+        fs::write(path.as_ref(), bincode::serialize(checkpoint)?)?;
+        Ok(())
+    }
+
+    pub fn save_checkpoint(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        let checkpoint = self.checkpoint_from_state(
+            self.next_step,
+            self.next_agent_id,
+            &self.agents,
+            self.metrics.clone(),
+            self.domain_events.clone(),
+            self.evolution.clone(),
+            self.lifecycle.clone(),
+        )?;
+        self.write_checkpoint_file(path.as_ref(), &checkpoint)?;
         let date = self
             .features
             .get(self.next_step)
@@ -1018,21 +1513,30 @@ impl SimulationEngine {
             .agents
             .into_iter()
             .map(|a| {
-                factory.restore(
+                let agent_id = a.state.id;
+                let mut agent = factory.restore(
                     a.state,
                     a.policy,
                     &AgentBuildContext {
-                        agent_id: AgentId(0),
+                        agent_id,
                         birth_date: birth,
                         config: &config,
                         architecture: &architecture,
                         compute_device: &compute_device,
                     },
-                )
+                )?;
+                agent.restore_learning(a.learning)?;
+                Ok(agent)
             })
             .collect::<Result<_>>()?;
         let costs = CostExecutionEngine {
             costs: config.execution.clone(),
+        };
+        let reward_function = configured_reward(&config.reward);
+        let replacement: Box<dyn ReplacementStrategy> = if config.evolution.enabled {
+            Box::new(crate::replacement::EvolutionaryReplacementStrategy::default())
+        } else {
+            Box::new(NonEvolutionaryRandomGenomeReplacement)
         };
         Ok(Self {
             config,
@@ -1048,7 +1552,9 @@ impl SimulationEngine {
             applier: Box::new(costs),
             validator: Box::new(LongOnlyActionValidator),
             factory,
-            replacement: Box::new(NonEvolutionaryRandomGenomeReplacement),
+            replacement,
+            reward_function,
+            evolution: cp.evolution,
             metrics: cp.metrics,
             domain_events: cp.domain_events,
             operational_events: Vec::new(),
@@ -1059,6 +1565,10 @@ impl SimulationEngine {
         })
     }
     pub fn report(&self) -> SimulationReport {
+        let learning_implementation = match self.config.learning.implementation {
+            crate::config::LearningKind::NoLearning => "no_learning",
+            crate::config::LearningKind::Ppo => "ppo",
+        };
         SimulationReport {
             split: self.split,
             steps: self.next_step,
@@ -1077,7 +1587,10 @@ impl SimulationEngine {
                 .identity(self.data.assets.len())
                 .expect("serializable schema"),
             replacement_strategy: self.replacement.name().into(),
-            learning_implementation: "no_learning".into(),
+            learning_implementation: learning_implementation.into(),
+            learning_updates: self.metrics.learning_updates,
+            evolutionary_births: self.metrics.reproductions,
+            active_lineages: self.evolution.metrics.active_lineages,
             lifecycle: self.lifecycle.clone(),
             failure_reason: match &self.lifecycle {
                 SimulationLifecycle::Failed { reason } => Some(reason.clone()),
@@ -1098,6 +1611,9 @@ pub struct SimulationReport {
     pub observation_schema_identity: String,
     pub replacement_strategy: String,
     pub learning_implementation: String,
+    pub learning_updates: u64,
+    pub evolutionary_births: u64,
+    pub active_lineages: u64,
     pub lifecycle: SimulationLifecycle,
     pub failure_reason: Option<String>,
 }

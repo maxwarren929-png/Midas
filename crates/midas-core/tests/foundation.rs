@@ -789,6 +789,8 @@ fn replacement_context_supports_deterministic_read_only_selection() {
             compute_device: &device,
             observation_schema: &schema,
             deterministic_seed: 7,
+            completed_lives: &[],
+            genome_registry: &std::collections::BTreeMap::new(),
         })
         .unwrap();
     assert_eq!(request.parent_ids, vec![AgentId(7)]);

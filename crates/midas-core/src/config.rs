@@ -24,6 +24,10 @@ pub struct Config {
     pub replacement: ReplacementConfig,
     #[serde(default)]
     pub checkpoint: CheckpointConfig,
+    #[serde(default)]
+    pub reward: RewardConfig,
+    #[serde(default)]
+    pub evolution: EvolutionConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -312,7 +316,7 @@ impl Default for PolicyFailureConfig {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LearningConfig {
     pub implementation: LearningKind,
@@ -324,13 +328,282 @@ pub struct LearningConfig {
     pub entropy_coefficient: f32,
     pub gradient_clip: f32,
     pub rollout_length: usize,
+    #[serde(default = "default_minibatch_size")]
+    pub minibatch_size: usize,
+    #[serde(default = "default_sequence_length")]
+    pub sequence_length: usize,
+    #[serde(default = "default_true")]
+    pub normalize_advantages: bool,
     pub optimisation_epochs: usize,
+}
+
+fn default_minibatch_size() -> usize {
+    32
+}
+fn default_sequence_length() -> usize {
+    16
+}
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LearningKind {
     NoLearning,
+    Ppo,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RewardConfig {
+    #[serde(default)]
+    pub kind: RewardKind,
+    #[serde(default)]
+    pub drawdown_penalty_weight: f32,
+    #[serde(default)]
+    pub turnover_penalty_weight: f32,
+    #[serde(default)]
+    pub invalid_action_penalty: f32,
+    #[serde(default = "default_bankruptcy_penalty")]
+    pub bankruptcy_penalty: f32,
+    #[serde(default = "default_reward_clip_min")]
+    pub clip_min: f32,
+    #[serde(default = "default_reward_clip_max")]
+    pub clip_max: f32,
+}
+fn default_bankruptcy_penalty() -> f32 {
+    1.0
+}
+fn default_reward_clip_min() -> f32 {
+    -5.0
+}
+fn default_reward_clip_max() -> f32 {
+    5.0
+}
+impl Default for RewardConfig {
+    fn default() -> Self {
+        Self {
+            kind: RewardKind::LogReturn,
+            drawdown_penalty_weight: 0.0,
+            turnover_penalty_weight: 0.0,
+            invalid_action_penalty: 0.05,
+            bankruptcy_penalty: 1.0,
+            clip_min: -5.0,
+            clip_max: 5.0,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RewardKind {
+    #[default]
+    LogReturn,
+    RiskAdjustedReturn,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvolutionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub fallback: EvolutionFallback,
+    #[serde(default)]
+    pub inheritance_mode: InheritanceMode,
+    #[serde(default)]
+    pub selection: EvolutionSelectionConfig,
+    #[serde(default)]
+    pub crossover: EvolutionCrossoverConfig,
+    #[serde(default)]
+    pub mutation: EvolutionMutationConfig,
+    #[serde(default)]
+    pub diversity: EvolutionDiversityConfig,
+    #[serde(default)]
+    pub fitness: EvolutionFitnessConfig,
+}
+impl Default for EvolutionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            fallback: EvolutionFallback::RandomGenome,
+            inheritance_mode: InheritanceMode::GenomeOnly,
+            selection: EvolutionSelectionConfig::default(),
+            crossover: EvolutionCrossoverConfig::default(),
+            mutation: EvolutionMutationConfig::default(),
+            diversity: EvolutionDiversityConfig::default(),
+            fitness: EvolutionFitnessConfig::default(),
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvolutionFallback {
+    #[default]
+    RandomGenome,
+    CloneBestEligible,
+    AbortExperiment,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InheritanceMode {
+    #[default]
+    GenomeOnly,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionMethod {
+    #[default]
+    Tournament,
+    RankWeighted,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvolutionSelectionConfig {
+    #[serde(default)]
+    pub method: SelectionMethod,
+    #[serde(default = "default_tournament_size")]
+    pub tournament_size: usize,
+    #[serde(default)]
+    pub minimum_age: u64,
+    #[serde(default)]
+    pub allow_self_parenting: bool,
+    #[serde(default)]
+    pub minimum_net_worth: f64,
+}
+fn default_tournament_size() -> usize {
+    4
+}
+impl Default for EvolutionSelectionConfig {
+    fn default() -> Self {
+        Self {
+            method: SelectionMethod::Tournament,
+            tournament_size: 4,
+            minimum_age: 0,
+            allow_self_parenting: false,
+            minimum_net_worth: 0.0,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrossoverMethod {
+    #[default]
+    UniformElementWise,
+    LayerWiseBlend,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvolutionCrossoverConfig {
+    #[serde(default)]
+    pub method: CrossoverMethod,
+}
+impl Default for EvolutionCrossoverConfig {
+    fn default() -> Self {
+        Self {
+            method: CrossoverMethod::UniformElementWise,
+        }
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvolutionMutationConfig {
+    #[serde(default = "default_weight_probability")]
+    pub weight_probability: f32,
+    #[serde(default = "default_weight_sigma")]
+    pub weight_sigma: f32,
+    #[serde(default = "default_bias_probability")]
+    pub bias_probability: f32,
+    #[serde(default = "default_bias_sigma")]
+    pub bias_sigma: f32,
+    #[serde(default)]
+    pub reset_probability: f32,
+    #[serde(default = "default_trait_probability")]
+    pub trait_probability: f32,
+}
+fn default_weight_probability() -> f32 {
+    0.02
+}
+fn default_weight_sigma() -> f32 {
+    0.05
+}
+fn default_bias_probability() -> f32 {
+    0.02
+}
+fn default_bias_sigma() -> f32 {
+    0.02
+}
+fn default_trait_probability() -> f32 {
+    0.05
+}
+impl Default for EvolutionMutationConfig {
+    fn default() -> Self {
+        Self {
+            weight_probability: 0.02,
+            weight_sigma: 0.05,
+            bias_probability: 0.02,
+            bias_sigma: 0.02,
+            reset_probability: 0.001,
+            trait_probability: 0.05,
+        }
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvolutionDiversityConfig {
+    #[serde(default)]
+    pub fitness_sharing: bool,
+    #[serde(default = "default_sharing_radius")]
+    pub sharing_radius: f32,
+    #[serde(default)]
+    pub minimum_mating_distance: f32,
+}
+fn default_sharing_radius() -> f32 {
+    0.15
+}
+impl Default for EvolutionDiversityConfig {
+    fn default() -> Self {
+        Self {
+            fitness_sharing: false,
+            sharing_radius: 0.15,
+            minimum_mating_distance: 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvolutionFitnessConfig {
+    #[serde(default = "default_fitness_return_weight")]
+    pub return_weight: f64,
+    #[serde(default = "default_fitness_survival_weight")]
+    pub survival_weight: f64,
+    #[serde(default = "default_fitness_drawdown_weight")]
+    pub drawdown_weight: f64,
+    #[serde(default = "default_fitness_turnover_weight")]
+    pub turnover_weight: f64,
+}
+fn default_fitness_return_weight() -> f64 {
+    1.0
+}
+fn default_fitness_survival_weight() -> f64 {
+    0.01
+}
+fn default_fitness_drawdown_weight() -> f64 {
+    0.5
+}
+fn default_fitness_turnover_weight() -> f64 {
+    0.001
+}
+impl Default for EvolutionFitnessConfig {
+    fn default() -> Self {
+        Self {
+            return_weight: 1.0,
+            survival_weight: 0.01,
+            drawdown_weight: 0.5,
+            turnover_weight: 0.001,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -480,6 +753,13 @@ impl Config {
         {
             return bad("maximum allocation trait bounds must be within (0, 1]");
         }
+        if self.brain.traits.learning_rate.minimum <= 0.0
+            || self.brain.traits.action_temperature.minimum <= 0.0
+            || self.brain.traits.temperature_decay.minimum < 0.0
+            || self.brain.traits.temperature_decay.maximum > 1.0
+        {
+            return bad("learning and action-temperature trait bounds are invalid");
+        }
         if self.observation.version == 0 || self.observation.features.is_empty() {
             return bad("observation schema version and features must be non-empty");
         }
@@ -509,9 +789,6 @@ impl Config {
         {
             return bad("splits must be chronological and non-overlapping");
         }
-        if self.learning.implementation != LearningKind::NoLearning {
-            return bad("Prompt 1 supports only explicit no_learning");
-        }
         if !self.learning.learning_rate.is_finite()
             || self.learning.learning_rate <= 0.0
             || !self.learning.gamma.is_finite()
@@ -527,9 +804,89 @@ impl Config {
             || !self.learning.gradient_clip.is_finite()
             || self.learning.gradient_clip <= 0.0
             || self.learning.rollout_length == 0
+            || self.learning.minibatch_size == 0
+            || self.learning.minibatch_size > self.learning.rollout_length
+            || self.learning.sequence_length == 0
+            || self.learning.sequence_length > self.learning.rollout_length
             || self.learning.optimisation_epochs == 0
         {
             return bad("learning configuration values are invalid");
+        }
+        for (name, value) in [
+            (
+                "reward.drawdown_penalty_weight",
+                self.reward.drawdown_penalty_weight,
+            ),
+            (
+                "reward.turnover_penalty_weight",
+                self.reward.turnover_penalty_weight,
+            ),
+            (
+                "reward.invalid_action_penalty",
+                self.reward.invalid_action_penalty,
+            ),
+            ("reward.bankruptcy_penalty", self.reward.bankruptcy_penalty),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return bad(&format!("{name} must be finite and non-negative"));
+            }
+        }
+        if !self.reward.clip_min.is_finite() || !self.reward.clip_max.is_finite() {
+            return bad("reward clip bounds must be finite");
+        }
+        if self.reward.clip_min >= self.reward.clip_max {
+            return bad("reward.clip_min must be less than clip_max");
+        }
+        let mutation = &self.evolution.mutation;
+        for (name, value) in [
+            ("weight_probability", mutation.weight_probability),
+            ("bias_probability", mutation.bias_probability),
+            ("reset_probability", mutation.reset_probability),
+            ("trait_probability", mutation.trait_probability),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return bad(&format!("evolution.mutation.{name} must be within [0, 1]"));
+            }
+        }
+        for (name, value) in [
+            ("weight_sigma", mutation.weight_sigma),
+            ("bias_sigma", mutation.bias_sigma),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return bad(&format!("evolution.mutation.{name} must be non-negative"));
+            }
+        }
+        if self.evolution.selection.tournament_size == 0
+            || !self.evolution.selection.minimum_net_worth.is_finite()
+            || self.evolution.selection.minimum_net_worth < 0.0
+            || !self.evolution.diversity.sharing_radius.is_finite()
+            || self.evolution.diversity.sharing_radius < 0.0
+            || !self.evolution.diversity.minimum_mating_distance.is_finite()
+            || self.evolution.diversity.minimum_mating_distance < 0.0
+        {
+            return bad("evolution selection or diversity configuration is invalid");
+        }
+        for (name, value) in [
+            (
+                "evolution.fitness.return_weight",
+                self.evolution.fitness.return_weight,
+            ),
+            (
+                "evolution.fitness.survival_weight",
+                self.evolution.fitness.survival_weight,
+            ),
+            (
+                "evolution.fitness.drawdown_weight",
+                self.evolution.fitness.drawdown_weight,
+            ),
+            (
+                "evolution.fitness.turnover_weight",
+                self.evolution.fitness.turnover_weight,
+            ),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return bad(&format!("{name} must be finite and non-negative"));
+            }
         }
         self.backend.compute_device()?;
         Ok(())
