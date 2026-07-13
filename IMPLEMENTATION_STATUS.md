@@ -4,7 +4,7 @@
 
 The Prompt 2 implementation is present and verified at the current foundation boundary.
 
-- `learning.rs` defines typed transitions, bounded rollouts, terminal/truncated GAE, advantage normalization, clipped PPO losses, deterministic recurrent sequence shuffling, update metrics, and checkpointable `NoLearning`/`PpoLearning` strategies.
+- `learning.rs` defines typed transitions, bounded rollouts, terminal/truncated GAE with continuing-state bootstrap estimates, advantage normalization, clipped PPO losses, deterministic recurrent sequence shuffling, update metrics, and checkpointable `NoLearning`/`PpoLearning` strategies.
 - `brain.rs` exposes framework-neutral policy evaluation and trainable-model hooks. The categorical action distribution is over cash and tradable assets; an asset draw maps to the configured maximum allocation and cash remainder, so sampled and deterministic actions are legal and stochastic samples have an exact categorical log probability. Burn caches runtime tensors and applies finite clipped actor/value updates with momentum optimizer state. The current adapter updates actor and critic heads; hidden/recurrent weights remain fixed by design.
 - `reward.rs` separates configurable log-return and risk-adjusted environment rewards from reproductive fitness.
 - `evolution.rs` provides stable `GenomeId`/`LineageId`, flat ancestry records, deterministic tournament/rank selection, uniform/layer blend crossover, bounded Gaussian mutation, fitness, genetic distance, fitness sharing, and checkpointable evolutionary metrics/RNG.

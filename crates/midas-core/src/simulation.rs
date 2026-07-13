@@ -629,6 +629,7 @@ impl SimulationEngine {
             .map(|i| self.data.bar(execution_date, AssetId(i as u64)))
             .collect::<Vec<_>>();
         let tradable = self.features[t].tradable.clone();
+        let next_tradable = self.features[t + 1].tradable.clone();
         let market = self.features[t].clone();
         let actions = self
             .data
@@ -687,12 +688,18 @@ impl SimulationEngine {
                         false,
                     )?;
                     transaction.events.extend(events);
+                    let next_value = if death.is_none() {
+                        self.next_value_estimate(agent, t + 1, &next_prices, &next_tradable)?
+                    } else {
+                        0.0
+                    };
                     self.record_learning(
                         agent,
                         observation,
                         evaluation,
                         validated,
                         reward,
+                        next_value,
                         death.is_some(),
                         observation_date,
                         &tradable,
@@ -1045,6 +1052,61 @@ impl SimulationEngine {
         Ok((events, None, reward))
     }
 
+    fn next_value_estimate(
+        &self,
+        agent: &Agent,
+        step: usize,
+        prices: &[Option<f64>],
+        tradable: &[bool],
+    ) -> Result<f32> {
+        if !matches!(
+            agent.policy.policy_blueprint(),
+            crate::brain::PolicyBlueprint::Neural
+        ) {
+            return Ok(0.0);
+        }
+        let mut policy = match agent.policy.fork() {
+            Ok(policy) => policy,
+            Err(_) => return Ok(0.0),
+        };
+        let market = self
+            .features
+            .get(step)
+            .ok_or_else(|| MidasError::Data("next-value feature row is missing".into()))?;
+        let observation = self.observation_builder.build(&ObservationContext {
+            market,
+            portfolio: &agent.state.portfolio,
+            prices,
+            starting_net_worth: self.config.simulation.starting_cash,
+            maximum_net_worth: agent.state.maximum_net_worth,
+            age: agent.state.age,
+            episode_steps: self.features.len() - 1,
+        })?;
+        let allocations = agent.state.portfolio.allocations(prices)?;
+        let maximum_asset_allocation = agent
+            .state
+            .genome
+            .as_ref()
+            .map(|genome| genome.traits.maximum_allocation as f64)
+            .unwrap_or(self.config.brain.traits.maximum_allocation.initial as f64);
+        let evaluation = policy.evaluate_action(
+            &observation,
+            &PolicyContext {
+                tradable,
+                current_allocations: &allocations,
+            },
+            false,
+            maximum_asset_allocation,
+        )?;
+        if evaluation.value_estimate.is_finite() {
+            Ok(evaluation.value_estimate)
+        } else {
+            Err(MidasError::Policy(
+                "next-value estimate is non-finite".into(),
+            ))
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn record_learning(
         &self,
@@ -1053,6 +1115,7 @@ impl SimulationEngine {
         evaluation: crate::brain::PolicyEvaluation,
         action: ValidatedAllocation,
         reward: f32,
+        next_value: f32,
         done: bool,
         date: NaiveDate,
         tradable: &[bool],
@@ -1076,7 +1139,7 @@ impl SimulationEngine {
             temperature: evaluation.temperature,
             value_estimate: evaluation.value_estimate,
             reward,
-            next_value: 0.0,
+            next_value,
             done,
             truncated: false,
             recurrent_state_before: before,

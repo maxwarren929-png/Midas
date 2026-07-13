@@ -18,7 +18,7 @@ Implement `NeuralModel` and `NeuralModelFactory`. A model owns recurrent state a
 
 ### PPO and rewards
 
-`LearningStrategy` owns bounded `RolloutBuffer` state. `PpoLearning` computes GAE with configured `gamma` and `gae_lambda`, normalizes advantages when enabled, preserves recurrent sequence order, and requests a clipped objective update at rollout length or episode end. A successful update is committed only after the model returns finite metrics; failed updates remain inside the step transaction. `RewardFunction` separates environment reward from reproductive fitness; `LogReturn` and `RiskAdjustedReturn` are available.
+`LearningStrategy` owns bounded `RolloutBuffer` state. `PpoLearning` computes GAE with configured `gamma` and `gae_lambda`, uses forked next-observation critic estimates for continuing neural episodes, normalizes advantages when enabled, preserves recurrent sequence order, and requests a clipped objective update at rollout length or episode end. A successful update is committed only after the model returns finite metrics; failed updates remain inside the step transaction. `RewardFunction` separates environment reward from reproductive fitness; `LogReturn` and `RiskAdjustedReturn` are available.
 
 For a neural agent, the inherited learning-rate and entropy traits initialize that agent's PPO update configuration, while action-temperature decay is mutable runtime state and is checkpointed with the policy snapshot. The immutable birth genome is not rewritten by these lifetime updates.
 
