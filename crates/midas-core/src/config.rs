@@ -16,6 +16,8 @@ pub struct Config {
     pub observation: ObservationConfig,
     #[serde(default)]
     pub corporate_actions: CorporateActionConfig,
+    #[serde(default)]
+    pub policy_failures: PolicyFailureConfig,
     pub brain: BrainConfig,
     pub learning: LearningConfig,
     pub backend: BackendConfig,
@@ -285,6 +287,31 @@ impl Default for CorporateActionConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyFailureBehavior {
+    Continue,
+    #[default]
+    KillAgent,
+    StopExperiment,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyFailureConfig {
+    pub maximum_consecutive: u32,
+    pub maximum_total: u32,
+    pub behavior: PolicyFailureBehavior,
+}
+impl Default for PolicyFailureConfig {
+    fn default() -> Self {
+        Self {
+            maximum_consecutive: 3,
+            maximum_total: 20,
+            behavior: PolicyFailureBehavior::KillAgent,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LearningConfig {
@@ -316,7 +343,25 @@ pub struct BackendConfig {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
+    #[serde(alias = "cpu")]
     Cpu,
+}
+
+impl BackendConfig {
+    pub fn compute_device(&self) -> Result<crate::brain::ComputeDevice> {
+        if self.device.trim().is_empty() {
+            return Err(MidasError::Config(
+                "backend.device must not be empty".into(),
+            ));
+        }
+        let device = match self.kind {
+            BackendKind::Cpu => crate::brain::ComputeDevice::CpuNdArray {
+                device: self.device.clone(),
+            },
+        };
+        device.validate()?;
+        Ok(device)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -446,6 +491,10 @@ impl Config {
         {
             return bad("corporate action thresholds are invalid");
         }
+        if self.policy_failures.maximum_consecutive == 0 || self.policy_failures.maximum_total == 0
+        {
+            return bad("policy failure limits must be positive");
+        }
         for range in [
             &self.splits.training,
             &self.splits.validation,
@@ -482,9 +531,7 @@ impl Config {
         {
             return bad("learning configuration values are invalid");
         }
-        if self.backend.device.trim().is_empty() {
-            return bad("backend.device must not be empty");
-        }
+        self.backend.compute_device()?;
         Ok(())
     }
 

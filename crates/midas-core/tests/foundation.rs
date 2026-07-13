@@ -1,31 +1,35 @@
 use chrono::NaiveDate;
 use midas_core::{
-    AssetId, MidasError,
+    AgentId, AssetId, MidasError,
     action::{
         ActionValidationContext, ActionValidator, LongOnlyActionValidator, ProposedAllocation,
     },
-    agent::StandardAgentFactory,
+    agent::{
+        AgentBuildContext, AgentFactory, AgentSpawnRequest, SpawnMetadata, StandardAgentFactory,
+    },
     brain::{
         BrainArchitecture, BrainGenome, BurnNeuralModelFactory, ComputeDevice, NeuralInput,
-        NeuralModel, NeuralModelFactory, NeuralModelState, NeuralOutput,
+        NeuralModel, NeuralModelFactory, NeuralModelState, NeuralOutput, PolicyBlueprint,
     },
     config::{
         Config, CorporateActionConfig, CorporateActionMode, DeathHandling, ObservationFeatureKind,
-        PolicyKind,
+        PolicyFailureBehavior, PolicyKind,
     },
     execution::{
         CostExecutionEngine, ExecutionApplier, ExecutionPlanner, ExecutionSnapshot, Portfolio,
         TradeSide,
     },
     market::{
-        BackwardFeaturePipeline, CorporateAction, FeaturePipeline, MarketBar, MarketDataSource,
-        MarketDataset, PolarsDataSource, write_parquet,
+        BackwardFeaturePipeline, CorporateAction, FeaturePipeline, FeaturePriceSeries, MarketBar,
+        MarketDataSource, MarketDataset, PointInTimeFeaturePriceSeries, PolarsDataSource,
+        write_parquet,
     },
     observation::{
         Observation, ObservationBuilder, ObservationContext, ObservationSchema,
         SchemaObservationBuilder,
     },
-    simulation::{DatasetSplit, SimulationEngine, SimulationLifecycle},
+    replacement::{LivingAgentSummary, ReplacementContext, ReplacementStrategy},
+    simulation::{DatasetSplit, DomainEvent, SimulationEngine, SimulationLifecycle},
 };
 use proptest::prelude::*;
 use std::path::PathBuf;
@@ -100,6 +104,109 @@ fn split_preserves_value_and_entry_price() {
     assert_eq!(p.positions[0].quantity, 20.0);
     assert_eq!(p.positions[0].average_entry_price, 50.0);
     assert_eq!(before, p.value(&[Some(50.0)]).unwrap());
+}
+
+#[test]
+fn reverse_and_multiple_splits_compose_without_feature_discontinuity() {
+    let config = CorporateActionConfig {
+        mode: CorporateActionMode::ExplicitEvents,
+        ..Default::default()
+    };
+    let bars = vec![
+        bar(0, "2020-01-01", 100.0),
+        bar(0, "2020-01-02", 50.0),
+        bar(0, "2020-01-03", 25.0),
+    ];
+    let actions = vec![
+        CorporateAction::Split {
+            asset_id: AssetId(0),
+            date: date("2020-01-02"),
+            ratio: 2.0,
+        },
+        CorporateAction::Split {
+            asset_id: AssetId(0),
+            date: date("2020-01-03"),
+            ratio: 2.0,
+        },
+    ];
+    let dataset =
+        MarketDataset::new_with_actions(vec!["A".into()], bars, actions, &config).unwrap();
+    let series = PointInTimeFeaturePriceSeries::new(&dataset);
+    assert_eq!(
+        series.price(AssetId(0), date("2020-01-01")).unwrap(),
+        Some(100.0)
+    );
+    assert_eq!(
+        series.price(AssetId(0), date("2020-01-02")).unwrap(),
+        Some(100.0)
+    );
+    assert_eq!(
+        series.price(AssetId(0), date("2020-01-03")).unwrap(),
+        Some(100.0)
+    );
+    let mut portfolio = Portfolio::new(0.0, 1);
+    portfolio.positions[0].quantity = 100.0;
+    portfolio.positions[0].average_entry_price = 10.0;
+    portfolio
+        .apply_corporate_action(&CorporateAction::Split {
+            asset_id: AssetId(0),
+            date: date("2020-01-02"),
+            ratio: 0.2,
+        })
+        .unwrap();
+    assert_eq!(portfolio.positions[0].quantity, 20.0);
+    assert_eq!(portfolio.positions[0].average_entry_price, 50.0);
+    assert_eq!(portfolio.value(&[Some(50.0)]).unwrap(), 1000.0);
+}
+
+#[test]
+fn dividend_is_credited_once_on_declared_event() {
+    let action = CorporateAction::CashDividend {
+        asset_id: AssetId(0),
+        date: date("2020-01-02"),
+        amount_per_share: 1.25,
+    };
+    let mut portfolio = Portfolio::new(10.0, 1);
+    portfolio.positions[0].quantity = 4.0;
+    portfolio.apply_corporate_action(&action).unwrap();
+    assert_eq!(portfolio.cash, 15.0);
+    assert_eq!(portfolio.cash, 15.0);
+    assert_eq!(portfolio.positions[0].quantity, 4.0);
+}
+
+#[test]
+fn same_day_split_and_dividend_follow_documented_order() {
+    let corporate = CorporateActionConfig {
+        mode: CorporateActionMode::ExplicitEvents,
+        ..Default::default()
+    };
+    let actions = vec![
+        CorporateAction::CashDividend {
+            asset_id: AssetId(0),
+            date: date("2020-01-02"),
+            amount_per_share: 1.0,
+        },
+        CorporateAction::Split {
+            asset_id: AssetId(0),
+            date: date("2020-01-02"),
+            ratio: 2.0,
+        },
+    ];
+    let dataset = MarketDataset::new_with_actions(
+        vec!["A".into()],
+        vec![bar(0, "2020-01-01", 100.0), bar(0, "2020-01-02", 50.0)],
+        actions,
+        &corporate,
+    )
+    .unwrap();
+    let mut portfolio = Portfolio::new(0.0, 1);
+    portfolio.positions[0].quantity = 10.0;
+    portfolio.positions[0].average_entry_price = 100.0;
+    for action in &dataset.corporate_actions {
+        portfolio.apply_corporate_action(action).unwrap();
+    }
+    assert_eq!(portfolio.positions[0].quantity, 20.0);
+    assert_eq!(portfolio.cash, 20.0);
 }
 
 #[test]
@@ -242,6 +349,58 @@ fn action_validator_masks_caps_and_falls_back() {
 }
 
 #[test]
+fn action_validator_handles_edge_cases_without_drift_or_looping() {
+    let proposals = [
+        vec![0.0, 1e300, 1e-300, 5.0, 0.0, 9.0],
+        vec![0.0; 6],
+        vec![f64::NAN; 6],
+        vec![f64::INFINITY, 1.0, 0.0, 0.0, 0.0, 0.0],
+        vec![0.0, -1.0, 1.0, 0.0, 0.0, 0.0],
+    ];
+    for maximum in [1.0, 0.01, 0.0001] {
+        for (tradable, proposal) in [
+            (vec![true, true, true, true, true], proposals[0].clone()),
+            (
+                vec![false, false, false, false, false],
+                proposals[1].clone(),
+            ),
+            (vec![true, false, true, false, true], proposals[2].clone()),
+            (vec![false, true, false, true, false], proposals[3].clone()),
+            (vec![true, true, false, false, true], proposals[4].clone()),
+        ] {
+            let value = validator(proposal, &tradable, maximum);
+            assert!(value.weights().iter().all(|weight| weight.is_finite()));
+            assert!((value.weights().iter().sum::<f64>() - 1.0).abs() < 1e-9);
+            assert!(
+                value
+                    .weights()
+                    .iter()
+                    .skip(1)
+                    .zip(&tradable)
+                    .all(|(weight, available)| {
+                        (!*available && *weight == 0.0) || *weight <= maximum + 1e-9
+                    })
+            );
+        }
+    }
+    let one = validator(vec![0.0, 10.0, 1.0], &[false, true], 0.0001);
+    assert_eq!(one.weights()[1], 0.0);
+    assert!(one.weights()[2] <= 0.0001 + 1e-9);
+    let many = vec![true; 127];
+    let mut proposal = vec![0.0; many.len() + 1];
+    proposal[1..].fill(1.0);
+    let value = validator(proposal, &many, 0.003);
+    assert!((value.weights().iter().sum::<f64>() - 1.0).abs() < 1e-9);
+    assert!(
+        value
+            .weights()
+            .iter()
+            .skip(1)
+            .all(|weight| *weight <= 0.003 + 1e-9)
+    );
+}
+
+#[test]
 fn random_and_malicious_proposals_cannot_bypass_concentration() {
     let mut c = config();
     c.brain.traits.maximum_allocation.initial = 0.25;
@@ -330,6 +489,103 @@ fn proportional_planning_includes_costs_and_is_order_invariant() {
 }
 
 #[test]
+fn execution_uses_stable_asset_ids_and_rejects_tampered_plans() {
+    let mut c = config();
+    c.execution.commission_fixed = 1.0;
+    c.execution.commission_rate = 0.01;
+    c.execution.spread_rate = 0.02;
+    c.execution.slippage_rate = 0.01;
+    let engine = CostExecutionEngine { costs: c.execution };
+    let mut first = Portfolio::new(100.0, 2);
+    first.positions[0].asset_id = AssetId(10);
+    first.positions[1].asset_id = AssetId(20);
+    let first_a = MarketBar {
+        asset_id: AssetId(10),
+        ..bar(10, "2020-01-01", 10.0)
+    };
+    let first_b = MarketBar {
+        asset_id: AssetId(20),
+        ..bar(20, "2020-01-01", 20.0)
+    };
+    let first_bars = [Some(&first_a), Some(&first_b)];
+    let first_prices = [Some(10.0), Some(20.0)];
+    let action = validator(vec![0.0, 0.5, 0.5], &[true, true], 1.0);
+    let first_plan = engine
+        .plan(
+            &first,
+            &action,
+            &ExecutionSnapshot {
+                bars: &first_bars,
+                valuation_prices: &first_prices,
+            },
+            0.0,
+        )
+        .unwrap();
+    let mut second = Portfolio::new(100.0, 2);
+    second.positions.swap(0, 1);
+    second.positions[0].asset_id = AssetId(20);
+    second.positions[1].asset_id = AssetId(10);
+    let second_bars = [Some(&first_b), Some(&first_a)];
+    let second_prices = [Some(20.0), Some(10.0)];
+    let second_action = validator(vec![0.0, 0.5, 0.5], &[true, true], 1.0);
+    let second_plan = engine
+        .plan(
+            &second,
+            &second_action,
+            &ExecutionSnapshot {
+                bars: &second_bars,
+                valuation_prices: &second_prices,
+            },
+            0.0,
+        )
+        .unwrap();
+    let by_id = |plan: &midas_core::execution::ExecutionPlan| {
+        plan.trades
+            .iter()
+            .map(|trade| (trade.asset_id, (trade.quantity, trade.notional)))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    assert_eq!(by_id(&first_plan), by_id(&second_plan));
+    let first_report = engine.apply(&mut first, &first_plan).unwrap();
+    assert!(first.cash >= 0.0);
+    assert!(
+        first_report
+            .trades
+            .iter()
+            .all(|trade| trade.asset_id.0 >= 10)
+    );
+    let mut tampered = first_plan.clone();
+    tampered.trades[0].commission += 1.0;
+    assert!(
+        engine
+            .apply(&mut Portfolio::new(100.0, 2), &tampered)
+            .is_err()
+    );
+    let unavailable_bars = [Some(&first_a), None];
+    let mut unavailable_portfolio = Portfolio::new(100.0, 2);
+    unavailable_portfolio.positions[0].asset_id = AssetId(10);
+    unavailable_portfolio.positions[1].asset_id = AssetId(20);
+    let unavailable = engine
+        .plan(
+            &unavailable_portfolio,
+            &action,
+            &ExecutionSnapshot {
+                bars: &unavailable_bars,
+                valuation_prices: &first_prices,
+            },
+            0.0,
+        )
+        .unwrap();
+    assert!(unavailable.rejected_assets.contains(&AssetId(20)));
+    assert!(
+        unavailable
+            .trades
+            .iter()
+            .all(|trade| trade.asset_id != AssetId(20))
+    );
+}
+
+#[test]
 fn minimum_trade_filter_stabilizes_and_apply_is_atomic() {
     let mut c = config();
     c.execution.commission_fixed = 10.0;
@@ -358,6 +614,25 @@ fn minimum_trade_filter_stabilizes_and_apply_is_atomic() {
     );
     engine.apply(&mut p, &plan).unwrap();
     assert!(p.cash >= 0.0);
+
+    let mut expensive = config();
+    expensive.execution.commission_fixed = 100.0;
+    let expensive_engine = CostExecutionEngine {
+        costs: expensive.execution,
+    };
+    let no_trade = expensive_engine
+        .plan(
+            &Portfolio::new(30.0, 1),
+            &validator(vec![0.0, 1.0], &[true], 1.0),
+            &ExecutionSnapshot {
+                bars: &[Some(&a)],
+                valuation_prices: &[Some(10.0)],
+            },
+            0.0,
+        )
+        .unwrap();
+    assert!(no_trade.trades.is_empty());
+    assert_eq!(no_trade.affordability_scale, 0.0);
 }
 
 #[test]
@@ -450,6 +725,91 @@ fn configured_no_replacement_is_respected() {
     }
 }
 
+struct SelectSpecificLiving;
+impl ReplacementStrategy for SelectSpecificLiving {
+    fn create_replacement(
+        &mut self,
+        context: &ReplacementContext<'_>,
+    ) -> midas_core::Result<AgentSpawnRequest> {
+        let living = context
+            .living_population
+            .iter()
+            .find(|summary| summary.id == AgentId(7))
+            .ok_or_else(|| MidasError::Policy("selected living agent is missing".into()))?;
+        Ok(AgentSpawnRequest {
+            policy_blueprint: living.policy.clone(),
+            genome: living.genome.cloned(),
+            parent_ids: vec![living.id],
+            metadata: SpawnMetadata {
+                reason: "test_deterministic_selection".into(),
+            },
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "test_specific_living"
+    }
+}
+
+#[test]
+fn replacement_context_supports_deterministic_read_only_selection() {
+    let c = config();
+    let data = loaded(&c);
+    let engine = SimulationEngine::new(c.clone(), data, DatasetSplit::Training).unwrap();
+    let state = engine.agents().next().unwrap().clone();
+    let architecture = BrainArchitecture::from_config(
+        &c.brain,
+        engine
+            .observation_schema()
+            .identity(c.market.assets.len())
+            .unwrap(),
+        engine.observation_schema().dimension(c.market.assets.len()),
+        c.market.assets.len(),
+    );
+    let device = c.backend.compute_device().unwrap();
+    let living = vec![LivingAgentSummary {
+        id: AgentId(7),
+        net_worth: state.portfolio.net_worth,
+        age: state.age,
+        policy: PolicyBlueprint::Neural,
+        genome: state.genome.as_ref(),
+        maximum_drawdown: state.maximum_drawdown,
+        birth_date: state.birth_date,
+        parent_ids: state.parent_ids.clone(),
+    }];
+    let schema = engine.observation_schema().clone();
+    let mut strategy = SelectSpecificLiving;
+    let request = strategy
+        .create_replacement(&ReplacementContext {
+            dead_agent: &state,
+            dead_policy: PolicyBlueprint::Neural,
+            living_population: &living,
+            config: &c,
+            architecture: &architecture,
+            compute_device: &device,
+            observation_schema: &schema,
+            deterministic_seed: 7,
+        })
+        .unwrap();
+    assert_eq!(request.parent_ids, vec![AgentId(7)]);
+    assert_eq!(request.genome.as_ref(), living[0].genome);
+    let factory = StandardAgentFactory::default();
+    let spawned = factory
+        .spawn(
+            request,
+            &AgentBuildContext {
+                agent_id: AgentId(99),
+                birth_date: state.birth_date,
+                config: &c,
+                architecture: &architecture,
+                compute_device: &device,
+            },
+        )
+        .unwrap();
+    assert_eq!(spawned.policy.policy_blueprint(), PolicyBlueprint::Neural);
+    assert_eq!(spawned.state.parent_ids, vec![AgentId(7)]);
+}
+
 #[test]
 fn checkpoint_domain_history_and_completion_are_deterministic() {
     let c = config();
@@ -465,6 +825,14 @@ fn checkpoint_domain_history_and_completion_are_deterministic() {
     let mut resumed = SimulationEngine::resume(c.clone(), data.clone(), file.path()).unwrap();
     resumed.run().unwrap();
     assert_eq!(full.domain_events, resumed.domain_events);
+    assert_eq!(
+        full.agents().collect::<Vec<_>>(),
+        resumed.agents().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        full.agent_blueprints().collect::<Vec<_>>(),
+        resumed.agent_blueprints().collect::<Vec<_>>()
+    );
     let count = resumed.domain_events.len();
     resumed.run().unwrap();
     assert_eq!(count, resumed.domain_events.len());
@@ -475,6 +843,14 @@ fn checkpoint_domain_history_and_completion_are_deterministic() {
     let count = restored.domain_events.len();
     restored.run().unwrap();
     assert_eq!(count, restored.domain_events.len());
+    let full_file = tempfile::NamedTempFile::new().unwrap();
+    let resumed_file = tempfile::NamedTempFile::new().unwrap();
+    full.save_checkpoint(full_file.path()).unwrap();
+    resumed.save_checkpoint(resumed_file.path()).unwrap();
+    assert_eq!(
+        std::fs::read(full_file.path()).unwrap(),
+        std::fs::read(resumed_file.path()).unwrap()
+    );
 }
 
 #[test]
@@ -495,14 +871,102 @@ fn checkpoint_rejects_observation_schema_change() {
     assert!(error.to_string().contains("observation schema"));
 }
 
+#[test]
+fn checkpoint_rejects_brain_architecture_change() {
+    let c = config();
+    let data = loaded(&c);
+    let mut engine =
+        SimulationEngine::new(c.clone(), data.clone(), DatasetSplit::Training).unwrap();
+    engine.run_steps(1).unwrap();
+    let file = tempfile::NamedTempFile::new().unwrap();
+    engine.save_checkpoint(file.path()).unwrap();
+    let mut changed = c;
+    changed.brain.hidden_layers = vec![8, 8];
+    let error = match SimulationEngine::resume(changed, data, file.path()) {
+        Ok(_) => panic!("architecture mismatch accepted"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("configuration") || error.to_string().contains("architecture")
+    );
+}
+
+#[test]
+fn checkpoint_rejects_corporate_action_data_change() {
+    let mut c = config();
+    c.corporate_actions.mode = CorporateActionMode::ExplicitEvents;
+    let source = loaded(&c);
+    let action = CorporateAction::CashDividend {
+        asset_id: AssetId(0),
+        date: date("2020-01-03"),
+        amount_per_share: 0.25,
+    };
+    let with_action = MarketDataset::new_with_actions(
+        source.assets.clone(),
+        source.bars.clone(),
+        vec![action],
+        &c.corporate_actions,
+    )
+    .unwrap();
+    let mut engine = SimulationEngine::new(c.clone(), with_action, DatasetSplit::Training).unwrap();
+    engine.run_steps(1).unwrap();
+    let file = tempfile::NamedTempFile::new().unwrap();
+    engine.save_checkpoint(file.path()).unwrap();
+    let without_action = MarketDataset::new_with_actions(
+        source.assets,
+        source.bars,
+        Vec::new(),
+        &c.corporate_actions,
+    )
+    .unwrap();
+    let error = match SimulationEngine::resume(c, without_action, file.path()) {
+        Ok(_) => panic!("corporate-action data mismatch accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("dataset identity"));
+}
+
+#[test]
+fn backend_identity_is_configuration_driven_and_checkpoint_checked() {
+    let mut c = config();
+    c.backend.device = "default".into();
+    assert_eq!(
+        c.backend.compute_device().unwrap().identity(),
+        "cpu_ndarray:default"
+    );
+    let data = loaded(&c);
+    let mut engine =
+        SimulationEngine::new(c.clone(), data.clone(), DatasetSplit::Training).unwrap();
+    engine.run_steps(1).unwrap();
+    let file = tempfile::NamedTempFile::new().unwrap();
+    engine.save_checkpoint(file.path()).unwrap();
+    let mut changed = c;
+    changed.backend.device = "other-device".into();
+    let error = match SimulationEngine::resume(changed, data, file.path()) {
+        Ok(_) => panic!("backend mismatch accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("backend") || error.to_string().contains("device"));
+    let mut unsupported = config();
+    unsupported.backend.device = "unsupported".into();
+    let error = unsupported.validate().unwrap_err();
+    assert!(error.to_string().contains("unsupported CPU NdArray device"));
+}
+
 struct MockModel {
     schema: String,
     size: usize,
     memory: f32,
+    fail: bool,
 }
 impl NeuralModel for MockModel {
     fn forward(&mut self, input: &NeuralInput<'_>) -> midas_core::Result<NeuralOutput> {
         assert_eq!(input.observation.schema_hash, self.schema);
+        if self.fail {
+            return Err(MidasError::Policy(
+                "non-finite neural output injected".into(),
+            ));
+        }
         self.memory += 1.0;
         Ok(NeuralOutput {
             logits: vec![0.0; self.size],
@@ -519,18 +983,22 @@ impl NeuralModel for MockModel {
         })
     }
 }
-struct MockFactory;
+struct MockFactory {
+    fail: bool,
+}
 impl NeuralModelFactory for MockFactory {
     fn build(
         &self,
         _: &BrainGenome,
         a: &BrainArchitecture,
-        _: &ComputeDevice,
+        device: &ComputeDevice,
     ) -> midas_core::Result<Box<dyn NeuralModel>> {
+        assert_eq!(device.identity(), "cpu_ndarray:default");
         Ok(Box::new(MockModel {
             schema: a.observation_schema_hash.clone(),
             size: a.actor_output_size,
             memory: 0.0,
+            fail: self.fail,
         }))
     }
     fn restore(
@@ -538,8 +1006,9 @@ impl NeuralModelFactory for MockFactory {
         _: &BrainGenome,
         a: &BrainArchitecture,
         state: NeuralModelState,
-        _: &ComputeDevice,
+        device: &ComputeDevice,
     ) -> midas_core::Result<Box<dyn NeuralModel>> {
+        assert_eq!(device.identity(), "cpu_ndarray:default");
         let NeuralModelState::External { state, .. } = state else {
             return Err(MidasError::Policy("wrong mock state".into()));
         };
@@ -547,6 +1016,7 @@ impl NeuralModelFactory for MockFactory {
             schema: a.observation_schema_hash.clone(),
             size: a.actor_output_size,
             memory: state[0],
+            fail: self.fail,
         }))
     }
 }
@@ -554,7 +1024,7 @@ impl NeuralModelFactory for MockFactory {
 fn simulation_runs_mock_and_burn_neural_models() {
     let c = config();
     let data = loaded(&c);
-    let factory = StandardAgentFactory::with_neural_factory(Box::new(MockFactory));
+    let factory = StandardAgentFactory::with_neural_factory(Box::new(MockFactory { fail: false }));
     let mut mock = SimulationEngine::new_with_factory(
         c.clone(),
         data.clone(),
@@ -568,6 +1038,53 @@ fn simulation_runs_mock_and_burn_neural_models() {
     burn.run_steps(2).unwrap();
     assert!(burn.metrics.agents.values().all(|m| m.survival_days == 2));
     assert!(!include_str!("../src/simulation.rs").contains("burn::"));
+}
+
+#[test]
+fn policy_failures_emit_diagnostics_and_obey_limits() {
+    let mut c = config();
+    c.simulation.population_size = 1;
+    c.policy_failures.maximum_consecutive = 1;
+    c.policy_failures.maximum_total = 1;
+    c.policy_failures.behavior = PolicyFailureBehavior::KillAgent;
+    let data = loaded(&c);
+    let factory = StandardAgentFactory::with_neural_factory(Box::new(MockFactory { fail: true }));
+    let mut engine =
+        SimulationEngine::new_with_factory(c, data, DatasetSplit::Training, Box::new(factory))
+            .unwrap();
+    engine.run_steps(1).unwrap();
+    assert_eq!(engine.metrics.policy_failures, 1);
+    assert_eq!(engine.metrics.births, 2);
+    assert!(engine.domain_events.iter().any(|event| matches!(event, DomainEvent::PolicyFailure { category: midas_core::simulation::PolicyFailureCategory::NonFiniteState, message, .. } if message.contains("injected"))));
+    let mut c = config();
+    c.simulation.population_size = 1;
+    c.policy_failures.maximum_consecutive = 1;
+    c.policy_failures.maximum_total = 2;
+    c.policy_failures.behavior = PolicyFailureBehavior::Continue;
+    let data = loaded(&c);
+    let factory = StandardAgentFactory::with_neural_factory(Box::new(MockFactory { fail: true }));
+    let mut engine =
+        SimulationEngine::new_with_factory(c, data, DatasetSplit::Training, Box::new(factory))
+            .unwrap();
+    engine.run_steps(2).unwrap();
+    assert_eq!(engine.metrics.policy_failures, 2);
+    assert_eq!(engine.metrics.births, 1);
+}
+
+#[test]
+fn stop_on_policy_failure_preserves_original_failure_event() {
+    let mut c = config();
+    c.simulation.population_size = 1;
+    c.policy_failures.maximum_consecutive = 1;
+    c.policy_failures.maximum_total = 1;
+    c.policy_failures.behavior = PolicyFailureBehavior::StopExperiment;
+    let data = loaded(&c);
+    let factory = StandardAgentFactory::with_neural_factory(Box::new(MockFactory { fail: true }));
+    let mut engine =
+        SimulationEngine::new_with_factory(c, data, DatasetSplit::Training, Box::new(factory))
+            .unwrap();
+    assert!(engine.run_steps(1).is_err());
+    assert!(engine.domain_events.iter().any(|event| matches!(event, DomainEvent::PolicyFailure { message, .. } if message.contains("injected"))));
 }
 
 #[test]
@@ -599,6 +1116,7 @@ fn neural_memory_resets_and_genome_validates_full_schema() {
         schema: "one".into(),
         size: 2,
         memory: 5.0,
+        fail: false,
     };
     model.reset_memory();
     let NeuralModelState::External { state, .. } = model.snapshot_state().unwrap() else {
@@ -740,12 +1258,25 @@ fn burn_model_is_deterministic_and_memory_is_checkpointed() {
         c.market.assets.len(),
     );
     let genome = BrainGenome::random(&architecture, &c.brain.traits, 7).unwrap();
+    let genome_before = genome.clone();
     let factory = BurnNeuralModelFactory;
     let mut first = factory
-        .build(&genome, &architecture, &ComputeDevice::Cpu)
+        .build(
+            &genome,
+            &architecture,
+            &ComputeDevice::CpuNdArray {
+                device: "default".into(),
+            },
+        )
         .unwrap();
     let mut second = factory
-        .build(&genome, &architecture, &ComputeDevice::Cpu)
+        .build(
+            &genome,
+            &architecture,
+            &ComputeDevice::CpuNdArray {
+                device: "default".into(),
+            },
+        )
         .unwrap();
     let observation = Observation {
         schema_hash: hash,
@@ -771,6 +1302,17 @@ fn burn_model_is_deterministic_and_memory_is_checkpointed() {
         first.snapshot_state().unwrap(),
         second.snapshot_state().unwrap()
     );
+    assert_eq!(first.runtime_parameter_builds(), 1);
+    assert_eq!(second.runtime_parameter_builds(), 1);
+    for _ in 0..32 {
+        first
+            .forward(&NeuralInput {
+                observation: &observation,
+            })
+            .unwrap();
+    }
+    assert_eq!(genome, genome_before);
+    assert_eq!(first.runtime_parameter_builds(), 1);
 }
 
 #[test]

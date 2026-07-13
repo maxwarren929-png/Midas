@@ -27,6 +27,7 @@ pub struct ValidatedAllocation {
     weights: Vec<f64>,
     rebalance: bool,
     used_fallback: bool,
+    fallback_reason: Option<String>,
 }
 
 impl ValidatedAllocation {
@@ -38,6 +39,9 @@ impl ValidatedAllocation {
     }
     pub fn used_fallback(&self) -> bool {
         self.used_fallback
+    }
+    pub fn fallback_reason(&self) -> Option<&str> {
+        self.fallback_reason.as_deref()
     }
 }
 
@@ -66,6 +70,8 @@ impl LongOnlyActionValidator {
             weights,
             rebalance: true,
             used_fallback,
+            fallback_reason: used_fallback
+                .then_some("invalid or unavailable allocation proposal".into()),
         }
     }
 }
@@ -88,7 +94,10 @@ impl ActionValidator for LongOnlyActionValidator {
         if proposed.weights.len() != context.asset_count + 1
             || proposed.weights.iter().any(|v| !v.is_finite() || *v < 0.0)
         {
-            return Ok(Self::cash(context.asset_count, true));
+            let mut value = Self::cash(context.asset_count, true);
+            value.fallback_reason =
+                Some("proposal length, finiteness, or sign validation failed".into());
+            return Ok(value);
         }
         let mut weights = proposed.weights;
         for (index, tradable) in context.tradable.iter().enumerate() {
@@ -98,7 +107,9 @@ impl ActionValidator for LongOnlyActionValidator {
         }
         let sum = weights.iter().sum::<f64>();
         if !sum.is_finite() || sum <= 0.0 {
-            return Ok(Self::cash(context.asset_count, true));
+            let mut value = Self::cash(context.asset_count, true);
+            value.fallback_reason = Some("proposal sum was zero or non-finite".into());
+            return Ok(value);
         }
         for weight in &mut weights {
             *weight /= sum;
@@ -132,7 +143,20 @@ impl ActionValidator for LongOnlyActionValidator {
         for weight in &mut weights {
             *weight /= sum;
         }
-        if weights.iter().skip(1).any(|v| *v > max + 1e-9) {
+        let mut rounding_excess = 0.0;
+        for weight in weights.iter_mut().skip(1) {
+            if *weight > max {
+                rounding_excess += *weight - max;
+                *weight = max;
+            }
+        }
+        weights[0] += rounding_excess;
+        if weights
+            .iter()
+            .any(|weight| !weight.is_finite() || *weight < 0.0)
+            || (weights.iter().sum::<f64>() - 1.0).abs() > 1e-9
+            || weights.iter().skip(1).any(|weight| *weight > max)
+        {
             return Err(MidasError::Policy(
                 "concentration enforcement failed".into(),
             ));
@@ -141,6 +165,7 @@ impl ActionValidator for LongOnlyActionValidator {
             weights,
             rebalance: proposed.rebalance,
             used_fallback: false,
+            fallback_reason: None,
         })
     }
 }

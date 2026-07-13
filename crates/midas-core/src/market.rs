@@ -63,6 +63,45 @@ pub struct MarketDataset {
     index: BTreeMap<(NaiveDate, AssetId), usize>,
 }
 
+/// Supplies raw-close feature prices adjusted only by split events known on or
+/// before the requested date. Cash dividends remain explicit cash events and
+/// are never folded into this series.
+pub trait FeaturePriceSeries: Send + Sync {
+    fn price(&self, asset: AssetId, date: NaiveDate) -> Result<Option<f64>>;
+}
+
+pub struct PointInTimeFeaturePriceSeries<'a> {
+    dataset: &'a MarketDataset,
+}
+impl<'a> PointInTimeFeaturePriceSeries<'a> {
+    pub fn new(dataset: &'a MarketDataset) -> Self {
+        Self { dataset }
+    }
+}
+impl FeaturePriceSeries for PointInTimeFeaturePriceSeries<'_> {
+    fn price(&self, asset: AssetId, date: NaiveDate) -> Result<Option<f64>> {
+        let Some(bar) = self.dataset.bar(date, asset) else {
+            return Ok(None);
+        };
+        let mut factor = 1.0;
+        for action in &self.dataset.corporate_actions {
+            if action.asset_id() == asset
+                && action.date() <= date
+                && let CorporateAction::Split { ratio, .. } = action
+            {
+                factor *= ratio;
+            }
+        }
+        let value = bar.close * factor;
+        if !value.is_finite() || value <= 0.0 {
+            return Err(MidasError::Data(format!(
+                "invalid point-in-time feature price for asset {asset} on {date}"
+            )));
+        }
+        Ok(Some(value))
+    }
+}
+
 impl MarketDataset {
     pub fn load(config: &Config) -> Result<Self> {
         let frame = match config.data.format {
@@ -217,7 +256,16 @@ impl MarketDataset {
             .enumerate()
             .map(|(i, b)| ((b.date, b.asset_id), i))
             .collect();
-        corporate_actions.sort_by_key(|action| (action.date(), action.asset_id()));
+        corporate_actions.sort_by_key(|action| {
+            (
+                action.date(),
+                action.asset_id(),
+                match action {
+                    CorporateAction::Split { .. } => 0u8,
+                    CorporateAction::CashDividend { .. } => 1u8,
+                },
+            )
+        });
         validate_corporate_actions(&assets, &bars, &corporate_actions, corporate_config)?;
         let identity = blake3::hash(&bincode::serialize(&(
             assets.as_slice(),
@@ -341,24 +389,16 @@ impl FeaturePipeline for BackwardFeaturePipeline {
     fn generate(&self, data: &MarketDataset, dates: &[NaiveDate]) -> Result<Vec<FeatureRow>> {
         let mut history: Vec<Vec<FeaturePoint<'_>>> =
             (0..self.schema.asset_count).map(|_| Vec::new()).collect();
-        let mut split_factor = vec![1.0; self.schema.asset_count];
+        let price_series = PointInTimeFeaturePriceSeries::new(data);
         let wanted: BTreeSet<_> = dates.iter().copied().collect();
         let mut rows = Vec::new();
         for date in &data.dates {
-            for action in data.corporate_actions_on(*date) {
-                if let CorporateAction::Split {
-                    asset_id, ratio, ..
-                } = action
-                {
-                    split_factor[asset_id.0 as usize] *= ratio;
-                }
-            }
             for (asset, asset_history) in history.iter_mut().enumerate() {
                 if let Some(bar) = data.bar(*date, AssetId(asset as u64)) {
-                    asset_history.push(FeaturePoint {
-                        bar,
-                        price: bar.close * split_factor[asset],
-                    });
+                    let price = price_series
+                        .price(AssetId(asset as u64), *date)?
+                        .unwrap_or(bar.close);
+                    asset_history.push(FeaturePoint { bar, price });
                 }
             }
             if !wanted.contains(date) {
@@ -537,6 +577,15 @@ fn validate_corporate_actions(
                 "corporate action references unknown asset".into(),
             ));
         }
+        if !bars
+            .iter()
+            .any(|bar| bar.asset_id == action.asset_id() && bar.date == action.date())
+        {
+            return Err(MidasError::Data(format!(
+                "corporate action for asset {} has no matching trading date",
+                action.asset_id()
+            )));
+        }
         match action {
             CorporateAction::Split { ratio, .. } if !ratio.is_finite() || *ratio <= 0.0 => {
                 return Err(MidasError::Data(
@@ -565,8 +614,10 @@ fn validate_corporate_actions(
     for bar in bars {
         if let Some(prior) = previous[bar.asset_id.0 as usize] {
             let change = (bar.open / prior.close - 1.0).abs();
-            let declared_split = actions.iter().any(|action| matches!(action, CorporateAction::Split { asset_id, date, .. } if *asset_id == bar.asset_id && *date == bar.date));
-            if change > config.discontinuity_threshold && !declared_split {
+            let declared_action = actions
+                .iter()
+                .any(|action| action.asset_id() == bar.asset_id && action.date() == bar.date);
+            if change > config.discontinuity_threshold && !declared_action {
                 return Err(MidasError::Data(format!(
                     "likely unsupported corporate action for asset {} on {}: {:.2}% discontinuity",
                     bar.asset_id,

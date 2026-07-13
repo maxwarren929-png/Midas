@@ -221,8 +221,43 @@ fn random_dense(inputs: usize, outputs: usize, r: &mut ChaCha8Rng) -> DenseGenom
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct LifetimeBrain {
-    pub parameters: BrainGenome,
+pub struct LifetimeParameters {
+    pub hidden: Vec<DenseGenome>,
+    pub recurrent: DenseGenome,
+    pub actor: DenseGenome,
+    pub critic: DenseGenome,
+}
+impl LifetimeParameters {
+    fn from_genome(genome: &BrainGenome) -> Self {
+        Self {
+            hidden: genome.hidden.clone(),
+            recurrent: genome.recurrent.clone(),
+            actor: genome.actor.clone(),
+            critic: genome.critic.clone(),
+        }
+    }
+    fn validate(&self, architecture: &BrainArchitecture) -> Result<()> {
+        let mut expected = architecture.observation_size;
+        for layer in &self.hidden {
+            validate_dense(layer, expected)?;
+            expected = layer.outputs;
+        }
+        validate_dense(&self.recurrent, expected + architecture.memory.size)?;
+        validate_dense(&self.actor, architecture.memory.size)?;
+        validate_dense(&self.critic, architecture.memory.size)?;
+        if self.recurrent.outputs != architecture.memory.size
+            || self.actor.outputs != architecture.actor_output_size
+            || self.critic.outputs != architecture.critic_output_size
+        {
+            return Err(MidasError::Policy(
+                "lifetime parameter output dimensions mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct NeuralRuntimeState {
     pub memory: Vec<f32>,
     pub inference_steps: u64,
 }
@@ -237,17 +272,45 @@ pub struct NeuralOutput {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum NeuralModelState {
-    Burn(Box<LifetimeBrain>),
-    External { kind: String, state: Vec<f32> },
+    Burn {
+        parameters: Box<LifetimeParameters>,
+        runtime: NeuralRuntimeState,
+    },
+    External {
+        kind: String,
+        state: Vec<f32>,
+    },
 }
 pub trait NeuralModel: Send {
     fn forward(&mut self, input: &NeuralInput<'_>) -> Result<NeuralOutput>;
     fn reset_memory(&mut self);
     fn snapshot_state(&self) -> Result<NeuralModelState>;
+    fn runtime_parameter_builds(&self) -> u64 {
+        0
+    }
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ComputeDevice {
-    Cpu,
+    CpuNdArray { device: String },
+}
+impl ComputeDevice {
+    pub const CPU_NDARRAY_DEFAULT: &'static str = "default";
+
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Self::CpuNdArray { device } if device == Self::CPU_NDARRAY_DEFAULT => Ok(()),
+            Self::CpuNdArray { device } => Err(MidasError::Config(format!(
+                "unsupported CPU NdArray device '{device}'; only '{}' is implemented",
+                Self::CPU_NDARRAY_DEFAULT
+            ))),
+        }
+    }
+
+    pub fn identity(&self) -> String {
+        match self {
+            Self::CpuNdArray { device } => format!("cpu_ndarray:{device}"),
+        }
+    }
 }
 pub trait NeuralModelFactory: Send + Sync {
     fn build(
@@ -267,7 +330,48 @@ pub trait NeuralModelFactory: Send + Sync {
 
 pub struct BurnNeuralModel {
     architecture: BrainArchitecture,
-    lifetime: LifetimeBrain,
+    lifetime: LifetimeParameters,
+    runtime: NeuralRuntimeState,
+    cached: BurnRuntimeParameters,
+}
+#[derive(Clone)]
+struct BurnRuntimeDense {
+    weights: Tensor<CpuBackend, 2>,
+    bias: Tensor<CpuBackend, 2>,
+}
+struct BurnRuntimeParameters {
+    hidden: Vec<BurnRuntimeDense>,
+    recurrent: BurnRuntimeDense,
+    actor: BurnRuntimeDense,
+    critic: BurnRuntimeDense,
+    builds: u64,
+}
+impl BurnRuntimeParameters {
+    fn from_lifetime(
+        lifetime: &LifetimeParameters,
+        d: &<CpuBackend as burn::tensor::backend::Backend>::Device,
+    ) -> Self {
+        Self {
+            hidden: lifetime
+                .hidden
+                .iter()
+                .map(|l| runtime_dense(l, d))
+                .collect(),
+            recurrent: runtime_dense(&lifetime.recurrent, d),
+            actor: runtime_dense(&lifetime.actor, d),
+            critic: runtime_dense(&lifetime.critic, d),
+            builds: 1,
+        }
+    }
+}
+fn runtime_dense(
+    l: &DenseGenome,
+    d: &<CpuBackend as burn::tensor::backend::Backend>::Device,
+) -> BurnRuntimeDense {
+    BurnRuntimeDense {
+        weights: Tensor::from_data(TensorData::new(l.weights.clone(), [l.inputs, l.outputs]), d),
+        bias: Tensor::from_data(TensorData::new(l.bias.clone(), [1, l.outputs]), d),
+    }
 }
 pub struct BurnNeuralModelFactory;
 impl NeuralModelFactory for BurnNeuralModelFactory {
@@ -275,13 +379,18 @@ impl NeuralModelFactory for BurnNeuralModelFactory {
         &self,
         g: &BrainGenome,
         a: &BrainArchitecture,
-        _: &ComputeDevice,
+        device: &ComputeDevice,
     ) -> Result<Box<dyn NeuralModel>> {
+        device.validate()?;
         g.validate(a)?;
+        let burn_device = Default::default();
+        let lifetime = LifetimeParameters::from_genome(g);
+        lifetime.validate(a)?;
         Ok(Box::new(BurnNeuralModel {
             architecture: a.clone(),
-            lifetime: LifetimeBrain {
-                parameters: g.clone(),
+            cached: BurnRuntimeParameters::from_lifetime(&lifetime, &burn_device),
+            lifetime,
+            runtime: NeuralRuntimeState {
                 memory: vec![0.0; a.memory.size],
                 inference_steps: 0,
             },
@@ -292,20 +401,32 @@ impl NeuralModelFactory for BurnNeuralModelFactory {
         g: &BrainGenome,
         a: &BrainArchitecture,
         state: NeuralModelState,
-        _: &ComputeDevice,
+        device: &ComputeDevice,
     ) -> Result<Box<dyn NeuralModel>> {
+        device.validate().map_err(|error| {
+            MidasError::Checkpoint(format!("checkpoint backend is unsupported: {error}"))
+        })?;
         g.validate(a)?;
-        let NeuralModelState::Burn(lifetime) = state else {
+        let NeuralModelState::Burn {
+            parameters,
+            runtime,
+        } = state
+        else {
             return Err(MidasError::Checkpoint("expected Burn neural state".into()));
         };
-        if lifetime.parameters.architecture != *a {
+        let lifetime = *parameters;
+        lifetime.validate(a)?;
+        if runtime.memory.len() != a.memory.size {
             return Err(MidasError::Checkpoint(
-                "neural state architecture mismatch".into(),
+                "neural runtime memory size mismatch".into(),
             ));
         }
+        let burn_device = Default::default();
         Ok(Box::new(BurnNeuralModel {
             architecture: a.clone(),
-            lifetime: *lifetime,
+            cached: BurnRuntimeParameters::from_lifetime(&lifetime, &burn_device),
+            lifetime,
+            runtime,
         }))
     }
 }
@@ -325,56 +446,47 @@ impl NeuralModel for BurnNeuralModel {
             ),
             &device,
         );
-        for l in &self.lifetime.parameters.hidden {
-            x = activate(dense(x, l, &device), self.architecture.activation);
+        for l in &self.cached.hidden {
+            x = activate(dense_runtime(x, l), self.architecture.activation);
         }
         let memory = Tensor::<CpuBackend, 2>::from_data(
             TensorData::new(
-                self.lifetime.memory.clone(),
+                self.runtime.memory.clone(),
                 [1, self.architecture.memory.size],
             ),
             &device,
         );
-        let next = activation::silu(dense(
+        let next = activation::silu(dense_runtime(
             Tensor::cat(vec![x, memory], 1),
-            &self.lifetime.parameters.recurrent,
-            &device,
+            &self.cached.recurrent,
         ));
-        let logits = to_vec(dense(
-            next.clone(),
-            &self.lifetime.parameters.actor,
-            &device,
-        ))?;
-        let value = to_vec(dense(
-            next.clone(),
-            &self.lifetime.parameters.critic,
-            &device,
-        ))?[0];
-        self.lifetime.memory = to_vec(next)?;
-        self.lifetime.inference_steps += 1;
+        let logits = to_vec(dense_runtime(next.clone(), &self.cached.actor))?;
+        let value = to_vec(dense_runtime(next.clone(), &self.cached.critic))?[0];
+        self.runtime.memory = to_vec(next)?;
+        self.runtime.inference_steps += 1;
         if logits.iter().any(|v| !v.is_finite())
             || !value.is_finite()
-            || self.lifetime.memory.iter().any(|v| !v.is_finite())
+            || self.runtime.memory.iter().any(|v| !v.is_finite())
         {
             return Err(MidasError::Policy("non-finite neural output".into()));
         }
         Ok(NeuralOutput { logits, value })
     }
     fn reset_memory(&mut self) {
-        self.lifetime.memory.fill(0.0)
+        self.runtime.memory.fill(0.0)
     }
     fn snapshot_state(&self) -> Result<NeuralModelState> {
-        Ok(NeuralModelState::Burn(Box::new(self.lifetime.clone())))
+        Ok(NeuralModelState::Burn {
+            parameters: Box::new(self.lifetime.clone()),
+            runtime: self.runtime.clone(),
+        })
+    }
+    fn runtime_parameter_builds(&self) -> u64 {
+        self.cached.builds
     }
 }
-fn dense(
-    x: Tensor<CpuBackend, 2>,
-    l: &DenseGenome,
-    d: &<CpuBackend as burn::tensor::backend::Backend>::Device,
-) -> Tensor<CpuBackend, 2> {
-    let w = Tensor::from_data(TensorData::new(l.weights.clone(), [l.inputs, l.outputs]), d);
-    let b = Tensor::from_data(TensorData::new(l.bias.clone(), [1, l.outputs]), d);
-    x.matmul(w) + b
+fn dense_runtime(x: Tensor<CpuBackend, 2>, l: &BurnRuntimeDense) -> Tensor<CpuBackend, 2> {
+    x.matmul(l.weights.clone()) + l.bias.clone()
 }
 fn activate(x: Tensor<CpuBackend, 2>, a: Activation) -> Tensor<CpuBackend, 2> {
     match a {

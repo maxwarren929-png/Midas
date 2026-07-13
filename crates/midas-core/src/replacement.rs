@@ -1,25 +1,29 @@
 use crate::{
     AgentId, Result,
     agent::{AgentSpawnRequest, AgentState, SpawnMetadata},
-    brain::{BrainArchitecture, BrainGenome, PolicyBlueprint},
+    brain::{BrainArchitecture, BrainGenome, ComputeDevice, PolicyBlueprint},
     config::Config,
     observation::ObservationSchema,
 };
 
 #[derive(Clone, Debug)]
-pub struct LivingAgentSummary {
+pub struct LivingAgentSummary<'a> {
     pub id: AgentId,
     pub net_worth: f64,
     pub age: u64,
     pub policy: PolicyBlueprint,
-    pub genome: Option<BrainGenome>,
+    pub genome: Option<&'a BrainGenome>,
+    pub maximum_drawdown: f64,
+    pub birth_date: chrono::NaiveDate,
+    pub parent_ids: Vec<AgentId>,
 }
 pub struct ReplacementContext<'a> {
     pub dead_agent: &'a AgentState,
     pub dead_policy: PolicyBlueprint,
-    pub living_population: &'a [LivingAgentSummary],
+    pub living_population: &'a [LivingAgentSummary<'a>],
     pub config: &'a Config,
     pub architecture: &'a BrainArchitecture,
+    pub compute_device: &'a ComputeDevice,
     pub observation_schema: &'a ObservationSchema,
     pub deterministic_seed: u64,
 }

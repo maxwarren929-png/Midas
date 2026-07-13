@@ -1,5 +1,22 @@
 # Implementation Status
 
+## Prompt 1.75 verification and hardening
+
+The Prompt 1.75 audit and regression pass is implemented in the core market, execution, observation, brain, agent, replacement, simulation, configuration, metrics, and integration-test modules. The current foundation is verified rather than advertised beyond its scope.
+
+- Corporate actions have one explicit convention: raw opens/closes remain execution and valuation prices; `FeaturePriceSeries` applies only split ratios dated on or before the requested feature date; dividends stay out of the feature price and credit cash exactly once at the beginning of the next-open execution date. Same-day actions are ordered split then dividend. Split, reverse-split, multiple-split, dividend, discontinuity-rejection, and future-leakage regressions cover the contract.
+- Backend/device selection is authoritative through `BackendConfig::compute_device` and `AgentBuildContext`. Only the implemented CPU Burn `NdArray` `default` device is accepted; unsupported device names fail configuration validation. Checkpoint format 3 records the backend identity and rejects incompatible restores.
+- Burn remains private to the neural adapter. `NeuralModel`/`NeuralModelFactory` support the mock external model and Burn model through the same agent/simulation path. Burn runtime tensors are built once per model build/restore and reused; immutable `BrainGenome`, mutable lifetime parameters, and recurrent runtime state are separate.
+- Policy and observation failures preserve their original diagnostics in `DomainEvent::PolicyFailure`, increment per-agent total/consecutive counters, and follow configurable continue, kill-agent, or stop-experiment behavior before cash fallback. The shared observation builder validates dimensions and normalization instead of panicking.
+- Long-only action validation covers finite/non-negative proposals, availability masks, concentration limits, cash redistribution, tiny caps, all-unavailable markets, and numerical edge cases. Execution planning includes costs before proportional scaling, uses stable asset IDs, converges minimum-trade filtering deterministically, and the applier recomputes trade economics before atomic mutation.
+- Checkpoint tests compare uninterrupted/resumed domain histories, portfolios, agent states, policy blueprints, serialized completed state, lifecycle idempotence, observation schema, corporate-action data, and backend compatibility. Operational checkpoint events remain intentionally outside deterministic domain history.
+- Replacement contexts expose read-only living-agent summaries (net worth, age, drawdown, birth date, parent IDs, policy blueprint, and borrowed optional genome references) plus architecture/schema/device/seed material. A deterministic selection strategy test spawns through `StandardAgentFactory`; two-parent selection and reproduction remain deferred.
+- The primary integration suite now contains 36 executable regressions, including property and permutation tests. No network or external data dependency is required.
+
+Files changed in this hardening pass include `crates/midas-core/src/{action,agent,brain,config,execution,market,metrics,observation,replacement,simulation}.rs`, `crates/midas-core/tests/foundation.rs`, `configs/{default,test}.toml`, `README.md`, `docs/EXTENDING.md`, and this status document.
+
+Known remaining limitations are deliberate: CPU `NdArray` is the only neural backend; memory is a simple recurrent layer, not a GRU; corporate actions are explicit split/dividend records and are not inferred from providers; event persistence is in-memory; and there is no PPO, lifetime optimizer state, mutation, crossover, two-parent reproduction, reproductive fitness, diversity, ancestry, or Lamarckian inheritance. Those items remain reserved for Prompt 2.
+
 ## Prompt 1 implemented
 
 - Cargo workspace with `midas-core` and `midas-cli`, pinned by `Cargo.lock`.
@@ -15,9 +32,9 @@
 - Cash, seeded-random, equal-weight, and configured-benchmark buy-and-hold policies.
 - Burn CPU actor-critic inference behind framework-neutral neural interfaces, persistent recurrent memory, configured evolvable-trait bounds, stable genome matrices, and complete architecture/schema validation.
 - Explicit `NoLearning` and explicitly non-evolutionary random-genome replacement.
-- Checkpoint format v2 with lifecycle, complete observation schema and architecture, policies/genomes/lifetime memory, portfolios, metrics, deterministic domain events, counters, and accessed-through date. Operational events are deliberately excluded.
+- Checkpoint format v3 with lifecycle, complete observation schema and architecture, policies/genomes/lifetime memory, portfolios, metrics, deterministic domain events, counters, backend identity, and accessed-through date. Operational events are deliberately excluded.
 - CLI validation, inspection, simulation, resume, and benchmark commands plus offline synthetic data.
-- Twenty-five focused regressions covering all seven repaired findings, CSV/Parquet, property invariants, mock and Burn neural models, replacement consistency, lifecycle idempotence, and checkpoint-resume domain-event equivalence.
+- The Prompt 1 foundation suite began with twenty-five regressions; Prompt 1.75 expands it to thirty-six focused regressions covering corporate-action timing, backend validation, policy diagnostics, execution permutations, schema edge cases, mock and Burn neural models, replacement readiness, lifecycle idempotence, and checkpoint equivalence.
 
 ## Known Prompt 1 limitations
 

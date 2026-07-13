@@ -24,6 +24,7 @@ pub struct MetricsCollector {
     pub agents: BTreeMap<AgentId, AgentMetrics>,
     pub invalid_actions: u64,
     pub rejected_trades: u64,
+    pub policy_failures: u64,
     pub deaths: u64,
     pub births: u64,
 }
@@ -53,6 +54,7 @@ impl EventSink for MetricsCollector {
                 agent_id, trade, ..
             } => add_trade(self.agents.entry(*agent_id).or_default(), trade),
             DomainEvent::ActionFallback { .. } => self.invalid_actions += 1,
+            DomainEvent::PolicyFailure { .. } => self.policy_failures += 1,
             DomainEvent::TradeRejected { .. } => self.rejected_trades += 1,
             DomainEvent::AgentDied { agent_id, .. } => {
                 self.deaths += 1;

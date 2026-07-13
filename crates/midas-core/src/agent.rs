@@ -18,9 +18,12 @@ pub struct AgentState {
     pub age: u64,
     pub portfolio: Portfolio,
     pub maximum_net_worth: f64,
+    pub maximum_drawdown: f64,
     pub alive: bool,
     pub genome: Option<BrainGenome>,
     pub parent_ids: Vec<AgentId>,
+    pub total_policy_failures: u32,
+    pub consecutive_policy_failures: u32,
 }
 pub struct Agent {
     pub state: AgentState,
@@ -42,6 +45,7 @@ pub struct AgentBuildContext<'a> {
     pub birth_date: NaiveDate,
     pub config: &'a Config,
     pub architecture: &'a BrainArchitecture,
+    pub compute_device: &'a ComputeDevice,
 }
 pub trait AgentFactory: Send + Sync {
     fn spawn(&self, request: AgentSpawnRequest, context: &AgentBuildContext<'_>) -> Result<Agent>;
@@ -72,6 +76,7 @@ impl StandardAgentFactory {
         genome: Option<&BrainGenome>,
         a: &BrainArchitecture,
         seed: u64,
+        device: &ComputeDevice,
     ) -> Result<Box<dyn Policy>> {
         Ok(match blueprint {
             PolicyBlueprint::Cash => Box::new(CashPolicy),
@@ -85,7 +90,7 @@ impl StandardAgentFactory {
                     .ok_or_else(|| MidasError::Policy("neural spawn requires genome".into()))?;
                 Box::new(NeuralPolicy::new(
                     g.clone(),
-                    self.neural.build(g, a, &ComputeDevice::Cpu)?,
+                    self.neural.build(g, a, device)?,
                 ))
             }
         })
@@ -101,6 +106,7 @@ impl AgentFactory for StandardAgentFactory {
             r.genome.as_ref(),
             c.architecture,
             c.config.simulation.seed ^ c.agent_id.0,
+            c.compute_device,
         )?;
         Ok(Agent {
             state: AgentState {
@@ -112,9 +118,12 @@ impl AgentFactory for StandardAgentFactory {
                     c.architecture.asset_count,
                 ),
                 maximum_net_worth: c.config.simulation.starting_cash,
+                maximum_drawdown: 0.0,
                 alive: true,
                 genome: r.genome,
                 parent_ids: r.parent_ids,
+                total_policy_failures: 0,
+                consecutive_policy_failures: 0,
             },
             policy,
         })
@@ -143,12 +152,18 @@ impl AgentFactory for StandardAgentFactory {
                 genome,
                 state: model_state,
             } => {
-                let model = self.neural.restore(
-                    &genome,
-                    c.architecture,
-                    *model_state,
-                    &ComputeDevice::Cpu,
-                )?;
+                genome.validate_with_traits(c.architecture, &c.config.brain.traits)?;
+                let state_genome = state.genome.as_ref().ok_or_else(|| {
+                    MidasError::Checkpoint("neural state is missing genome".into())
+                })?;
+                if state_genome != &genome {
+                    return Err(MidasError::Checkpoint(
+                        "checkpoint neural genome does not match agent state".into(),
+                    ));
+                }
+                let model =
+                    self.neural
+                        .restore(&genome, c.architecture, *model_state, c.compute_device)?;
                 Box::new(NeuralPolicy::new(genome, model))
             }
         };

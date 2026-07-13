@@ -118,6 +118,11 @@ optimisation_epochs = 4
 kind = "cpu"
 device = "default"
 
+[policy_failures]
+maximum_consecutive = 3
+maximum_total = 20
+behavior = "kill_agent"
+
 [replacement]
 strategy = "non_evolutionary_random_genome"
 

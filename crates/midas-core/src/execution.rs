@@ -5,6 +5,7 @@ use crate::{
     market::{CorporateAction, MarketBar},
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Position {
     pub asset_id: AssetId,
@@ -56,6 +57,11 @@ impl Portfolio {
             if p.quantity < 0.0 || !p.quantity.is_finite() {
                 return Err(MidasError::Accounting("invalid holding".into()));
             }
+            if let Some(price) = price
+                && (!price.is_finite() || *price <= 0.0)
+            {
+                return Err(MidasError::Accounting("invalid valuation price".into()));
+            }
             if p.quantity > 0.0 {
                 total += p.quantity
                     * price.ok_or_else(|| {
@@ -69,13 +75,26 @@ impl Portfolio {
         Ok(total)
     }
     pub fn allocations(&self, prices: &[Option<f64>]) -> Result<Vec<f64>> {
-        let gross = self.cash
-            + self
-                .positions
-                .iter()
-                .zip(prices)
-                .map(|(p, v)| p.quantity * v.unwrap_or(0.0))
-                .sum::<f64>();
+        if prices.len() != self.positions.len() {
+            return Err(MidasError::Accounting(
+                "allocation price length mismatch".into(),
+            ));
+        }
+        let mut gross = self.cash;
+        for (position, price) in self.positions.iter().zip(prices) {
+            if position.quantity < 0.0 || !position.quantity.is_finite() {
+                return Err(MidasError::Accounting("invalid holding".into()));
+            }
+            if let Some(price) = price {
+                if !price.is_finite() || *price <= 0.0 {
+                    return Err(MidasError::Accounting("invalid allocation price".into()));
+                }
+                gross += position.quantity * price;
+            }
+        }
+        if !gross.is_finite() {
+            return Err(MidasError::Accounting("non-finite allocation value".into()));
+        }
         if gross <= 0.0 {
             let mut w = vec![0.0; self.positions.len() + 1];
             w[0] = 1.0;
@@ -105,7 +124,13 @@ impl Portfolio {
                 if !ratio.is_finite() || *ratio <= 0.0 {
                     return Err(MidasError::Accounting("invalid split ratio".into()));
                 }
-                let p = &mut self.positions[asset_id.0 as usize];
+                let p = self
+                    .positions
+                    .iter_mut()
+                    .find(|position| position.asset_id == *asset_id)
+                    .ok_or_else(|| {
+                        MidasError::Accounting(format!("unknown split asset {asset_id}"))
+                    })?;
                 p.quantity *= ratio;
                 if p.average_entry_price > 0.0 {
                     p.average_entry_price /= ratio;
@@ -119,18 +144,28 @@ impl Portfolio {
                 if !amount_per_share.is_finite() || *amount_per_share < 0.0 {
                     return Err(MidasError::Accounting("invalid dividend".into()));
                 }
-                self.cash += self.positions[asset_id.0 as usize].quantity * amount_per_share;
+                let quantity = self
+                    .positions
+                    .iter()
+                    .find(|position| position.asset_id == *asset_id)
+                    .ok_or_else(|| {
+                        MidasError::Accounting(format!("unknown dividend asset {asset_id}"))
+                    })?
+                    .quantity;
+                self.cash += quantity * amount_per_share;
             }
         }
         self.check()
     }
     pub fn check(&self) -> Result<()> {
+        let mut asset_ids = BTreeSet::new();
         if !self.cash.is_finite()
             || self.cash < -1e-8
             || !self.liabilities.is_finite()
             || self.liabilities < 0.0
             || self.positions.iter().any(|p| {
-                p.quantity < -1e-10
+                !asset_ids.insert(p.asset_id)
+                    || p.quantity < -1e-10
                     || !p.quantity.is_finite()
                     || !p.average_entry_price.is_finite()
                     || p.average_entry_price < 0.0
@@ -275,9 +310,21 @@ impl ExecutionPlanner for CostExecutionEngine {
         minimum: f64,
     ) -> Result<ExecutionPlan> {
         self.validate_costs()?;
+        if !minimum.is_finite() || minimum < 0.0 {
+            return Err(MidasError::Config(
+                "minimum trade value must be finite and non-negative".into(),
+            ));
+        }
         if m.bars.len() != p.positions.len() || m.valuation_prices.len() != p.positions.len() {
             return Err(MidasError::Accounting(
                 "execution snapshot dimension mismatch".into(),
+            ));
+        }
+        if m.bars.iter().enumerate().any(|(index, bar)| {
+            bar.is_some_and(|value| value.asset_id != p.positions[index].asset_id)
+        }) {
+            return Err(MidasError::Accounting(
+                "execution snapshot asset order mismatch".into(),
             ));
         }
         if !a.rebalance() {
@@ -306,7 +353,7 @@ impl ExecutionPlanner for CostExecutionEngine {
             if *current_value > desired + minimum {
                 if let Some(bar) = m.bars[i].filter(|b| b.tradable) {
                     let trade = self.trade(
-                        AssetId(i as u64),
+                        p.positions[i].asset_id,
                         TradeSide::Sell,
                         *current_value - desired,
                         bar.open,
@@ -314,7 +361,7 @@ impl ExecutionPlanner for CostExecutionEngine {
                     available += trade.quantity * trade.execution_price - trade.commission;
                     plan.trades.push(trade)
                 } else {
-                    plan.rejected_assets.push(AssetId(i as u64));
+                    plan.rejected_assets.push(p.positions[i].asset_id);
                 }
             }
         }
@@ -325,7 +372,7 @@ impl ExecutionPlanner for CostExecutionEngine {
                     if m.bars[i].is_some_and(|b| b.tradable) {
                         Some((i, desired - current[i]))
                     } else {
-                        plan.rejected_assets.push(AssetId(i as u64));
+                        plan.rejected_assets.push(p.positions[i].asset_id);
                         None
                     }
                 } else {
@@ -347,16 +394,22 @@ impl ExecutionPlanner for CostExecutionEngine {
             let fixed = self.costs.commission_fixed * eligible.len() as f64;
             scale = ((available - fixed) / requested / variable).clamp(0.0, 1.0);
             let before = eligible.len();
-            eligible.retain(|(_, request)| request * scale >= minimum);
+            eligible.retain(|(_, request)| {
+                let notional = request * scale;
+                notional > 0.0 && notional >= minimum
+            });
             if eligible.len() == before {
                 break;
             }
         }
         plan.affordability_scale = scale;
+        eligible.sort_by_key(|(i, _)| p.positions[*i].asset_id);
         for (i, request) in eligible {
-            let bar = m.bars[i].expect("eligible buy has bar");
+            let bar = m.bars[i].ok_or_else(|| {
+                MidasError::Accounting("eligible buy is missing an execution bar".into())
+            })?;
             plan.trades.push(self.trade(
-                AssetId(i as u64),
+                p.positions[i].asset_id,
                 TradeSide::Buy,
                 request * scale,
                 bar.open,
@@ -368,46 +421,96 @@ impl ExecutionPlanner for CostExecutionEngine {
 impl ExecutionApplier for CostExecutionEngine {
     fn apply(&self, p: &mut Portfolio, plan: &ExecutionPlan) -> Result<ExecutionReport> {
         self.validate_costs()?;
+        if !plan.affordability_scale.is_finite() || !(0.0..=1.0).contains(&plan.affordability_scale)
+        {
+            return Err(MidasError::Accounting(
+                "invalid execution-plan affordability scale".into(),
+            ));
+        }
         let mut candidate = p.clone();
+        let mut applied_trades = Vec::with_capacity(plan.trades.len());
         for t in &plan.trades {
-            self.trade(t.asset_id, t.side.clone(), t.notional, t.base_price)?;
-            let pos = &mut candidate.positions[t.asset_id.0 as usize];
-            match t.side {
+            let expected = self.trade(t.asset_id, t.side.clone(), t.notional, t.base_price)?;
+            if !trades_match(t, &expected) {
+                return Err(MidasError::Accounting(
+                    "execution plan trade economics mismatch".into(),
+                ));
+            }
+            let position_index = candidate
+                .positions
+                .iter()
+                .position(|position| position.asset_id == t.asset_id)
+                .ok_or_else(|| {
+                    MidasError::Accounting(format!("unknown execution asset {}", t.asset_id))
+                })?;
+            let pos = &mut candidate.positions[position_index];
+            match expected.side {
                 TradeSide::Sell => {
-                    if t.quantity > pos.quantity + 1e-9 {
+                    if expected.quantity > pos.quantity + 1e-9 {
                         return Err(MidasError::Accounting(
                             "planned sell exceeds holding".into(),
                         ));
                     }
-                    pos.quantity = (pos.quantity - t.quantity).max(0.0);
-                    candidate.cash += t.quantity * t.execution_price - t.commission;
+                    pos.quantity = (pos.quantity - expected.quantity).max(0.0);
+                    candidate.cash +=
+                        expected.quantity * expected.execution_price - expected.commission;
                     if pos.quantity < 1e-12 {
                         pos.average_entry_price = 0.0;
                     }
                 }
                 TradeSide::Buy => {
-                    let spend = t.quantity * t.execution_price + t.commission;
+                    let spend = expected.quantity * expected.execution_price + expected.commission;
                     if spend > candidate.cash + 1e-8 {
                         return Err(MidasError::Accounting("planned buys exceed cash".into()));
                     }
                     let old = pos.quantity;
-                    let new = old + t.quantity;
-                    pos.average_entry_price =
-                        (old * pos.average_entry_price + t.quantity * t.execution_price) / new;
+                    let new = old + expected.quantity;
+                    pos.average_entry_price = (old * pos.average_entry_price
+                        + expected.quantity * expected.execution_price)
+                        / new;
                     pos.quantity = new;
                     candidate.cash = (candidate.cash - spend).max(0.0);
                 }
             }
-            candidate.cumulative_commission += t.commission;
-            candidate.cumulative_spread += t.spread_cost;
-            candidate.cumulative_slippage += t.slippage_cost;
-            candidate.cumulative_turnover += t.notional;
+            candidate.cumulative_commission += expected.commission;
+            candidate.cumulative_spread += expected.spread_cost;
+            candidate.cumulative_slippage += expected.slippage_cost;
+            candidate.cumulative_turnover += expected.notional;
+            applied_trades.push(expected);
         }
         candidate.check()?;
         *p = candidate;
         Ok(ExecutionReport {
-            trades: plan.trades.clone(),
+            trades: applied_trades,
             rejected_assets: plan.rejected_assets.clone(),
         })
     }
+}
+
+fn trades_match(actual: &PlannedTrade, expected: &PlannedTrade) -> bool {
+    actual.asset_id == expected.asset_id
+        && actual.side == expected.side
+        && [
+            actual.quantity,
+            actual.base_price,
+            actual.execution_price,
+            actual.commission,
+            actual.spread_cost,
+            actual.slippage_cost,
+            actual.notional,
+        ]
+        .iter()
+        .zip([
+            expected.quantity,
+            expected.base_price,
+            expected.execution_price,
+            expected.commission,
+            expected.spread_cost,
+            expected.slippage_cost,
+            expected.notional,
+        ])
+        .all(|(actual, expected)| {
+            let tolerance = 1e-10 * actual.abs().max(expected.abs()).max(1.0);
+            (*actual - expected).abs() <= tolerance
+        })
 }
