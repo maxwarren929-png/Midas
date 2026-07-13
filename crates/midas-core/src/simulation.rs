@@ -2,6 +2,7 @@ use crate::{
     AgentId, AssetId, MidasError, Result,
     action::{
         ActionValidationContext, ActionValidator, LongOnlyActionValidator, ProposedAllocation,
+        ValidatedAllocation,
     },
     agent::{
         Agent, AgentBuildContext, AgentFactory, AgentSpawnRequest, SpawnMetadata,
@@ -27,8 +28,8 @@ use crate::{
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
-// Version 3 includes backend identity and the separated neural lifetime/runtime state.
-pub const CHECKPOINT_VERSION: u32 = 3;
+// Version 4 includes failed lifecycle metadata and transactional step semantics.
+pub const CHECKPOINT_VERSION: u32 = 4;
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum DatasetSplit {
     Training,
@@ -44,11 +45,12 @@ impl DatasetSplit {
         }
     }
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SimulationLifecycle {
     Initialized,
     Running,
     Completed,
+    Failed { reason: String },
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum DeathCause {
@@ -173,6 +175,40 @@ pub struct SimulationEngine {
     next_agent_id: u64,
     lifecycle: SimulationLifecycle,
 }
+struct StepTransaction {
+    agents: Vec<Agent>,
+    next_agent_id: u64,
+    events: Vec<DomainEvent>,
+    replacement: Option<Box<dyn ReplacementStrategy>>,
+}
+type AdvanceResult = (Vec<DomainEvent>, Option<(AgentId, NaiveDate)>);
+#[derive(Clone, Debug)]
+struct PolicyFailureIncident {
+    category: PolicyFailureCategory,
+    message: String,
+}
+enum PolicyDecisionOutcome {
+    Valid(crate::action::ValidatedAllocation),
+    RecoverableFailure {
+        incident: PolicyFailureIncident,
+        fallback: crate::action::ValidatedAllocation,
+    },
+    FatalAgentFailure {
+        incident: PolicyFailureIncident,
+    },
+    FatalExperimentFailure {
+        incident: PolicyFailureIncident,
+    },
+}
+enum StepAbort {
+    Error(MidasError),
+    FatalExperiment { event: DomainEvent, reason: String },
+}
+impl From<MidasError> for StepAbort {
+    fn from(error: MidasError) -> Self {
+        Self::Error(error)
+    }
+}
 impl SimulationEngine {
     pub fn new(config: Config, data: MarketDataset, split: DatasetSplit) -> Result<Self> {
         Self::new_with_factory(
@@ -282,7 +318,7 @@ impl SimulationEngine {
         })
     }
     pub fn lifecycle(&self) -> SimulationLifecycle {
-        self.lifecycle
+        self.lifecycle.clone()
     }
     pub fn agents(&self) -> impl Iterator<Item = &crate::agent::AgentState> {
         self.agents.iter().map(|a| &a.state)
@@ -304,8 +340,12 @@ impl SimulationEngine {
         self.replacement = r
     }
     pub fn run(&mut self) -> Result<SimulationReport> {
-        if self.lifecycle == SimulationLifecycle::Completed {
-            return Ok(self.report());
+        match &self.lifecycle {
+            SimulationLifecycle::Completed => return Ok(self.report()),
+            SimulationLifecycle::Failed { reason } => {
+                return Err(MidasError::Policy(reason.clone()));
+            }
+            SimulationLifecycle::Initialized | SimulationLifecycle::Running => {}
         }
         self.lifecycle = SimulationLifecycle::Running;
         while self.next_step + 1 < self.features.len() {
@@ -317,8 +357,12 @@ impl SimulationEngine {
         Ok(self.report())
     }
     pub fn run_steps(&mut self, count: usize) -> Result<()> {
-        if self.lifecycle == SimulationLifecycle::Completed {
-            return Ok(());
+        match &self.lifecycle {
+            SimulationLifecycle::Completed => return Ok(()),
+            SimulationLifecycle::Failed { reason } => {
+                return Err(MidasError::Policy(reason.clone()));
+            }
+            SimulationLifecycle::Initialized | SimulationLifecycle::Running => {}
         }
         self.lifecycle = SimulationLifecycle::Running;
         for _ in 0..count {
@@ -330,16 +374,114 @@ impl SimulationEngine {
         Ok(())
     }
     fn step(&mut self) -> Result<()> {
+        let agents = match self.fork_agents() {
+            Ok(agents) => agents,
+            Err(error) => {
+                let reason = error.to_string();
+                self.lifecycle = SimulationLifecycle::Failed {
+                    reason: reason.clone(),
+                };
+                return Err(error);
+            }
+        };
+        let transaction = StepTransaction {
+            agents,
+            next_agent_id: self.next_agent_id,
+            events: Vec::new(),
+            replacement: None,
+        };
+        let mut transaction = transaction;
+        match self.execute_step(&mut transaction) {
+            Ok(()) => self.commit_step(transaction),
+            Err(StepAbort::Error(error)) => {
+                let reason = error.to_string();
+                self.lifecycle = SimulationLifecycle::Failed {
+                    reason: reason.clone(),
+                };
+                Err(error)
+            }
+            Err(StepAbort::FatalExperiment { event, reason }) => {
+                self.emit(event);
+                self.lifecycle = SimulationLifecycle::Failed {
+                    reason: reason.clone(),
+                };
+                Err(MidasError::Policy(reason))
+            }
+        }
+    }
+
+    fn fork_agents(&self) -> Result<Vec<Agent>> {
+        self.agents
+            .iter()
+            .map(|agent| match agent.fork() {
+                Ok(forked) => Ok(forked),
+                Err(fork_error) => {
+                    let snapshot = agent.policy.snapshot().map_err(|restore_error| {
+                        MidasError::Policy(format!(
+                            "transactional policy fork failed: {fork_error}; snapshot failed: {restore_error}"
+                        ))
+                    })?;
+                    self.factory
+                        .restore(
+                            agent.state.clone(),
+                            snapshot,
+                            &AgentBuildContext {
+                                agent_id: agent.state.id,
+                                birth_date: agent.state.birth_date,
+                                config: &self.config,
+                                architecture: &self.architecture,
+                                compute_device: &self.compute_device,
+                            },
+                        )
+                        .map_err(|restore_error| {
+                            MidasError::Policy(format!(
+                                "transactional policy fork failed: {fork_error}; restore failed: {restore_error}"
+                            ))
+                        })
+                }
+            })
+            .collect()
+    }
+
+    fn commit_step(&mut self, transaction: StepTransaction) -> Result<()> {
+        let StepTransaction {
+            agents,
+            next_agent_id,
+            events,
+            replacement,
+        } = transaction;
+        self.agents = agents;
+        self.next_agent_id = next_agent_id;
+        if let Some(replacement) = replacement {
+            self.replacement = replacement;
+        }
+        for event in events {
+            self.emit(event);
+        }
+        self.next_step += 1;
+        if self.config.checkpoint.every_steps > 0
+            && self
+                .next_step
+                .is_multiple_of(self.config.checkpoint.every_steps)
+        {
+            let path = self.config.checkpoint.path.clone();
+            self.save_checkpoint(&path).inspect_err(|error| {
+                let reason = error.to_string();
+                self.lifecycle = SimulationLifecycle::Failed {
+                    reason: reason.clone(),
+                };
+            })?;
+        }
+        Ok(())
+    }
+
+    fn execute_step(
+        &mut self,
+        transaction: &mut StepTransaction,
+    ) -> std::result::Result<(), StepAbort> {
         let t = self.next_step;
         let observation_date = self.features[t].date;
         let execution_date = self.features[t + 1].date;
-        self.emit(DomainEvent::DayStarted {
-            date: execution_date,
-            step: t,
-        });
-        self.emit(DomainEvent::ObservationRevealed {
-            date: observation_date,
-        });
         let current_prices = self.valuation_prices(observation_date);
         let next_prices = self.valuation_prices(execution_date);
         let bars = (0..self.data.assets.len())
@@ -352,250 +494,359 @@ impl SimulationEngine {
             .corporate_actions_on(execution_date)
             .cloned()
             .collect::<Vec<_>>();
+        transaction.events.push(DomainEvent::DayStarted {
+            date: execution_date,
+            step: t,
+        });
+        transaction.events.push(DomainEvent::ObservationRevealed {
+            date: observation_date,
+        });
+
         let mut deaths = Vec::new();
-        let mut pending = Vec::new();
-        let mut stop_experiment = false;
-        for agent in &mut self.agents {
+        for agent in &mut transaction.agents {
             if !agent.state.alive {
                 continue;
             }
             let allocations = agent.state.portfolio.allocations(&current_prices)?;
-            let mut policy_failure_kill = false;
-            let mut policy_error_recorded = false;
-            let policy_result = match self.observation_builder.build(&ObservationContext {
-                market: &market,
-                portfolio: &agent.state.portfolio,
-                prices: &current_prices,
-                starting_net_worth: self.config.simulation.starting_cash,
-                maximum_net_worth: agent.state.maximum_net_worth,
-                age: agent.state.age,
-                episode_steps: self.features.len() - 1,
-            }) {
-                Ok(observation) => agent.policy.propose_action(
-                    &observation,
-                    &PolicyContext {
-                        tradable: &tradable,
-                        current_allocations: &allocations,
-                    },
-                ),
-                Err(error) => Err(MidasError::Policy(format!("invalid observation: {error}"))),
-            };
-            let proposal = match policy_result {
-                Ok(p) => {
-                    agent.state.consecutive_policy_failures = 0;
-                    p
-                }
-                Err(error) => {
-                    policy_error_recorded = true;
-                    agent.state.total_policy_failures =
-                        agent.state.total_policy_failures.saturating_add(1);
-                    agent.state.consecutive_policy_failures =
-                        agent.state.consecutive_policy_failures.saturating_add(1);
-                    let category = classify_policy_failure(&error);
-                    pending.push(DomainEvent::PolicyFailure {
-                        agent_id: agent.state.id,
-                        date: observation_date,
-                        policy_kind: agent.policy.policy_blueprint(),
-                        category,
-                        message: error.to_string(),
-                    });
-                    pending.push(DomainEvent::ActionFallback {
-                        agent_id: agent.state.id,
-                        date: observation_date,
-                    });
-                    let limits_reached = agent.state.consecutive_policy_failures
-                        >= self.config.policy_failures.maximum_consecutive
-                        || agent.state.total_policy_failures
-                            >= self.config.policy_failures.maximum_total;
-                    match self.config.policy_failures.behavior {
-                        PolicyFailureBehavior::Continue => {}
-                        PolicyFailureBehavior::KillAgent if limits_reached => {
-                            policy_failure_kill = true
-                        }
-                        PolicyFailureBehavior::StopExperiment if limits_reached => {
-                            stop_experiment = true
-                        }
-                        _ => {}
-                    }
-                    ProposedAllocation::rebalance(vec![f64::NAN; self.data.assets.len() + 1])
-                }
-            };
-            if policy_failure_kill {
-                agent.state.alive = false;
-            }
             let maximum_asset_allocation = agent
                 .state
                 .genome
                 .as_ref()
                 .map(|genome| genome.traits.maximum_allocation as f64)
                 .unwrap_or(self.config.brain.traits.maximum_allocation.initial as f64);
-            let validated = self.validator.validate(
-                proposal,
-                &ActionValidationContext {
-                    asset_count: self.data.assets.len(),
-                    tradable: &tradable,
-                    maximum_asset_allocation,
-                },
+            let action_context = ActionValidationContext {
+                asset_count: self.data.assets.len(),
+                tradable: &tradable,
+                maximum_asset_allocation,
+            };
+            let outcome = self.decide_policy(
+                agent,
+                &market,
+                &current_prices,
+                &tradable,
+                &allocations,
+                &action_context,
             )?;
-            if validated.used_fallback() {
-                pending.push(DomainEvent::ActionFallback {
-                    agent_id: agent.state.id,
-                    date: observation_date,
-                });
-                if !policy_error_recorded {
-                    agent.state.total_policy_failures =
-                        agent.state.total_policy_failures.saturating_add(1);
-                    agent.state.consecutive_policy_failures =
-                        agent.state.consecutive_policy_failures.saturating_add(1);
-                    pending.push(DomainEvent::PolicyFailure {
+            match outcome {
+                PolicyDecisionOutcome::Valid(validated) => {
+                    let (events, death) = self.advance_agent(
+                        agent,
+                        &validated,
+                        observation_date,
+                        execution_date,
+                        &current_prices,
+                        &next_prices,
+                        &bars,
+                        &actions,
+                    )?;
+                    transaction.events.extend(events);
+                    if let Some(death) = death {
+                        deaths.push(death);
+                    }
+                }
+                PolicyDecisionOutcome::RecoverableFailure { incident, fallback } => {
+                    let failure_event =
+                        self.policy_failure_event(agent, observation_date, incident.clone());
+                    transaction.events.push(failure_event);
+                    transaction.events.push(DomainEvent::ActionFallback {
                         agent_id: agent.state.id,
                         date: observation_date,
-                        policy_kind: agent.policy.policy_blueprint(),
+                    });
+                    let (events, death) = self.advance_agent(
+                        agent,
+                        &fallback,
+                        observation_date,
+                        execution_date,
+                        &current_prices,
+                        &next_prices,
+                        &bars,
+                        &actions,
+                    )?;
+                    transaction.events.extend(events);
+                    if let Some(death) = death {
+                        deaths.push(death);
+                    }
+                }
+                PolicyDecisionOutcome::FatalAgentFailure { incident } => {
+                    let final_net_worth = agent.state.portfolio.value(&current_prices)?;
+                    agent.state.portfolio.previous_net_worth = agent.state.portfolio.net_worth;
+                    agent.state.portfolio.net_worth = final_net_worth;
+                    agent.state.maximum_net_worth =
+                        agent.state.maximum_net_worth.max(final_net_worth);
+                    if agent.state.maximum_net_worth > 0.0 {
+                        agent.state.maximum_drawdown = agent
+                            .state
+                            .maximum_drawdown
+                            .max(1.0 - final_net_worth / agent.state.maximum_net_worth);
+                    }
+                    agent.state.alive = false;
+                    transaction.events.push(self.policy_failure_event(
+                        agent,
+                        observation_date,
+                        incident,
+                    ));
+                    transaction.events.push(DomainEvent::AgentDied {
+                        agent_id: agent.state.id,
+                        birth_date: agent.state.birth_date,
+                        death_date: observation_date,
+                        age: agent.state.age,
+                        starting_net_worth: self.config.simulation.starting_cash,
+                        final_net_worth,
+                        maximum_net_worth: agent.state.maximum_net_worth,
+                        cause: DeathCause::PolicyFailure,
+                    });
+                    deaths.push((agent.state.id, observation_date));
+                }
+                PolicyDecisionOutcome::FatalExperimentFailure { incident } => {
+                    let event =
+                        self.policy_failure_event(agent, observation_date, incident.clone());
+                    return Err(StepAbort::FatalExperiment {
+                        event,
+                        reason: format!(
+                            "policy failure limit reached for agent {} at {}: {}",
+                            agent.state.id, observation_date, incident.message
+                        ),
+                    });
+                }
+            }
+        }
+        for (id, date) in deaths {
+            self.handle_death_in_transaction(transaction, id, date)?;
+        }
+        Ok(())
+    }
+
+    fn decide_policy(
+        &self,
+        agent: &mut Agent,
+        market: &FeatureRow,
+        prices: &[Option<f64>],
+        tradable: &[bool],
+        allocations: &[f64],
+        action_context: &ActionValidationContext<'_>,
+    ) -> Result<PolicyDecisionOutcome> {
+        let observation = self.observation_builder.build(&ObservationContext {
+            market,
+            portfolio: &agent.state.portfolio,
+            prices,
+            starting_net_worth: self.config.simulation.starting_cash,
+            maximum_net_worth: agent.state.maximum_net_worth,
+            age: agent.state.age,
+            episode_steps: self.features.len() - 1,
+        });
+        let proposal = match observation {
+            Ok(observation) => agent.policy.propose_action(
+                &observation,
+                &PolicyContext {
+                    tradable,
+                    current_allocations: allocations,
+                },
+            ),
+            Err(error) => Err(MidasError::Policy(format!("invalid observation: {error}"))),
+        };
+        match proposal {
+            Ok(proposal) => {
+                let validated = self.validator.validate(proposal, action_context)?;
+                if validated.used_fallback() {
+                    let incident = PolicyFailureIncident {
                         category: PolicyFailureCategory::InvalidOutput,
                         message: validated
                             .fallback_reason()
                             .unwrap_or("invalid policy output")
-                            .into(),
-                    });
-                    let limits_reached = agent.state.consecutive_policy_failures
-                        >= self.config.policy_failures.maximum_consecutive
-                        || agent.state.total_policy_failures
-                            >= self.config.policy_failures.maximum_total;
-                    match self.config.policy_failures.behavior {
-                        PolicyFailureBehavior::Continue => {}
-                        PolicyFailureBehavior::KillAgent if limits_reached => {
-                            policy_failure_kill = true
-                        }
-                        PolicyFailureBehavior::StopExperiment if limits_reached => {
-                            stop_experiment = true
-                        }
-                        _ => {}
-                    }
+                            .to_string(),
+                    };
+                    self.failure_outcome(agent, incident, action_context, Some(validated))
+                } else {
+                    agent.state.consecutive_policy_failures = 0;
+                    Ok(PolicyDecisionOutcome::Valid(validated))
                 }
             }
-            // Corporate actions are effective at the start of execution_date:
-            // splits adjust holdings before opening orders and dividends credit
-            // cash once before the planner evaluates those orders.
-            for action in &actions {
-                agent.state.portfolio.apply_corporate_action(action)?;
-                pending.push(DomainEvent::CorporateActionApplied {
-                    agent_id: agent.state.id,
-                    date: execution_date,
-                    action: action.clone(),
-                });
+            Err(error) => {
+                let incident = PolicyFailureIncident {
+                    category: classify_policy_failure(&error),
+                    message: error.to_string(),
+                };
+                self.failure_outcome(agent, incident, action_context, None)
             }
-            let plan = self.planner.plan(
-                &agent.state.portfolio,
-                &validated,
-                &ExecutionSnapshot {
-                    bars: &bars,
-                    valuation_prices: &current_prices,
-                },
-                self.config.simulation.minimum_trade_value,
-            )?;
-            let report = self.applier.apply(&mut agent.state.portfolio, &plan)?;
-            for trade in report.trades {
-                pending.push(DomainEvent::TradeExecuted {
-                    agent_id: agent.state.id,
-                    date: execution_date,
-                    trade,
-                });
+        }
+    }
+
+    fn failure_outcome(
+        &self,
+        agent: &mut Agent,
+        incident: PolicyFailureIncident,
+        action_context: &ActionValidationContext<'_>,
+        fallback: Option<ValidatedAllocation>,
+    ) -> Result<PolicyDecisionOutcome> {
+        agent.state.total_policy_failures = agent.state.total_policy_failures.saturating_add(1);
+        agent.state.consecutive_policy_failures =
+            agent.state.consecutive_policy_failures.saturating_add(1);
+        let limits_reached = agent.state.consecutive_policy_failures
+            >= self.config.policy_failures.maximum_consecutive
+            || agent.state.total_policy_failures >= self.config.policy_failures.maximum_total;
+        match self.config.policy_failures.behavior {
+            PolicyFailureBehavior::StopExperiment if limits_reached => {
+                Ok(PolicyDecisionOutcome::FatalExperimentFailure { incident })
             }
-            for asset_id in report.rejected_assets {
-                pending.push(DomainEvent::TradeRejected {
-                    agent_id: agent.state.id,
-                    date: execution_date,
-                    asset_id,
-                });
+            PolicyFailureBehavior::KillAgent if limits_reached => {
+                Ok(PolicyDecisionOutcome::FatalAgentFailure { incident })
             }
-            let previous = agent.state.portfolio.net_worth;
-            agent.state.portfolio.previous_net_worth = previous;
-            agent.state.portfolio.net_worth = agent.state.portfolio.value(&next_prices)?;
-            agent
-                .state
-                .portfolio
-                .apply_survival_cost(self.config.simulation.daily_survival_cost);
-            let current = agent.state.portfolio.net_worth;
-            let reward = if previous > 0.0 && current > 0.0 {
-                (current / previous).ln() as f32
-            } else {
-                -1.0
-            };
-            agent.state.age += 1;
-            agent.state.maximum_net_worth = agent.state.maximum_net_worth.max(current);
-            if agent.state.maximum_net_worth > 0.0 {
-                agent.state.maximum_drawdown = agent
-                    .state
-                    .maximum_drawdown
-                    .max(1.0 - current / agent.state.maximum_net_worth);
+            _ => {
+                let fallback = match fallback {
+                    Some(value) => value,
+                    None => self.validator.validate(
+                        ProposedAllocation::rebalance(vec![
+                            f64::NAN;
+                            action_context.asset_count + 1
+                        ]),
+                        action_context,
+                    )?,
+                };
+                if !fallback.used_fallback() {
+                    return Err(MidasError::Policy(
+                        "cash fallback did not produce a validated fallback allocation".into(),
+                    ));
+                }
+                Ok(PolicyDecisionOutcome::RecoverableFailure { incident, fallback })
             }
-            pending.push(DomainEvent::Valuation {
+        }
+    }
+
+    fn policy_failure_event(
+        &self,
+        agent: &Agent,
+        date: NaiveDate,
+        incident: PolicyFailureIncident,
+    ) -> DomainEvent {
+        DomainEvent::PolicyFailure {
+            agent_id: agent.state.id,
+            date,
+            policy_kind: agent.policy.policy_blueprint(),
+            category: incident.category,
+            message: incident.message,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn advance_agent(
+        &self,
+        agent: &mut Agent,
+        validated: &ValidatedAllocation,
+        _observation_date: NaiveDate,
+        execution_date: NaiveDate,
+        current_prices: &[Option<f64>],
+        next_prices: &[Option<f64>],
+        bars: &[Option<&crate::market::MarketBar>],
+        actions: &[CorporateAction],
+    ) -> Result<AdvanceResult> {
+        let mut events = Vec::new();
+        // Actions take effect at the next open, in the canonical split then
+        // dividend order supplied by MarketDataset.
+        for action in actions {
+            agent.state.portfolio.apply_corporate_action(action)?;
+            events.push(DomainEvent::CorporateActionApplied {
                 agent_id: agent.state.id,
                 date: execution_date,
-                net_worth: current,
-                previous,
-                reward,
+                action: action.clone(),
             });
-            if current <= self.config.simulation.bankruptcy_threshold || policy_failure_kill {
-                agent.state.alive = false;
-                deaths.push(agent.state.id);
-                pending.push(DomainEvent::AgentDied {
-                    agent_id: agent.state.id,
-                    birth_date: agent.state.birth_date,
-                    death_date: execution_date,
-                    age: agent.state.age,
-                    starting_net_worth: self.config.simulation.starting_cash,
-                    final_net_worth: current,
-                    maximum_net_worth: agent.state.maximum_net_worth,
-                    cause: if policy_failure_kill {
-                        DeathCause::PolicyFailure
-                    } else {
-                        DeathCause::Bankruptcy
-                    },
-                });
-            }
         }
-        for event in pending {
-            self.emit(event)
+        let plan = self.planner.plan(
+            &agent.state.portfolio,
+            validated,
+            &ExecutionSnapshot {
+                bars,
+                valuation_prices: current_prices,
+            },
+            self.config.simulation.minimum_trade_value,
+        )?;
+        let report = self.applier.apply(&mut agent.state.portfolio, &plan)?;
+        for trade in report.trades {
+            events.push(DomainEvent::TradeExecuted {
+                agent_id: agent.state.id,
+                date: execution_date,
+                trade,
+            });
         }
-        if stop_experiment {
-            return Err(MidasError::Policy(
-                "policy failure limit reached; stopping experiment".into(),
-            ));
+        for asset_id in report.rejected_assets {
+            events.push(DomainEvent::TradeRejected {
+                agent_id: agent.state.id,
+                date: execution_date,
+                asset_id,
+            });
         }
-        for id in deaths {
-            self.handle_death(id, execution_date)?
+        let previous = agent.state.portfolio.net_worth;
+        agent.state.portfolio.previous_net_worth = previous;
+        agent.state.portfolio.net_worth = agent.state.portfolio.value(next_prices)?;
+        agent
+            .state
+            .portfolio
+            .apply_survival_cost(self.config.simulation.daily_survival_cost);
+        let current = agent.state.portfolio.net_worth;
+        let reward = if previous > 0.0 && current > 0.0 {
+            (current / previous).ln() as f32
+        } else {
+            -1.0
+        };
+        agent.state.age += 1;
+        agent.state.maximum_net_worth = agent.state.maximum_net_worth.max(current);
+        if agent.state.maximum_net_worth > 0.0 {
+            agent.state.maximum_drawdown = agent
+                .state
+                .maximum_drawdown
+                .max(1.0 - current / agent.state.maximum_net_worth);
         }
-        self.next_step += 1;
-        if self.config.checkpoint.every_steps > 0
-            && self
-                .next_step
-                .is_multiple_of(self.config.checkpoint.every_steps)
-        {
-            let path = self.config.checkpoint.path.clone();
-            self.save_checkpoint(&path)?;
+        events.push(DomainEvent::Valuation {
+            agent_id: agent.state.id,
+            date: execution_date,
+            net_worth: current,
+            previous,
+            reward,
+        });
+        if current <= self.config.simulation.bankruptcy_threshold {
+            agent.state.alive = false;
+            events.push(DomainEvent::AgentDied {
+                agent_id: agent.state.id,
+                birth_date: agent.state.birth_date,
+                death_date: execution_date,
+                age: agent.state.age,
+                starting_net_worth: self.config.simulation.starting_cash,
+                final_net_worth: current,
+                maximum_net_worth: agent.state.maximum_net_worth,
+                cause: DeathCause::Bankruptcy,
+            });
+            return Ok((events, Some((agent.state.id, execution_date))));
         }
-        Ok(())
+        Ok((events, None))
     }
-    fn handle_death(&mut self, id: AgentId, date: NaiveDate) -> Result<()> {
+
+    fn handle_death_in_transaction(
+        &mut self,
+        transaction: &mut StepTransaction,
+        id: AgentId,
+        date: NaiveDate,
+    ) -> Result<()> {
         match self.config.simulation.death_handling {
             DeathHandling::LeaveVacant => Ok(()),
             DeathHandling::EndAgentOnly => {
-                self.agents.retain(|a| a.state.id != id);
+                transaction.agents.retain(|a| a.state.id != id);
                 Ok(())
             }
             DeathHandling::Replace => {
-                let slot = self
+                let slot = transaction
                     .agents
                     .iter()
                     .position(|a| a.state.id == id)
                     .ok_or_else(|| MidasError::Accounting("dead agent missing".into()))?;
-                let dead_state = self.agents[slot].state.clone();
-                let dead_policy = self.agents[slot].policy.policy_blueprint();
-                let new_id = AgentId(self.next_agent_id);
-                self.next_agent_id += 1;
+                let dead_state = transaction.agents[slot].state.clone();
+                let dead_policy = transaction.agents[slot].policy.policy_blueprint();
+                let new_id = AgentId(transaction.next_agent_id);
+                transaction.next_agent_id += 1;
+                let mut replacement = match transaction.replacement.take() {
+                    Some(replacement) => replacement,
+                    None => self.replacement.fork()?,
+                };
                 let request = {
-                    let living = self
+                    let living = transaction
                         .agents
                         .iter()
                         .filter(|a| a.state.alive)
@@ -610,7 +861,7 @@ impl SimulationEngine {
                             parent_ids: a.state.parent_ids.clone(),
                         })
                         .collect::<Vec<_>>();
-                    self.replacement.create_replacement(&ReplacementContext {
+                    replacement.create_replacement(&ReplacementContext {
                         dead_agent: &dead_state,
                         dead_policy,
                         living_population: &living,
@@ -622,6 +873,7 @@ impl SimulationEngine {
                             ^ new_id.0.wrapping_mul(0x9e3779b97f4a7c15),
                     })?
                 };
+                transaction.replacement = Some(replacement);
                 let agent = self.factory.spawn(
                     request,
                     &AgentBuildContext {
@@ -632,8 +884,8 @@ impl SimulationEngine {
                         compute_device: &self.compute_device,
                     },
                 )?;
-                self.agents[slot] = agent;
-                self.emit(DomainEvent::AgentBorn {
+                transaction.agents[slot] = agent;
+                transaction.events.push(DomainEvent::AgentBorn {
                     agent_id: new_id,
                     date,
                 });
@@ -663,7 +915,7 @@ impl SimulationEngine {
             split: self.split,
             next_step: self.next_step,
             next_agent_id: self.next_agent_id,
-            lifecycle: self.lifecycle,
+            lifecycle: self.lifecycle.clone(),
             agents: self
                 .agents
                 .iter()
@@ -695,7 +947,20 @@ impl SimulationEngine {
             });
         Ok(())
     }
-    pub fn resume(config: Config, mut data: MarketDataset, path: impl AsRef<Path>) -> Result<Self> {
+    pub fn resume(config: Config, data: MarketDataset, path: impl AsRef<Path>) -> Result<Self> {
+        Self::resume_with_factory(
+            config,
+            data,
+            path,
+            Box::new(StandardAgentFactory::default()),
+        )
+    }
+    pub fn resume_with_factory(
+        config: Config,
+        mut data: MarketDataset,
+        path: impl AsRef<Path>,
+        factory: Box<dyn AgentFactory>,
+    ) -> Result<Self> {
         let bytes = fs::read(path)?;
         let cp: Checkpoint = bincode::deserialize(&bytes).map_err(|_| {
             MidasError::Checkpoint(format!(
@@ -738,12 +1003,16 @@ impl SimulationEngine {
         if cp.architecture != architecture {
             return Err(MidasError::Checkpoint("brain architecture mismatch".into()));
         }
+        if features.len() < 2 {
+            return Err(MidasError::Checkpoint(
+                "checkpoint split needs at least two trading dates".into(),
+            ));
+        }
         let observation_builder = SchemaObservationBuilder::new(
             observation_schema.clone(),
             config.features.features.clone(),
             data.assets.len(),
         )?;
-        let factory: Box<dyn AgentFactory> = Box::new(StandardAgentFactory::default());
         let birth = features[0].date;
         let agents = cp
             .agents
@@ -809,7 +1078,11 @@ impl SimulationEngine {
                 .expect("serializable schema"),
             replacement_strategy: self.replacement.name().into(),
             learning_implementation: "no_learning".into(),
-            lifecycle: self.lifecycle,
+            lifecycle: self.lifecycle.clone(),
+            failure_reason: match &self.lifecycle {
+                SimulationLifecycle::Failed { reason } => Some(reason.clone()),
+                _ => None,
+            },
         }
     }
 }
@@ -826,6 +1099,7 @@ pub struct SimulationReport {
     pub replacement_strategy: String,
     pub learning_implementation: String,
     pub lifecycle: SimulationLifecycle,
+    pub failure_reason: Option<String>,
 }
 
 fn classify_policy_failure(error: &MidasError) -> PolicyFailureCategory {

@@ -18,7 +18,7 @@ Implement `NeuralModel` and `NeuralModelFactory`. A model owns recurrent state a
 
 ## Agent construction and replacement
 
-Both initial population and death replacement use `AgentFactory::spawn`. A replacement strategy receives `ReplacementContext` with dead state and blueprint, living summaries, configuration, architecture, observation schema, and deterministic seed material. It returns `AgentSpawnRequest`; it must not construct a policy. Prompt 1 preserves benchmark blueprints and randomises only neural genomes. Parent selection and reproduction remain deferred.
+Both initial population and death replacement use `AgentFactory::spawn`. A replacement strategy receives `ReplacementContext` with dead state and blueprint, living summaries, configuration, architecture, observation schema, and deterministic seed material. It returns `AgentSpawnRequest`; it must not construct a policy. Strategies with mutable selection/RNG state should implement `ReplacementStrategy::fork`; the simulation swaps the fork only when the containing step commits. Prompt 1 preserves benchmark blueprints and randomises only neural genomes. Parent selection and reproduction remain deferred.
 
 ## Execution
 
@@ -26,7 +26,11 @@ Both initial population and death replacement use `AgentFactory::spawn`. A repla
 
 ## Events and checkpoints
 
-`DomainEvent` is deterministic and checkpointed. `OperationalEvent` records effects such as successful checkpoint writes and is not part of simulation equivalence. `SimulationLifecycle` makes completion idempotent. Checkpoint format 3 records backend identity and the separated neural runtime state; format or schema changes require a version bump and explicit rejection of incompatible files. Policy failures emit diagnostics, count per agent, and follow `policy_failures.behavior` after configured consecutive/total limits.
+`DomainEvent` is deterministic and checkpointed. `OperationalEvent` records effects such as successful checkpoint writes and is not part of simulation equivalence. `SimulationLifecycle` makes completion idempotent. Checkpoint format 4 records backend identity, the separated neural runtime state, and a persistent failed lifecycle; format or schema changes require a version bump and explicit rejection of incompatible files. Policy failures emit diagnostics, count per agent, and follow `policy_failures.behavior` after configured consecutive/total limits.
+
+Every simulation step is a transaction. The engine forks mutable policy/neural state, buffers domain events, and commits agents, replacement state, counters, metrics, and `next_step` only after the complete close-to-next-open path succeeds. A `StopExperiment` limit discards that transaction and enters `SimulationLifecycle::Failed { reason }`; it does not apply corporate actions, trades, costs, valuation, aging, or automatic checkpoint writes. Repeated calls after failure return the stored reason without mutation. The failure event is diagnostic metadata; the checkpoint boundary remains the previous committed step. Completed runs are likewise idempotent.
+
+Failure event sequences are deliberately strict. A recoverable incident emits one `PolicyFailure` followed by one `ActionFallback`, then executes the cash allocation normally. A fatal `KillAgent` incident emits `PolicyFailure` followed by `AgentDied` with `DeathCause::PolicyFailure`; no fallback or next-day event is executed for that agent. Consecutive failures increment on every unusable decision and reset only after a valid, non-fallback action has passed validation. Total failures never reset during a lifetime; a replacement starts both counters at zero. Corporate actions retain the order observe close `t`, decide/fail, advance survivors, split then dividend at `t+1`, execute opening trades, and value the close.
 
 ## Learning
 

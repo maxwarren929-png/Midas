@@ -285,6 +285,13 @@ pub trait NeuralModel: Send {
     fn forward(&mut self, input: &NeuralInput<'_>) -> Result<NeuralOutput>;
     fn reset_memory(&mut self);
     fn snapshot_state(&self) -> Result<NeuralModelState>;
+    /// Fork runtime state for a transactional simulation step. Framework
+    /// adapters should clone cached parameters rather than rebuilding them.
+    fn fork(&self) -> Result<Box<dyn NeuralModel>> {
+        Err(MidasError::Policy(
+            "neural model does not support transactional forking".into(),
+        ))
+    }
     fn runtime_parameter_builds(&self) -> u64 {
         0
     }
@@ -339,6 +346,7 @@ struct BurnRuntimeDense {
     weights: Tensor<CpuBackend, 2>,
     bias: Tensor<CpuBackend, 2>,
 }
+#[derive(Clone)]
 struct BurnRuntimeParameters {
     hidden: Vec<BurnRuntimeDense>,
     recurrent: BurnRuntimeDense,
@@ -481,6 +489,14 @@ impl NeuralModel for BurnNeuralModel {
             runtime: self.runtime.clone(),
         })
     }
+    fn fork(&self) -> Result<Box<dyn NeuralModel>> {
+        Ok(Box::new(Self {
+            architecture: self.architecture.clone(),
+            lifetime: self.lifetime.clone(),
+            runtime: self.runtime.clone(),
+            cached: self.cached.clone(),
+        }))
+    }
     fn runtime_parameter_builds(&self) -> u64 {
         self.cached.builds
     }
@@ -522,6 +538,12 @@ pub trait Policy: Send {
     fn snapshot(&self) -> Result<PolicySnapshot>;
     fn reset_episode_state(&mut self);
     fn policy_blueprint(&self) -> PolicyBlueprint;
+    /// Fork policy state for a transactional simulation step.
+    fn fork(&self) -> Result<Box<dyn Policy>> {
+        Err(MidasError::Policy(
+            "policy does not support transactional forking".into(),
+        ))
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum PolicySnapshot {
@@ -580,6 +602,12 @@ impl Policy for NeuralPolicy {
     fn policy_blueprint(&self) -> PolicyBlueprint {
         PolicyBlueprint::Neural
     }
+    fn fork(&self) -> Result<Box<dyn Policy>> {
+        Ok(Box::new(Self {
+            genome: self.genome.clone(),
+            model: self.model.fork()?,
+        }))
+    }
 }
 pub struct CashPolicy;
 impl Policy for CashPolicy {
@@ -598,6 +626,9 @@ impl Policy for CashPolicy {
     fn reset_episode_state(&mut self) {}
     fn policy_blueprint(&self) -> PolicyBlueprint {
         PolicyBlueprint::Cash
+    }
+    fn fork(&self) -> Result<Box<dyn Policy>> {
+        Ok(Box::new(CashPolicy))
     }
 }
 pub struct EqualWeightPolicy;
@@ -625,6 +656,9 @@ impl Policy for EqualWeightPolicy {
     fn reset_episode_state(&mut self) {}
     fn policy_blueprint(&self) -> PolicyBlueprint {
         PolicyBlueprint::EqualWeight
+    }
+    fn fork(&self) -> Result<Box<dyn Policy>> {
+        Ok(Box::new(EqualWeightPolicy))
     }
 }
 pub struct RandomPolicy {
@@ -657,6 +691,11 @@ impl Policy for RandomPolicy {
     fn reset_episode_state(&mut self) {}
     fn policy_blueprint(&self) -> PolicyBlueprint {
         PolicyBlueprint::Random
+    }
+    fn fork(&self) -> Result<Box<dyn Policy>> {
+        Ok(Box::new(Self {
+            rng: self.rng.clone(),
+        }))
     }
 }
 pub struct BuyAndHoldPolicy {
@@ -702,6 +741,12 @@ impl Policy for BuyAndHoldPolicy {
         PolicyBlueprint::BuyAndHold {
             target_asset: self.target_asset,
         }
+    }
+    fn fork(&self) -> Result<Box<dyn Policy>> {
+        Ok(Box::new(Self {
+            initialized: self.initialized,
+            target_asset: self.target_asset,
+        }))
     }
 }
 

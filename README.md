@@ -25,9 +25,9 @@ Data uses a long-form canonical schema: `date, asset, open, high, low, close, ad
 
 An optional `data.corporate_actions_path` CSV uses `date,asset,kind,value`, where `kind` is `split` or `cash_dividend`. Split `value` is the positive new-shares-per-old-share ratio; dividend `value` is non-negative cash per share.
 
-At close on day `t`, a policy sees features and availability known through `t`; its proposal is validated centrally and executes at open on `t+1`. Missing `t+1` bars reject that asset's order. Holdings in unavailable assets use the latest known close for valuation.
+At close on day `t`, a policy sees features and availability known through `t`; its proposal is validated centrally and executes at open on `t+1`. Missing `t+1` bars reject that asset's order. Holdings in unavailable assets use the latest known close for valuation. Each step is transactional: policy state, neural memory, portfolios, counters, events, metrics, replacement state, RNG state, and `next_step` are committed together only after the full step succeeds.
 
-Feature rows are calculated from current and earlier bars only. A complete versioned observation schema orders market, portfolio, and agent-state features and derives the neural input dimension. Its stable hash is part of `BrainArchitecture` and checkpoint compatibility. Checkpoint format version 3 rejects older layouts, neural-state layouts, and backend identities explicitly.
+Feature rows are calculated from current and earlier bars only. A complete versioned observation schema orders market, portfolio, and agent-state features and derives the neural input dimension. Its stable hash is part of `BrainArchitecture` and checkpoint compatibility. Checkpoint format version 4 rejects older layouts, neural-state layouts, and backend identities explicitly.
 
 ## Architecture
 
@@ -44,7 +44,7 @@ Feature rows are calculated from current and earlier bars only. A complete versi
 - `EventSink`: consume deterministic `DomainEvent` values; operational events are separate.
 - `LearningStrategy`: lifetime-learning boundary; Prompt 1 provides only `NoLearning`.
 
-The stable `BrainGenome` stores explicit matrix shapes, values, configured bounded traits, and complete architecture metadata. A neural policy keeps the immutable genome separate from mutable lifetime parameters and simple recurrent runtime memory. Burn caches runtime tensors when a model is built or restored; serialisation and simulation interfaces do not expose Burn tensor types. Policy failures preserve diagnostics in `DomainEvent::PolicyFailure` and follow the configured failure limits before any cash fallback is used.
+The stable `BrainGenome` stores explicit matrix shapes, values, configured bounded traits, and complete architecture metadata. A neural policy keeps the immutable genome separate from mutable lifetime parameters and simple recurrent runtime memory. Burn caches runtime tensors when a model is built or restored; serialisation and simulation interfaces do not expose Burn tensor types. Policy failures preserve diagnostics in `DomainEvent::PolicyFailure` and follow the configured failure limits before any cash fallback is used. A recoverable incident emits exactly `PolicyFailure` then `ActionFallback` and continues with cash. `KillAgent` kills the agent during the decision phase, emits `PolicyFailure` then `AgentDied`, and applies no next-day actions, trades, costs, age, or reward. `StopExperiment` discards the in-progress step, enters `SimulationLifecycle::Failed { reason }`, and preserves the last committed checkpoint boundary; repeated `run` and `run_steps` calls return the same failure without mutation. A valid validated action alone resets consecutive failures; total failures reset only for a newly spawned replacement.
 
 See [Extending Midas](docs/EXTENDING.md) for subsystem-specific extension steps and [Implementation Status](IMPLEMENTATION_STATUS.md) for the exact Prompt 1 boundary.
 

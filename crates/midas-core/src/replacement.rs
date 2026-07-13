@@ -31,6 +31,13 @@ pub trait ReplacementStrategy: Send {
     fn create_replacement(&mut self, context: &ReplacementContext<'_>)
     -> Result<AgentSpawnRequest>;
     fn name(&self) -> &'static str;
+    /// Clone strategy state for a transactional simulation step. Stateful
+    /// strategies must override this before they can replace agents.
+    fn fork(&self) -> Result<Box<dyn ReplacementStrategy>> {
+        Err(crate::MidasError::Policy(
+            "replacement strategy does not support transactional forking".into(),
+        ))
+    }
 }
 pub struct NonEvolutionaryRandomGenomeReplacement;
 impl ReplacementStrategy for NonEvolutionaryRandomGenomeReplacement {
@@ -55,5 +62,8 @@ impl ReplacementStrategy for NonEvolutionaryRandomGenomeReplacement {
     }
     fn name(&self) -> &'static str {
         "non_evolutionary_random_genome"
+    }
+    fn fork(&self) -> Result<Box<dyn ReplacementStrategy>> {
+        Ok(Box::new(Self))
     }
 }

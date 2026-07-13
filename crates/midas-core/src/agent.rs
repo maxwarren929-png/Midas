@@ -29,6 +29,14 @@ pub struct Agent {
     pub state: AgentState,
     pub policy: Box<dyn Policy>,
 }
+impl Agent {
+    pub fn fork(&self) -> Result<Self> {
+        Ok(Self {
+            state: self.state.clone(),
+            policy: self.policy.fork()?,
+        })
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SpawnMetadata {
     pub reason: String,
