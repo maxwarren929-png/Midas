@@ -1,0 +1,3 @@
+condition,seed,comparison,status
+ppo,42,uninterrupted training report vs 600-step checkpoint plus resume,byte-identical
+all,all,checkpoint format 11 restore and deterministic state tests,passed

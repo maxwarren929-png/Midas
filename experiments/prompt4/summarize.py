@@ -116,7 +116,7 @@ def main() -> None:
 
     fields = list(rows[0])
     with (REPORTS / "per-seed-results.csv").open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer = csv.DictWriter(handle, fieldnames=fields, lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
 
@@ -169,7 +169,7 @@ def main() -> None:
             }
         )
     with (REPORTS / "condition-summary.csv").open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=summary_fields)
+        writer = csv.DictWriter(handle, fieldnames=summary_fields, lineterminator="\n")
         writer.writeheader()
         writer.writerows(summaries)
 
@@ -177,7 +177,7 @@ def main() -> None:
     dataset = ROOT / "data" / "prompt3b" / "market.csv"
     dataset_hash = hashlib.sha256(dataset.read_bytes()).hexdigest()
     with (REPORTS / "run-manifest.csv").open("w", newline="") as handle:
-        writer = csv.writer(handle)
+        writer = csv.writer(handle, lineterminator="\n")
         writer.writerow(["condition", "seed", "commit", "config", "checkpoint", "training", "validation", "test"])
         for condition in CONDITIONS:
             for seed in SEEDS:
