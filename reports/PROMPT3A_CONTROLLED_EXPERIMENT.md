@@ -20,7 +20,7 @@ detected: PPO finished below control on all five seeds.
 ## Commit and Environment
 
 The final implementation and experiment artifact commit is
-`c42452b2e0bcddc3ff086e27033aadc43f6bcd75`. The experiments used:
+`aabb0ef320c979db8dc58268d4aec0145ce2db23`. The experiments used:
 
 * Rust `1.96.1`, Cargo `1.96.1`
 * Linux `7.0.13-arch1-1`, x86_64
