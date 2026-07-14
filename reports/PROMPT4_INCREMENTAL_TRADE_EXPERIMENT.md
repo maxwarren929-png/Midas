@@ -66,7 +66,7 @@ For PPO seed 42, an uninterrupted run and a 600-step checkpoint followed by resu
 - `cargo fmt --all --check` passed.
 - `cargo check --workspace --all-targets` passed.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings` passed.
-- `cargo test --workspace --all-features` passed: 33 core unit tests, 53 foundation regressions, and 7 Prompt 2 integration tests; **93 passed, 0 failed, 0 ignored**.
+- `cargo test --workspace --all-features` passed: 33 core unit tests, 54 foundation regressions, and 7 Prompt 2 integration tests; **94 passed, 0 failed, 0 ignored**.
 - Release CLI validation, 40 training runs, 80 validation/test replays, benchmark, diagnostics, and checkpoint-resume comparison passed.
 
 ## Limitations

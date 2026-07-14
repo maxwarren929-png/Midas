@@ -587,6 +587,43 @@ fn incremental_impulses_cannot_bypass_configured_trade_fraction() {
 }
 
 #[test]
+fn incremental_minimum_trade_filter_reports_removed_buy_notional() {
+    let c = config();
+    let engine = CostExecutionEngine { costs: c.execution };
+    let validator = LongOnlyActionValidator;
+    let portfolio = Portfolio::new(100.0, 2);
+    let bar0 = bar(0, "2020-01-01", 100.0);
+    let bar1 = bar(1, "2020-01-01", 100.0);
+    let bars = [Some(&bar0), Some(&bar1)];
+    let prices = [Some(100.0), Some(100.0)];
+    let action = validator
+        .validate_action(
+            ProposedAction::TradeImpulses(ProposedTradeImpulses::new(vec![0.01, 0.0], 0.05)),
+            &ActionValidationContext {
+                asset_count: 2,
+                tradable: &[true, true],
+                policy_maximum_asset_allocation: None,
+                policy_maximum_trade_fraction: None,
+                market_maximum_asset_allocation: None,
+            },
+        )
+        .unwrap();
+    let plan = engine
+        .plan_action(
+            &portfolio,
+            &action,
+            &ExecutionSnapshot {
+                bars: &bars,
+                valuation_prices: &prices,
+            },
+            1.0,
+        )
+        .unwrap();
+    assert!(plan.trades.is_empty());
+    assert!(plan.rejected_notional > 0.0);
+}
+
+#[test]
 fn execution_uses_stable_asset_ids_and_rejects_tampered_plans() {
     let mut c = config();
     c.execution.commission_fixed = 1.0;

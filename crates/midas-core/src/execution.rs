@@ -563,8 +563,17 @@ impl ExecutionPlanner for CostExecutionEngine {
             let fixed = self.costs.commission_fixed * buys.len() as f64;
             scale = ((available - fixed) / requested / variable).clamp(0.0, 1.0);
             let before = buys.len();
-            buys.retain(|(_, value)| *value * scale >= minimum && *value * scale > 0.0);
-            if buys.len() == before {
+            let mut retained = Vec::with_capacity(before);
+            for (index, value) in buys.drain(..) {
+                if value * scale >= minimum && value * scale > 0.0 {
+                    retained.push((index, value));
+                } else {
+                    plan.rejected_notional += value;
+                }
+            }
+            let stable = retained.len() == before;
+            buys = retained;
+            if stable {
                 break;
             }
         }
