@@ -2,7 +2,8 @@ use chrono::NaiveDate;
 use midas_core::{
     AgentId, AssetId, MidasError,
     action::{
-        ActionValidationContext, ActionValidator, LongOnlyActionValidator, ProposedAllocation,
+        ActionValidationContext, ActionValidator, LongOnlyActionValidator, ProposedAction,
+        ProposedAllocation, ProposedTradeImpulses,
     },
     agent::{
         AgentBuildContext, AgentFactory, AgentSpawnRequest, SpawnMetadata, StandardAgentFactory,
@@ -71,6 +72,7 @@ fn validator(
                 asset_count: tradable.len(),
                 tradable,
                 policy_maximum_asset_allocation: Some(max),
+                policy_maximum_trade_fraction: None,
                 market_maximum_asset_allocation: None,
             },
         )
@@ -421,16 +423,20 @@ fn random_and_malicious_proposals_cannot_bypass_concentration() {
         )
         .unwrap();
         let valid = LongOnlyActionValidator
-            .validate(
+            .validate_action(
                 proposal,
                 &ActionValidationContext {
                     asset_count: 3,
                     tradable: &[true, true, true],
                     policy_maximum_asset_allocation: Some(0.25),
+                    policy_maximum_trade_fraction: None,
                     market_maximum_asset_allocation: None,
                 },
             )
             .unwrap();
+        let midas_core::action::ValidatedAction::Allocation(valid) = valid else {
+            panic!("random benchmark must emit an allocation action")
+        };
         assert!(valid.weights().iter().skip(1).all(|v| *v <= 0.25 + 1e-9));
     }
     let valid = validator(vec![0.0, 100.0, 0.0, 0.0], &[true, true, true], 0.25);
@@ -488,6 +494,96 @@ fn proportional_planning_includes_costs_and_is_order_invariant() {
         plan.trades.iter().map(|t| t.notional).sum::<f64>(),
         reversed.trades.iter().map(|t| t.notional).sum::<f64>()
     );
+}
+
+#[test]
+fn incremental_impulses_preserve_portfolio_and_execute_sells_before_buys() {
+    let c = config();
+    let engine = CostExecutionEngine { costs: c.execution };
+    let validator = LongOnlyActionValidator;
+    let mut portfolio = Portfolio::new(50.0, 2);
+    portfolio.positions[0].quantity = 5.0;
+    portfolio.positions[0].average_entry_price = 10.0;
+    let bar0 = bar(0, "2020-01-01", 10.0);
+    let bar1 = bar(1, "2020-01-01", 20.0);
+    let bars = [Some(&bar0), Some(&bar1)];
+    let prices = [Some(10.0), Some(20.0)];
+    let context = ActionValidationContext {
+        asset_count: 2,
+        tradable: &[true, true],
+        policy_maximum_asset_allocation: None,
+        policy_maximum_trade_fraction: None,
+        market_maximum_asset_allocation: None,
+    };
+    let hold = validator
+        .validate_action(
+            ProposedAction::TradeImpulses(ProposedTradeImpulses::new(vec![0.0, 0.0], 0.05)),
+            &context,
+        )
+        .unwrap();
+    let hold_plan = engine
+        .plan_action(
+            &portfolio,
+            &hold,
+            &ExecutionSnapshot {
+                bars: &bars,
+                valuation_prices: &prices,
+            },
+            0.0,
+        )
+        .unwrap();
+    assert!(hold_plan.trades.is_empty());
+
+    let action = validator
+        .validate_action(
+            ProposedAction::TradeImpulses(ProposedTradeImpulses::new(vec![-1.0, 1.0], 0.5)),
+            &context,
+        )
+        .unwrap();
+    let plan = engine
+        .plan_action(
+            &portfolio,
+            &action,
+            &ExecutionSnapshot {
+                bars: &bars,
+                valuation_prices: &prices,
+            },
+            0.0,
+        )
+        .unwrap();
+    assert_eq!(
+        plan.trades.first().map(|trade| &trade.side),
+        Some(&TradeSide::Sell)
+    );
+    assert!(plan.trades.iter().any(|trade| trade.side == TradeSide::Buy));
+    engine.apply(&mut portfolio, &plan).unwrap();
+    assert!(portfolio.cash >= -1e-9);
+    assert!(
+        portfolio
+            .positions
+            .iter()
+            .all(|position| position.quantity >= -1e-9)
+    );
+    assert!(portfolio.positions[0].quantity < 5.0);
+    assert!(portfolio.positions[1].quantity > 0.0);
+}
+
+#[test]
+fn incremental_impulses_cannot_bypass_configured_trade_fraction() {
+    let validator = LongOnlyActionValidator;
+    let error = validator
+        .validate_action(
+            ProposedAction::TradeImpulses(ProposedTradeImpulses::new(vec![0.5], 0.2)),
+            &ActionValidationContext {
+                asset_count: 1,
+                tradable: &[true],
+                policy_maximum_asset_allocation: None,
+                policy_maximum_trade_fraction: Some(0.05),
+                market_maximum_asset_allocation: None,
+            },
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("incremental trade impulse"));
 }
 
 #[test]
@@ -968,7 +1064,7 @@ fn checkpoint_v6_is_rejected_as_bias_only_optimizer_layout() {
     let file = tempfile::NamedTempFile::new().unwrap();
     engine.save_checkpoint(file.path()).unwrap();
     let mut bytes = fs::read(file.path()).unwrap();
-    assert_eq!(bytes.first().copied(), Some(9));
+    assert_eq!(bytes.first().copied(), Some(11));
     bytes[0] = 6;
     fs::write(file.path(), bytes).unwrap();
     let error = match SimulationEngine::resume(c, data, file.path()) {
@@ -988,7 +1084,7 @@ fn checkpoint_v8_is_rejected_as_single_asset_action_layout() {
     let file = tempfile::NamedTempFile::new().unwrap();
     engine.save_checkpoint(file.path()).unwrap();
     let mut bytes = fs::read(file.path()).unwrap();
-    assert_eq!(bytes.first().copied(), Some(9));
+    assert_eq!(bytes.first().copied(), Some(11));
     bytes[0] = 8;
     fs::write(file.path(), bytes).unwrap();
     let error = match SimulationEngine::resume(c, data, file.path()) {
@@ -996,6 +1092,26 @@ fn checkpoint_v8_is_rejected_as_single_asset_action_layout() {
         Err(error) => error,
     };
     assert!(error.to_string().contains("single-asset categorical"));
+}
+
+#[test]
+fn checkpoint_v10_is_rejected_as_pre_impulse_metrics_layout() {
+    let c = config();
+    let data = loaded(&c);
+    let mut engine =
+        SimulationEngine::new(c.clone(), data.clone(), DatasetSplit::Training).unwrap();
+    engine.run_steps(1).unwrap();
+    let file = tempfile::NamedTempFile::new().unwrap();
+    engine.save_checkpoint(file.path()).unwrap();
+    let mut bytes = fs::read(file.path()).unwrap();
+    assert_eq!(bytes.first().copied(), Some(11));
+    bytes[0] = 10;
+    fs::write(file.path(), bytes).unwrap();
+    let error = match SimulationEngine::resume(c, data, file.path()) {
+        Ok(_) => panic!("checkpoint 10 was accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("incompatible with 11"));
 }
 
 #[test]

@@ -1,6 +1,6 @@
 use crate::{
     MidasError, PolicyFailureCategory, Result,
-    action::ValidatedAllocation,
+    action::ValidatedAction,
     brain::{NeuralRuntimeState, PolicyActionSample},
     config::LearningConfig,
     observation::Observation,
@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Transition {
     pub observation: Option<Observation>,
-    pub action: ValidatedAllocation,
+    pub action: ValidatedAction,
     pub action_sample: Option<PolicyActionSample>,
     pub raw_policy_output: Option<Vec<f32>>,
     pub log_probability: Option<f32>,
@@ -648,6 +648,7 @@ mod tests {
                     asset_count: 1,
                     tradable: &[true],
                     policy_maximum_asset_allocation: Some(1.0),
+                    policy_maximum_trade_fraction: None,
                     market_maximum_asset_allocation: None,
                 },
             )
@@ -657,12 +658,12 @@ mod tests {
                 schema_hash: "schema".into(),
                 values: vec![0.0],
             }),
-            action,
+            action: crate::action::ValidatedAction::Allocation(action),
             action_sample: Some(PolicyActionSample {
                 active_asset_indices: vec![0],
                 latent_samples: vec![0.5],
-                allocation: vec![0.5, 0.5],
-                maximum_asset_allocation: 1.0,
+                trade_impulses: vec![0.0],
+                maximum_trade_fraction: 0.05,
                 log_probability: -std::f32::consts::LN_2,
                 entropy: std::f32::consts::LN_2,
             }),

@@ -40,6 +40,10 @@ pub struct MetricsCollector {
     pub neural_active_position_total: f64,
     pub neural_concentration_total: f64,
     pub neural_cash_allocation_total: f64,
+    pub neural_impulse_count: u64,
+    pub neural_abs_impulse_total: f64,
+    pub neural_small_impulse_count: u64,
+    pub neural_saturated_impulse_count: u64,
 }
 impl MetricsCollector {
     pub fn record_neural_allocations(&mut self, stats: &AllocationStats) {
@@ -50,6 +54,16 @@ impl MetricsCollector {
         self.neural_active_position_total += stats.active_positions;
         self.neural_concentration_total += stats.concentration;
         self.neural_cash_allocation_total += stats.cash_allocation;
+        self.neural_impulse_count = self
+            .neural_impulse_count
+            .saturating_add(stats.impulse_count);
+        self.neural_abs_impulse_total += stats.abs_impulse_total;
+        self.neural_small_impulse_count = self
+            .neural_small_impulse_count
+            .saturating_add(stats.small_impulse_count);
+        self.neural_saturated_impulse_count = self
+            .neural_saturated_impulse_count
+            .saturating_add(stats.saturated_impulse_count);
     }
 }
 
@@ -60,6 +74,10 @@ pub struct AllocationStats {
     pub active_positions: f64,
     pub concentration: f64,
     pub cash_allocation: f64,
+    pub impulse_count: u64,
+    pub abs_impulse_total: f64,
+    pub small_impulse_count: u64,
+    pub saturated_impulse_count: u64,
 }
 impl AllocationStats {
     pub fn record(&mut self, weights: &[f64]) -> crate::Result<()> {
@@ -85,6 +103,25 @@ impl AllocationStats {
         self.active_positions += active as f64;
         self.concentration += weights.iter().skip(1).copied().fold(0.0, f64::max);
         self.cash_allocation += weights[0];
+        Ok(())
+    }
+
+    pub fn record_impulses(&mut self, impulses: &[f64]) -> crate::Result<()> {
+        for impulse in impulses {
+            if !impulse.is_finite() || !(-1.0..=1.0).contains(impulse) {
+                return Err(crate::MidasError::Policy(
+                    "invalid neural trade impulse statistics input".into(),
+                ));
+            }
+            self.impulse_count = self.impulse_count.saturating_add(1);
+            self.abs_impulse_total += impulse.abs();
+            if impulse.abs() <= 0.05 {
+                self.small_impulse_count = self.small_impulse_count.saturating_add(1);
+            }
+            if impulse.abs() >= 0.95 {
+                self.saturated_impulse_count = self.saturated_impulse_count.saturating_add(1);
+            }
+        }
         Ok(())
     }
 }

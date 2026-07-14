@@ -25,6 +25,31 @@ impl ProposedAllocation {
     }
 }
 
+/// A neural incremental-trading proposal. Each entry is a bounded impulse:
+/// negative values sell, positive values buy, and zero leaves that asset
+/// unchanged. The fraction is carried with the proposal so validation and
+/// execution use the same configured action scale.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ProposedTradeImpulses {
+    pub impulses: Vec<f64>,
+    pub maximum_trade_fraction: f64,
+}
+
+impl ProposedTradeImpulses {
+    pub fn new(impulses: Vec<f64>, maximum_trade_fraction: f64) -> Self {
+        Self {
+            impulses,
+            maximum_trade_fraction,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub enum ProposedAction {
+    Allocation(ProposedAllocation),
+    TradeImpulses(ProposedTradeImpulses),
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ValidatedAllocation {
     weights: Vec<f64>,
@@ -48,6 +73,27 @@ impl ValidatedAllocation {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ValidatedTradeImpulses {
+    impulses: Vec<f64>,
+    maximum_trade_fraction: f64,
+}
+
+impl ValidatedTradeImpulses {
+    pub fn impulses(&self) -> &[f64] {
+        &self.impulses
+    }
+    pub fn maximum_trade_fraction(&self) -> f64 {
+        self.maximum_trade_fraction
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub enum ValidatedAction {
+    Allocation(ValidatedAllocation),
+    TradeImpulses(ValidatedTradeImpulses),
+}
+
 pub struct ActionValidationContext<'a> {
     pub asset_count: usize,
     pub tradable: &'a [bool],
@@ -55,6 +101,9 @@ pub struct ActionValidationContext<'a> {
     /// this unset because their documented allocations are not neural-policy
     /// proposals.
     pub policy_maximum_asset_allocation: Option<f64>,
+    /// Maximum notional fraction permitted for a neural incremental-trade
+    /// proposal. `None` keeps the validator generic for non-neural actions.
+    pub policy_maximum_trade_fraction: Option<f64>,
     /// An explicit market-wide cap, when an experiment chooses to impose one
     /// on every policy including benchmarks.
     pub market_maximum_asset_allocation: Option<f64>,
@@ -66,6 +115,21 @@ pub trait ActionValidator: Send + Sync {
         proposed: ProposedAllocation,
         context: &ActionValidationContext<'_>,
     ) -> Result<ValidatedAllocation>;
+
+    fn validate_action(
+        &self,
+        proposed: ProposedAction,
+        context: &ActionValidationContext<'_>,
+    ) -> Result<ValidatedAction> {
+        match proposed {
+            ProposedAction::Allocation(allocation) => self
+                .validate(allocation, context)
+                .map(ValidatedAction::Allocation),
+            ProposedAction::TradeImpulses(_) => Err(MidasError::Policy(
+                "action validator does not support incremental trade impulses".into(),
+            )),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -191,5 +255,50 @@ impl ActionValidator for LongOnlyActionValidator {
             used_fallback: false,
             fallback_reason: None,
         })
+    }
+
+    fn validate_action(
+        &self,
+        proposed: ProposedAction,
+        context: &ActionValidationContext<'_>,
+    ) -> Result<ValidatedAction> {
+        match proposed {
+            ProposedAction::Allocation(allocation) => self
+                .validate(allocation, context)
+                .map(ValidatedAction::Allocation),
+            ProposedAction::TradeImpulses(mut impulses) => {
+                if context.tradable.len() != context.asset_count
+                    || impulses.impulses.len() != context.asset_count
+                    || !impulses.maximum_trade_fraction.is_finite()
+                    || impulses.maximum_trade_fraction <= 0.0
+                    || impulses.maximum_trade_fraction > 1.0
+                    || context
+                        .policy_maximum_trade_fraction
+                        .is_some_and(|maximum| {
+                            !maximum.is_finite()
+                                || maximum <= 0.0
+                                || maximum > 1.0
+                                || impulses.maximum_trade_fraction > maximum + 1e-12
+                        })
+                    || impulses
+                        .impulses
+                        .iter()
+                        .any(|value| !value.is_finite() || !(-1.0..=1.0).contains(value))
+                {
+                    return Err(MidasError::Policy(
+                        "invalid incremental trade impulse proposal".into(),
+                    ));
+                }
+                for (impulse, tradable) in impulses.impulses.iter_mut().zip(context.tradable) {
+                    if !tradable {
+                        *impulse = 0.0;
+                    }
+                }
+                Ok(ValidatedAction::TradeImpulses(ValidatedTradeImpulses {
+                    impulses: impulses.impulses,
+                    maximum_trade_fraction: impulses.maximum_trade_fraction,
+                }))
+            }
+        }
     }
 }

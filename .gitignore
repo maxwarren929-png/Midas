@@ -12,3 +12,5 @@
 /reports/prompt3b/calibration-*.json
 /reports/prompt3b/prompt3a-baseline-*
 /reports/prompt3b/final-evolution-report.json
+/reports/prompt4/*-seed-*
+/reports/prompt4/diagnostics-*/

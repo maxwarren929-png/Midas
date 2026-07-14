@@ -108,6 +108,7 @@ impl StandardAgentFactory {
         a: &BrainArchitecture,
         seed: u64,
         device: &ComputeDevice,
+        maximum_trade_fraction: f64,
     ) -> Result<Box<dyn Policy>> {
         Ok(match blueprint {
             PolicyBlueprint::Cash => Box::new(CashPolicy),
@@ -119,10 +120,11 @@ impl StandardAgentFactory {
             PolicyBlueprint::Neural => {
                 let g = genome
                     .ok_or_else(|| MidasError::Policy("neural spawn requires genome".into()))?;
-                Box::new(NeuralPolicy::new_with_seed(
+                Box::new(NeuralPolicy::new_with_seed_and_trade_fraction(
                     g.clone(),
                     self.neural.build(g, a, device)?,
                     seed,
+                    maximum_trade_fraction,
                 ))
             }
         })
@@ -158,6 +160,7 @@ impl AgentFactory for StandardAgentFactory {
             c.architecture,
             c.config.simulation.seed ^ c.agent_id.0,
             c.compute_device,
+            c.config.brain.trading.maximum_trade_fraction,
         )?;
         let learning = self.build_learning(
             &r.policy_blueprint,
@@ -213,10 +216,23 @@ impl AgentFactory for StandardAgentFactory {
                 state: model_state,
                 rng,
                 temperature,
+                maximum_trade_fraction,
             } => {
                 if !temperature.is_finite() || temperature <= 0.0 {
                     return Err(MidasError::Checkpoint(
                         "checkpoint action temperature is invalid".into(),
+                    ));
+                }
+                if !maximum_trade_fraction.is_finite()
+                    || maximum_trade_fraction <= 0.0
+                    || maximum_trade_fraction > 1.0
+                    || (maximum_trade_fraction - c.config.brain.trading.maximum_trade_fraction)
+                        .abs()
+                        > 1e-12
+                {
+                    return Err(MidasError::Checkpoint(
+                        "checkpoint incremental trade fraction is incompatible with configuration"
+                            .into(),
                     ));
                 }
                 genome.validate_with_traits(c.architecture, &c.config.brain.traits)?;
@@ -231,7 +247,13 @@ impl AgentFactory for StandardAgentFactory {
                 let model =
                     self.neural
                         .restore(&genome, c.architecture, *model_state, c.compute_device)?;
-                Box::new(NeuralPolicy::with_rng(genome, model, rng, temperature))
+                Box::new(NeuralPolicy::with_rng(
+                    genome,
+                    model,
+                    rng,
+                    temperature,
+                    maximum_trade_fraction,
+                ))
             }
         };
         let learning = self.build_learning(

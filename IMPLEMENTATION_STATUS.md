@@ -1,10 +1,22 @@
 # Implementation Status
 
+## Prompt 4: persistent incremental trade policy
+
+Prompt 4 replaces the neural target-portfolio action with persistent incremental trade impulses. The actor still emits two bounded-Beta shape values per asset, but the latent action is now mapped to one impulse in `[-1, 1]` per tradable asset (`2u - 1`). The configured `[brain.trading].maximum_trade_fraction` scales each impulse by current close net worth. Cash is implicit; existing holdings persist between decisions.
+
+- `ProposedAction`/`ValidatedAction` carry either benchmark allocations or neural `TradeImpulses`. The central validator checks dimensions, finite bounds, and availability without applying allocation-cap semantics to neural trades.
+- `ExecutionPlanner::plan_action` performs sells first, then fixed/variable-cost-aware common scaling of buys, minimum-trade filtering, and deterministic stable-ID ordering. `ExecutionApplier` remains atomic and rejects negative cash, holdings, leverage, and tampered economics. Impossible requests are broker constraints, not policy failures.
+- PPO continues to use the exact independent Beta latent log probability and entropy; deterministic evaluation uses Beta means and does not consume RNG or decay temperature. Full actor/critic head training, frozen encoder, reward, and evolution are unchanged.
+- Decision traces now include requested/executed impulses, notionals, scaling, rejected notional, cash and holdings before/after, and impulse magnitude/saturation metrics. Portfolio allocation metrics describe the persistent post-execution holdings.
+- Checkpoint format is now 11. Format 10 and formats 6 through 9 are rejected because their action samples, rollout/policy snapshots, or metrics layouts are incompatible; no unsafe migration is attempted. Birth genomes remain immutable and replacement lifetime state is fresh.
+
+Prompt 4's controlled rerun is recorded in [Prompt 4 Persistent Incremental Trade Experiment](reports/PROMPT4_INCREMENTAL_TRADE_EXPERIMENT.md) when available. It is a mechanical action-interface change, not evidence of profitability or intelligence. Known limitations are the independent per-asset Beta impulse factorisation, stable latent ordering, and frozen hidden/recurrent encoder.
+
 ## Prompt 3B: long-horizon diagnosis and adaptive reward experiment
 
 Prompt 3B adds report-only observability and a frozen, long-horizon experimental protocol. The implementation commit tested for the suite is `c692101`. The generated market contains 1,800 business dates, four assets, 1,259 training steps, and frozen validation/test splits; its SHA-256 is recorded in `reports/PROMPT3B_DIAGNOSTIC_EXPERIMENT.md`.
 
-- `RewardBreakdown`, transactional `DecisionTrace`, and `PpoUpdateTrace` expose return components, costs, turnover, allocations, stick-breaking order positions, PPO KL/clipping, gradients, and head deltas without changing the reward scalar or checkpointed simulation state. The diagnostics binary writes compact JSONL/CSV traces.
+- `RewardBreakdown`, transactional `DecisionTrace`, and `PpoUpdateTrace` expose return components, costs, turnover, allocations, asset-order positions, PPO KL/clipping, gradients, and head deltas without changing the reward scalar or checkpointed simulation state. The diagnostics binary writes compact JSONL/CSV traces.
 - Forty primary CLI runs (control, PPO, evolution-only, and PPO+evolution; seeds 41-50) and eighteen three-seed ablations completed. Checkpoint/resume matched for representative runs. Recoverable-failure learning and benchmark exposure regressions remain covered by tests.
 - PPO underperformance is primarily associated with extreme turnover and execution costs: the representative PPO trace had about 6,257 turnover units and $75,623 execution cost per agent-day versus about 40 and $488 for control. Stable order bias is measurable; naive episode rotation increased turnover and worsened results. Short-rollout PPO over-updating is supported as a contributing factor because a conservative schedule improved all three paired ablation seeds, but it is not yet a final selected policy.
 - Real PPO+evolution CLI runs produced deaths, two-parent reproduction, crossover, mutation, ancestry, and generation depth. Evolution did not show consistent performance improvement. No permanent turnover or concentration penalty was added; the turnover ablation was unit-mismatched and clipped heavily.

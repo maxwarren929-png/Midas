@@ -1,6 +1,6 @@
 use crate::{
     MidasError, Result,
-    action::ProposedAllocation,
+    action::{ProposedAction, ProposedAllocation, ProposedTradeImpulses},
     config::{
         ActionDistributionConfig, ActionDistributionKind, Activation, AssetOrder, BrainConfig,
         EvolvableTraitsConfig, LearningConfig,
@@ -302,14 +302,14 @@ pub struct NeuralOutput {
 pub struct PolicyActionSample {
     pub active_asset_indices: Vec<usize>,
     pub latent_samples: Vec<f32>,
-    pub allocation: Vec<f64>,
-    pub maximum_asset_allocation: f32,
+    pub trade_impulses: Vec<f32>,
+    pub maximum_trade_fraction: f32,
     pub log_probability: f32,
     pub entropy: f32,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PolicyEvaluation {
-    pub proposed_allocation: ProposedAllocation,
+    pub proposed_action: ProposedAction,
     pub action_sample: Option<PolicyActionSample>,
     pub log_probability: Option<f32>,
     pub entropy: f32,
@@ -873,7 +873,7 @@ fn train_burn_heads_inner(
             let temperature = sample
                 .temperature
                 .ok_or_else(|| MidasError::Policy("actor sample is missing temperature".into()))?;
-            let distribution = evaluate_bounded_stick_breaking_sample(
+            let distribution = evaluate_incremental_trade_sample(
                 &output.logits,
                 &sample.tradable,
                 action_sample,
@@ -1142,7 +1142,7 @@ pub trait Policy: Send {
         &mut self,
         _: &Observation,
         context: &PolicyContext<'_>,
-    ) -> Result<ProposedAllocation>;
+    ) -> Result<ProposedAction>;
     fn snapshot(&self) -> Result<PolicySnapshot>;
     fn reset_episode_state(&mut self);
     fn policy_blueprint(&self) -> PolicyBlueprint;
@@ -1155,7 +1155,7 @@ pub trait Policy: Send {
     ) -> Result<PolicyEvaluation> {
         let proposed = self.propose_action(observation, context)?;
         Ok(PolicyEvaluation {
-            proposed_allocation: proposed,
+            proposed_action: proposed,
             action_sample: None,
             log_probability: None,
             entropy: 0.0,
@@ -1203,6 +1203,7 @@ pub enum PolicySnapshot {
         state: Box<NeuralModelState>,
         rng: ChaCha8Rng,
         temperature: f32,
+        maximum_trade_fraction: f64,
     },
 }
 
@@ -1211,18 +1212,28 @@ pub struct NeuralPolicy {
     model: Box<dyn NeuralModel>,
     rng: ChaCha8Rng,
     temperature: f32,
+    maximum_trade_fraction: f64,
 }
 impl NeuralPolicy {
     pub fn new(genome: BrainGenome, model: Box<dyn NeuralModel>) -> Self {
-        Self::new_with_seed(genome, model, 0)
+        Self::new_with_seed_and_trade_fraction(genome, model, 0, 0.05)
     }
     pub fn new_with_seed(genome: BrainGenome, model: Box<dyn NeuralModel>, seed: u64) -> Self {
+        Self::new_with_seed_and_trade_fraction(genome, model, seed, 0.05)
+    }
+    pub fn new_with_seed_and_trade_fraction(
+        genome: BrainGenome,
+        model: Box<dyn NeuralModel>,
+        seed: u64,
+        maximum_trade_fraction: f64,
+    ) -> Self {
         let temperature = genome.traits.action_temperature;
         Self {
             genome,
             model,
             rng: ChaCha8Rng::seed_from_u64(seed),
             temperature,
+            maximum_trade_fraction,
         }
     }
     pub(crate) fn with_rng(
@@ -1230,29 +1241,29 @@ impl NeuralPolicy {
         model: Box<dyn NeuralModel>,
         rng: ChaCha8Rng,
         temperature: f32,
+        maximum_trade_fraction: f64,
     ) -> Self {
         Self {
             genome,
             model,
             rng,
             temperature,
+            maximum_trade_fraction,
         }
     }
 }
 impl Policy for NeuralPolicy {
-    fn propose_action(
-        &mut self,
-        o: &Observation,
-        c: &PolicyContext<'_>,
-    ) -> Result<ProposedAllocation> {
-        Ok(self.evaluate_action(o, c, false, 1.0)?.proposed_allocation)
+    fn propose_action(&mut self, o: &Observation, c: &PolicyContext<'_>) -> Result<ProposedAction> {
+        Ok(self
+            .evaluate_action(o, c, false, self.maximum_trade_fraction)?
+            .proposed_action)
     }
     fn evaluate_action(
         &mut self,
         o: &Observation,
         c: &PolicyContext<'_>,
         stochastic: bool,
-        maximum_asset_allocation: f64,
+        maximum_trade_fraction: f64,
     ) -> Result<PolicyEvaluation> {
         let order_offset = self
             .model
@@ -1260,10 +1271,10 @@ impl Policy for NeuralPolicy {
             .map(|state| state.inference_steps as usize)
             .unwrap_or(0);
         let out = self.model.forward(&NeuralInput { observation: o })?;
-        let evaluation = bounded_stick_breaking_evaluation_with_order(
+        let evaluation = bounded_impulse_beta_evaluation_with_order(
             out,
             c.tradable,
-            maximum_asset_allocation,
+            maximum_trade_fraction,
             stochastic,
             self.temperature,
             &mut self.rng,
@@ -1304,6 +1315,7 @@ impl Policy for NeuralPolicy {
             state: Box::new(self.model.snapshot_state()?),
             rng: self.rng.clone(),
             temperature: self.temperature,
+            maximum_trade_fraction: self.maximum_trade_fraction,
         })
     }
     fn reset_episode_state(&mut self) {
@@ -1319,15 +1331,17 @@ impl Policy for NeuralPolicy {
             model: self.model.fork()?,
             rng: self.rng.clone(),
             temperature: self.temperature,
+            maximum_trade_fraction: self.maximum_trade_fraction,
         }))
     }
 }
 
-/// A bounded stick-breaking portfolio distribution. The PPO action is the
-/// vector of latent Beta samples, not the final portfolio weights. For each
-/// tradable asset in stable asset order, `weight = cap * u`; cash receives the
-/// residual. This makes the concentration cap part of the action mapping and
-/// leaves the joint log probability as the sum of the exact Beta log densities.
+/// An independent bounded Beta impulse distribution.  The PPO action is the
+/// vector of latent Beta samples.  Each active asset receives the deterministic
+/// impulse `2u - 1`; the broker then interprets that impulse as an incremental
+/// trade.  Keeping the latent sample as the PPO action makes the joint density
+/// the exact sum of the independent Beta densities (the affine mapping to an
+/// impulse is deterministic and is not post-processed by the validator).
 #[derive(Clone, Debug)]
 struct BetaDecision {
     actor_alpha_index: usize,
@@ -1342,26 +1356,26 @@ struct BetaDecision {
 }
 
 #[derive(Clone, Debug)]
-struct StickBreakingEvaluation {
+struct ImpulseBetaEvaluation {
     log_probability: f32,
     entropy: f32,
     decisions: Vec<BetaDecision>,
 }
 
 #[cfg(test)]
-fn bounded_stick_breaking_evaluation(
+fn bounded_impulse_beta_evaluation(
     output: NeuralOutput,
     tradable: &[bool],
-    maximum_asset_allocation: f64,
+    maximum_trade_fraction: f64,
     stochastic: bool,
     temperature: f32,
     rng: &mut ChaCha8Rng,
     config: &ActionDistributionConfig,
 ) -> Result<PolicyEvaluation> {
-    bounded_stick_breaking_evaluation_with_order(
+    bounded_impulse_beta_evaluation_with_order(
         output,
         tradable,
-        maximum_asset_allocation,
+        maximum_trade_fraction,
         stochastic,
         temperature,
         rng,
@@ -1371,10 +1385,10 @@ fn bounded_stick_breaking_evaluation(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn bounded_stick_breaking_evaluation_with_order(
+fn bounded_impulse_beta_evaluation_with_order(
     output: NeuralOutput,
     tradable: &[bool],
-    maximum_asset_allocation: f64,
+    maximum_trade_fraction: f64,
     stochastic: bool,
     temperature: f32,
     rng: &mut ChaCha8Rng,
@@ -1384,7 +1398,7 @@ fn bounded_stick_breaking_evaluation_with_order(
     validate_distribution_inputs(
         &output,
         tradable,
-        maximum_asset_allocation,
+        maximum_trade_fraction,
         temperature,
         config,
     )?;
@@ -1400,12 +1414,11 @@ fn bounded_stick_breaking_evaluation_with_order(
     } else {
         deterministic_latents(&output.logits, &active_asset_indices, temperature, config)?
     };
-    let (weights, decisions) = evaluate_latents(
+    let (impulses, decisions) = evaluate_impulses(
         &output.logits,
         tradable,
         &active_asset_indices,
         &latents,
-        maximum_asset_allocation,
         temperature,
         config,
     )?;
@@ -1417,14 +1430,14 @@ fn bounded_stick_breaking_evaluation_with_order(
         .iter()
         .map(|decision| beta_entropy(decision.alpha, decision.beta))
         .sum::<Result<f64>>()? as f32;
-    let proposed = ProposedAllocation::rebalance(weights.clone());
+    let proposed = ProposedTradeImpulses::new(impulses.clone(), maximum_trade_fraction);
     Ok(PolicyEvaluation {
-        proposed_allocation: proposed,
+        proposed_action: ProposedAction::TradeImpulses(proposed),
         action_sample: stochastic.then_some(PolicyActionSample {
             active_asset_indices,
             latent_samples: latents.iter().map(|value| *value as f32).collect(),
-            allocation: weights,
-            maximum_asset_allocation: maximum_asset_allocation as f32,
+            trade_impulses: impulses.iter().map(|value| *value as f32).collect(),
+            maximum_trade_fraction: maximum_trade_fraction as f32,
             log_probability,
             entropy,
         }),
@@ -1439,11 +1452,11 @@ fn bounded_stick_breaking_evaluation_with_order(
 fn validate_distribution_inputs(
     output: &NeuralOutput,
     tradable: &[bool],
-    maximum_asset_allocation: f64,
+    maximum_trade_fraction: f64,
     temperature: f32,
     config: &ActionDistributionConfig,
 ) -> Result<()> {
-    if !matches!(config.kind, ActionDistributionKind::BoundedStickBreaking)
+    if !matches!(config.kind, ActionDistributionKind::BoundedImpulseBeta)
         || !matches!(
             config.asset_order,
             AssetOrder::Stable | AssetOrder::EpisodeRotated
@@ -1453,9 +1466,9 @@ fn validate_distribution_inputs(
         || output.logits.iter().any(|value| !value.is_finite())
         || !temperature.is_finite()
         || temperature <= 0.0
-        || !maximum_asset_allocation.is_finite()
-        || !(0.0..=1.0).contains(&maximum_asset_allocation)
-        || maximum_asset_allocation == 0.0
+        || !maximum_trade_fraction.is_finite()
+        || !(0.0..=1.0).contains(&maximum_trade_fraction)
+        || maximum_trade_fraction == 0.0
         || !config.minimum_shape.is_finite()
         || !config.maximum_shape.is_finite()
         || config.minimum_shape <= 0.0
@@ -1465,7 +1478,7 @@ fn validate_distribution_inputs(
         || config.latent_epsilon == 0.0
     {
         return Err(MidasError::Policy(
-            "invalid bounded stick-breaking output or action bounds".into(),
+            "invalid bounded impulse Beta output or action bounds".into(),
         ));
     }
     Ok(())
@@ -1517,7 +1530,7 @@ fn sample_latents(
             );
             if !sample.is_finite() {
                 return Err(MidasError::Policy(
-                    "non-finite bounded stick-breaking sample".into(),
+                    "non-finite bounded impulse sample".into(),
                 ));
             }
             Ok(sample)
@@ -1548,22 +1561,20 @@ fn deterministic_latents(
         .collect()
 }
 
-fn evaluate_latents(
+fn evaluate_impulses(
     logits: &[f32],
     tradable: &[bool],
     active_asset_indices: &[usize],
     latents: &[f64],
-    maximum_asset_allocation: f64,
     temperature: f32,
     config: &ActionDistributionConfig,
 ) -> Result<(Vec<f64>, Vec<BetaDecision>)> {
     if active_asset_indices.len() != latents.len() || logits.len() != tradable.len() * 2 {
         return Err(MidasError::Policy(
-            "bounded stick-breaking latent dimensions mismatch".into(),
+            "bounded impulse Beta latent dimensions mismatch".into(),
         ));
     }
-    let mut weights = vec![0.0; tradable.len() + 1];
-    let mut remaining = 1.0_f64;
+    let mut impulses = vec![0.0; tradable.len()];
     let mut decisions = Vec::with_capacity(active_asset_indices.len());
     for (position, asset_index) in active_asset_indices.iter().copied().enumerate() {
         let latent = latents[position];
@@ -1572,7 +1583,7 @@ fn evaluate_latents(
             || latent > 1.0 - config.latent_epsilon as f64
         {
             return Err(MidasError::Policy(
-                "bounded stick-breaking latent is outside the supported interior".into(),
+                "bounded impulse Beta latent is outside the supported interior".into(),
             ));
         }
         let (alpha, beta, d_alpha_d_raw, d_beta_d_raw) = beta_shapes(
@@ -1581,15 +1592,13 @@ fn evaluate_latents(
             temperature,
             config,
         )?;
-        let cap = maximum_asset_allocation.min(remaining);
-        let weight = cap * latent;
-        if !weight.is_finite() || weight < 0.0 || weight > cap + 1e-12 {
+        let impulse = 2.0 * latent - 1.0;
+        if !impulse.is_finite() || !(-1.0..=1.0).contains(&impulse) {
             return Err(MidasError::Policy(
-                "bounded stick-breaking allocation is invalid".into(),
+                "bounded impulse Beta action is invalid".into(),
             ));
         }
-        weights[asset_index + 1] = weight;
-        remaining -= weight;
+        impulses[asset_index] = impulse;
         let log_gradient_alpha = beta_log_probability_derivative_alpha(alpha, beta, latent)?;
         let log_gradient_beta = beta_log_probability_derivative_beta(alpha, beta, latent)?;
         let entropy_gradient_alpha = beta_entropy_derivative_alpha(alpha, beta)?;
@@ -1606,43 +1615,31 @@ fn evaluate_latents(
             d_entropy_d_raw_beta: (entropy_gradient_beta * d_beta_d_raw) as f32,
         });
     }
-    weights[0] = remaining;
-    let total = weights.iter().sum::<f64>();
-    if !total.is_finite() || total <= 0.0 {
-        return Err(MidasError::Policy(
-            "bounded stick-breaking weights are non-finite".into(),
-        ));
-    }
-    let drift = 1.0 - total;
-    if drift.abs() > 1e-10 {
-        weights[0] += drift;
-    }
-    if weights
+    if impulses
         .iter()
-        .any(|weight| !weight.is_finite() || *weight < 0.0)
-        || (weights.iter().sum::<f64>() - 1.0).abs() > 1e-9
+        .any(|impulse| !impulse.is_finite() || !(-1.0..=1.0).contains(impulse))
     {
         return Err(MidasError::Policy(
-            "bounded stick-breaking weights failed simplex validation".into(),
+            "bounded impulse Beta action failed validation".into(),
         ));
     }
-    Ok((weights, decisions))
+    Ok((impulses, decisions))
 }
 
-fn evaluate_bounded_stick_breaking_sample(
+fn evaluate_incremental_trade_sample(
     logits: &[f32],
     tradable: &[bool],
     sample: &PolicyActionSample,
     temperature: f32,
     config: &ActionDistributionConfig,
-) -> Result<StickBreakingEvaluation> {
+) -> Result<ImpulseBetaEvaluation> {
     validate_distribution_inputs(
         &NeuralOutput {
             logits: logits.to_vec(),
             value: 0.0,
         },
         tradable,
-        sample.maximum_asset_allocation as f64,
+        sample.maximum_trade_fraction as f64,
         temperature,
         config,
     )?;
@@ -1652,7 +1649,7 @@ fn evaluate_bounded_stick_breaking_sample(
     let canonical_indices = active_asset_indices(tradable)?;
     if sorted_indices != canonical_indices
         || sample.latent_samples.len() != expected_indices.len()
-        || sample.allocation.len() != tradable.len() + 1
+        || sample.trade_impulses.len() != tradable.len()
     {
         return Err(MidasError::Policy(
             "PPO portfolio action sample dimensions or mask mismatch".into(),
@@ -1663,22 +1660,21 @@ fn evaluate_bounded_stick_breaking_sample(
         .iter()
         .map(|value| *value as f64)
         .collect::<Vec<_>>();
-    let (allocation, decisions) = evaluate_latents(
+    let (impulses, decisions) = evaluate_impulses(
         logits,
         tradable,
         &expected_indices,
         &latents,
-        sample.maximum_asset_allocation as f64,
         temperature,
         config,
     )?;
-    if allocation
+    if impulses
         .iter()
-        .zip(&sample.allocation)
-        .any(|(actual, stored)| !stored.is_finite() || (actual - stored).abs() > 1e-5)
+        .zip(&sample.trade_impulses)
+        .any(|(actual, stored)| !stored.is_finite() || (*actual - *stored as f64).abs() > 1e-5)
     {
         return Err(MidasError::Policy(
-            "PPO portfolio action sample allocation does not match its latent action".into(),
+            "PPO incremental trade sample does not match its latent action".into(),
         ));
     }
     let log_probability = decisions
@@ -1691,14 +1687,25 @@ fn evaluate_bounded_stick_breaking_sample(
         .sum::<Result<f64>>()? as f32;
     if !log_probability.is_finite() || !entropy.is_finite() {
         return Err(MidasError::Policy(
-            "non-finite bounded stick-breaking PPO density".into(),
+            "non-finite bounded impulse Beta PPO density".into(),
         ));
     }
-    Ok(StickBreakingEvaluation {
+    Ok(ImpulseBetaEvaluation {
         log_probability,
         entropy,
         decisions,
     })
+}
+
+#[cfg(test)]
+fn evaluate_impulse_beta_sample(
+    logits: &[f32],
+    tradable: &[bool],
+    sample: &PolicyActionSample,
+    temperature: f32,
+    config: &ActionDistributionConfig,
+) -> Result<ImpulseBetaEvaluation> {
+    evaluate_incremental_trade_sample(logits, tradable, sample, temperature, config)
 }
 
 fn beta_shapes(
@@ -1870,10 +1877,10 @@ impl Policy for CashPolicy {
         &mut self,
         _observation: &Observation,
         c: &PolicyContext<'_>,
-    ) -> Result<ProposedAllocation> {
+    ) -> Result<ProposedAction> {
         let mut w = vec![0.0; c.tradable.len() + 1];
         w[0] = 1.0;
-        Ok(ProposedAllocation::rebalance(w))
+        Ok(ProposedAction::Allocation(ProposedAllocation::rebalance(w)))
     }
     fn snapshot(&self) -> Result<PolicySnapshot> {
         Ok(PolicySnapshot::Cash)
@@ -1892,7 +1899,7 @@ impl Policy for EqualWeightPolicy {
         &mut self,
         observation: &Observation,
         c: &PolicyContext<'_>,
-    ) -> Result<ProposedAllocation> {
+    ) -> Result<ProposedAction> {
         let n = c.tradable.iter().filter(|v| **v).count();
         if n == 0 {
             return CashPolicy.propose_action(observation, c);
@@ -1903,7 +1910,7 @@ impl Policy for EqualWeightPolicy {
                 w[i + 1] = 1.0 / n as f64
             }
         }
-        Ok(ProposedAllocation::rebalance(w))
+        Ok(ProposedAction::Allocation(ProposedAllocation::rebalance(w)))
     }
     fn snapshot(&self) -> Result<PolicySnapshot> {
         Ok(PolicySnapshot::EqualWeight)
@@ -1927,16 +1934,12 @@ impl RandomPolicy {
     }
 }
 impl Policy for RandomPolicy {
-    fn propose_action(
-        &mut self,
-        _: &Observation,
-        c: &PolicyContext<'_>,
-    ) -> Result<ProposedAllocation> {
-        Ok(ProposedAllocation::rebalance(
+    fn propose_action(&mut self, _: &Observation, c: &PolicyContext<'_>) -> Result<ProposedAction> {
+        Ok(ProposedAction::Allocation(ProposedAllocation::rebalance(
             (0..=c.tradable.len())
                 .map(|_| self.rng.gen_range(0.0001..1.0))
                 .collect(),
-        ))
+        )))
     }
     fn snapshot(&self) -> Result<PolicySnapshot> {
         Ok(PolicySnapshot::Random {
@@ -1966,13 +1969,11 @@ impl BuyAndHoldPolicy {
     }
 }
 impl Policy for BuyAndHoldPolicy {
-    fn propose_action(
-        &mut self,
-        _: &Observation,
-        c: &PolicyContext<'_>,
-    ) -> Result<ProposedAllocation> {
+    fn propose_action(&mut self, _: &Observation, c: &PolicyContext<'_>) -> Result<ProposedAction> {
         if self.initialized {
-            return Ok(ProposedAllocation::hold(c.current_allocations.to_vec()));
+            return Ok(ProposedAction::Allocation(ProposedAllocation::hold(
+                c.current_allocations.to_vec(),
+            )));
         }
         self.initialized = true;
         let mut w = vec![0.0; c.tradable.len() + 1];
@@ -1981,7 +1982,7 @@ impl Policy for BuyAndHoldPolicy {
         } else {
             w[0] = 1.0
         }
-        Ok(ProposedAllocation::rebalance(w))
+        Ok(ProposedAction::Allocation(ProposedAllocation::rebalance(w)))
     }
     fn snapshot(&self) -> Result<PolicySnapshot> {
         Ok(PolicySnapshot::BuyAndHold {
@@ -2062,11 +2063,8 @@ mod tests {
             action_sample: Some(PolicyActionSample {
                 active_asset_indices: vec![0],
                 latent_samples: vec![if action_index == 0 { 0.25 } else { 0.75 }],
-                allocation: vec![
-                    if action_index == 0 { 0.75 } else { 0.25 },
-                    if action_index == 0 { 0.25 } else { 0.75 },
-                ],
-                maximum_asset_allocation: 1.0,
+                trade_impulses: vec![if action_index == 0 { -0.5 } else { 0.5 }],
+                maximum_trade_fraction: 0.05,
                 log_probability: old_log_probability,
                 entropy: 0.0,
             }),
@@ -2151,8 +2149,8 @@ mod tests {
                 action_sample: Some(PolicyActionSample {
                     active_asset_indices: vec![0],
                     latent_samples: vec![0.5],
-                    allocation: vec![0.5, 0.5],
-                    maximum_asset_allocation: 1.0,
+                    trade_impulses: vec![0.0],
+                    maximum_trade_fraction: 0.05,
                     log_probability: -std::f32::consts::LN_2,
                     entropy: 0.0,
                 }),
@@ -2379,7 +2377,7 @@ mod tests {
         let output_b = model
             .evaluate_representation(&state_b.representation)
             .unwrap();
-        let evaluation_a = bounded_stick_breaking_evaluation(
+        let evaluation_a = bounded_impulse_beta_evaluation(
             output_a,
             &[true],
             1.0,
@@ -2389,7 +2387,7 @@ mod tests {
             &model.architecture.action_distribution,
         )
         .unwrap();
-        let evaluation_b = bounded_stick_breaking_evaluation(
+        let evaluation_b = bounded_impulse_beta_evaluation(
             output_b,
             &[true],
             1.0,
@@ -2399,18 +2397,17 @@ mod tests {
             &model.architecture.action_distribution,
         )
         .unwrap();
-        assert!(
-            evaluation_a.proposed_allocation.weights()[1]
-                > evaluation_b.proposed_allocation.weights()[1]
-        );
-        assert!(
-            evaluation_a.proposed_allocation.weights()[1]
-                > 1.0 - evaluation_a.proposed_allocation.weights()[1]
-        );
-        assert!(
-            evaluation_b.proposed_allocation.weights()[0]
-                > evaluation_b.proposed_allocation.weights()[1]
-        );
+        let impulse_a = match evaluation_a.proposed_action {
+            ProposedAction::TradeImpulses(value) => value.impulses[0],
+            ProposedAction::Allocation(_) => panic!("expected impulse action"),
+        };
+        let impulse_b = match evaluation_b.proposed_action {
+            ProposedAction::TradeImpulses(value) => value.impulses[0],
+            ProposedAction::Allocation(_) => panic!("expected impulse action"),
+        };
+        assert!(impulse_a > impulse_b);
+        assert!(impulse_a > 0.0);
+        assert!(impulse_b < 0.0);
     }
 
     #[test]
@@ -2527,13 +2524,13 @@ mod tests {
     }
 
     #[test]
-    fn bounded_stick_breaking_is_masked_and_seed_reproducible() {
+    fn bounded_impulse_beta_is_masked_and_seed_reproducible() {
         let output = NeuralOutput {
             logits: vec![0.0, 2.0, 0.0, 1.0],
             value: 0.0,
         };
         let mut deterministic_rng = ChaCha8Rng::seed_from_u64(1);
-        let deterministic = bounded_stick_breaking_evaluation(
+        let deterministic = bounded_impulse_beta_evaluation(
             output.clone(),
             &[true, false],
             0.5,
@@ -2543,20 +2540,15 @@ mod tests {
             &ActionDistributionConfig::default(),
         )
         .unwrap();
-        assert!(
-            (deterministic
-                .proposed_allocation
-                .weights()
-                .iter()
-                .sum::<f64>()
-                - 1.0)
-                .abs()
-                < 1e-9
-        );
-        assert_eq!(deterministic.proposed_allocation.weights()[2], 0.0);
+        let impulses = match deterministic.proposed_action {
+            ProposedAction::TradeImpulses(value) => value.impulses,
+            ProposedAction::Allocation(_) => panic!("expected impulse action"),
+        };
+        assert_eq!(impulses.len(), 2);
+        assert_eq!(impulses[1], 0.0);
         let mut left_rng = ChaCha8Rng::seed_from_u64(5);
         let mut right_rng = ChaCha8Rng::seed_from_u64(5);
-        let left = bounded_stick_breaking_evaluation(
+        let left = bounded_impulse_beta_evaluation(
             output.clone(),
             &[true, true],
             0.5,
@@ -2566,7 +2558,7 @@ mod tests {
             &ActionDistributionConfig::default(),
         )
         .unwrap();
-        let right = bounded_stick_breaking_evaluation(
+        let right = bounded_impulse_beta_evaluation(
             output,
             &[true, true],
             0.5,
@@ -2580,13 +2572,13 @@ mod tests {
     }
 
     #[test]
-    fn neural_policy_can_allocate_positive_weight_to_two_assets() {
+    fn neural_policy_can_request_two_asset_impulses() {
         let output = NeuralOutput {
             logits: vec![0.0, 0.0, 0.0, 0.0],
             value: 0.0,
         };
         let mut rng = ChaCha8Rng::seed_from_u64(9);
-        let evaluation = bounded_stick_breaking_evaluation(
+        let evaluation = bounded_impulse_beta_evaluation(
             output,
             &[true, true],
             0.5,
@@ -2596,16 +2588,16 @@ mod tests {
             &ActionDistributionConfig::default(),
         )
         .unwrap();
-        let weights = evaluation.proposed_allocation.weights();
-        assert!(weights[1] > 0.0, "first asset must receive positive weight");
-        assert!(
-            weights[2] > 0.0,
-            "second asset must receive positive weight"
-        );
+        let impulses = match evaluation.proposed_action {
+            ProposedAction::TradeImpulses(value) => value.impulses,
+            ProposedAction::Allocation(_) => panic!("expected impulse action"),
+        };
+        assert!(impulses.iter().all(|value| (-1.0..=1.0).contains(value)));
+        assert_eq!(impulses.len(), 2);
     }
 
     #[test]
-    fn bounded_stick_breaking_distribution_is_valid_across_masks_caps_and_seeds() {
+    fn bounded_impulse_beta_distribution_is_valid_across_masks_caps_and_seeds() {
         for (tradable, cap) in [
             (vec![true, true, true], 1.0),
             (vec![true, false, true], 0.5),
@@ -2617,7 +2609,7 @@ mod tests {
                     logits: vec![0.3, -0.2, 1.0, -1.0, -0.7, 0.8],
                     value: 0.0,
                 };
-                let evaluation = bounded_stick_breaking_evaluation(
+                let evaluation = bounded_impulse_beta_evaluation(
                     output,
                     &tradable,
                     cap,
@@ -2627,19 +2619,19 @@ mod tests {
                     &ActionDistributionConfig::default(),
                 )
                 .unwrap();
-                let weights = evaluation.proposed_allocation.weights();
-                assert_eq!(weights.len(), 4);
+                let impulses = match evaluation.proposed_action {
+                    ProposedAction::TradeImpulses(value) => value.impulses,
+                    ProposedAction::Allocation(_) => panic!("expected impulse action"),
+                };
+                assert_eq!(impulses.len(), 3);
                 assert!(
-                    weights
+                    impulses
                         .iter()
-                        .all(|weight| weight.is_finite() && *weight >= 0.0)
+                        .all(|value| value.is_finite() && (-1.0..=1.0).contains(value))
                 );
-                assert!((weights.iter().sum::<f64>() - 1.0).abs() < 1e-9);
                 for (index, is_tradable) in tradable.iter().enumerate() {
                     if !is_tradable {
-                        assert_eq!(weights[index + 1], 0.0);
-                    } else {
-                        assert!(weights[index + 1] <= cap + 1e-9);
+                        assert_eq!(impulses[index], 0.0);
                     }
                 }
             }
@@ -2647,13 +2639,13 @@ mod tests {
     }
 
     #[test]
-    fn bounded_stick_breaking_log_probability_recomputes_exactly() {
+    fn bounded_impulse_beta_log_probability_recomputes_exactly() {
         let output = NeuralOutput {
             logits: vec![0.3, -0.2, 1.0, -1.0, -0.7, 0.8],
             value: 0.0,
         };
         let config = ActionDistributionConfig::default();
-        let evaluation = bounded_stick_breaking_evaluation(
+        let evaluation = bounded_impulse_beta_evaluation(
             output.clone(),
             &[true, false, true],
             0.5,
@@ -2664,7 +2656,7 @@ mod tests {
         )
         .unwrap();
         let sample = evaluation.action_sample.as_ref().unwrap();
-        let recomputed = evaluate_bounded_stick_breaking_sample(
+        let recomputed = evaluate_impulse_beta_sample(
             &output.logits,
             &[true, false, true],
             sample,
@@ -2677,14 +2669,14 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_stick_breaking_evaluation_does_not_consume_rng() {
+    fn deterministic_impulse_evaluation_does_not_consume_rng() {
         let output = NeuralOutput {
             logits: vec![0.0, 0.0, 0.0, 0.0],
             value: 0.0,
         };
         let mut rng = ChaCha8Rng::seed_from_u64(77);
         let mut expected = rng.clone();
-        bounded_stick_breaking_evaluation(
+        bounded_impulse_beta_evaluation(
             output,
             &[true, true],
             0.5,
@@ -2698,8 +2690,8 @@ mod tests {
     }
 
     #[test]
-    fn sampled_valid_allocation_survives_central_validation_unchanged() {
-        let evaluation = bounded_stick_breaking_evaluation(
+    fn sampled_valid_impulses_survive_central_validation_unchanged() {
+        let evaluation = bounded_impulse_beta_evaluation(
             NeuralOutput {
                 logits: vec![0.2, -0.3, 0.4, 0.1],
                 value: 0.0,
@@ -2712,25 +2704,28 @@ mod tests {
             &ActionDistributionConfig::default(),
         )
         .unwrap();
-        let proposed = evaluation.proposed_allocation.clone();
+        let proposed = evaluation.proposed_action.clone();
         let validated = LongOnlyActionValidator
-            .validate(
-                proposed,
+            .validate_action(
+                proposed.clone(),
                 &ActionValidationContext {
                     asset_count: 2,
                     tradable: &[true, true],
-                    policy_maximum_asset_allocation: Some(0.5),
+                    policy_maximum_asset_allocation: None,
+                    policy_maximum_trade_fraction: None,
                     market_maximum_asset_allocation: None,
                 },
             )
             .unwrap();
-        assert!(
-            validated
-                .weights()
-                .iter()
-                .zip(evaluation.proposed_allocation.weights())
-                .all(|(actual, proposed)| (actual - proposed).abs() < 1e-9)
-        );
+        match (proposed, validated) {
+            (
+                ProposedAction::TradeImpulses(a),
+                crate::action::ValidatedAction::TradeImpulses(b),
+            ) => {
+                assert_eq!(a.impulses, b.impulses());
+            }
+            _ => panic!("expected impulse validation"),
+        }
     }
 
     #[test]

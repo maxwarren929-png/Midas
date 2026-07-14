@@ -131,6 +131,8 @@ pub struct BrainConfig {
     pub traits: EvolvableTraitsConfig,
     #[serde(default)]
     pub action_distribution: ActionDistributionConfig,
+    #[serde(default)]
+    pub trading: TradingConfig,
 }
 fn default_activation() -> Activation {
     Activation::Gelu
@@ -160,6 +162,8 @@ pub enum PolicyKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionDistributionKind {
+    BoundedImpulseBeta,
+    #[serde(rename = "bounded_stick_breaking")]
     BoundedStickBreaking,
 }
 
@@ -186,7 +190,7 @@ pub struct ActionDistributionConfig {
 }
 
 fn default_action_distribution_kind() -> ActionDistributionKind {
-    ActionDistributionKind::BoundedStickBreaking
+    ActionDistributionKind::BoundedImpulseBeta
 }
 fn default_minimum_shape() -> f32 {
     0.1
@@ -209,6 +213,25 @@ impl Default for ActionDistributionConfig {
             maximum_shape: default_maximum_shape(),
             latent_epsilon: default_latent_epsilon(),
             asset_order: default_asset_order(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TradingConfig {
+    #[serde(default = "default_maximum_trade_fraction")]
+    pub maximum_trade_fraction: f64,
+}
+
+fn default_maximum_trade_fraction() -> f64 {
+    0.05
+}
+
+impl Default for TradingConfig {
+    fn default() -> Self {
+        Self {
+            maximum_trade_fraction: default_maximum_trade_fraction(),
         }
     }
 }
@@ -788,7 +811,7 @@ impl Config {
         }
         if !matches!(
             self.brain.action_distribution.kind,
-            ActionDistributionKind::BoundedStickBreaking
+            ActionDistributionKind::BoundedImpulseBeta
         ) || !self.brain.action_distribution.minimum_shape.is_finite()
             || !self.brain.action_distribution.maximum_shape.is_finite()
             || !self.brain.action_distribution.latent_epsilon.is_finite()
@@ -798,7 +821,13 @@ impl Config {
             || !(0.0..0.5).contains(&self.brain.action_distribution.latent_epsilon)
             || self.brain.action_distribution.latent_epsilon == 0.0
         {
-            return bad("bounded stick-breaking action distribution parameters are invalid");
+            return bad("bounded impulse Beta action distribution parameters are invalid");
+        }
+        if !self.brain.trading.maximum_trade_fraction.is_finite()
+            || self.brain.trading.maximum_trade_fraction <= 0.0
+            || self.brain.trading.maximum_trade_fraction > 1.0
+        {
+            return bad("brain.trading.maximum_trade_fraction must be in (0, 1]");
         }
         for (name, value) in [
             ("learning_rate", &self.brain.traits.learning_rate),

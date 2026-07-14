@@ -2,8 +2,8 @@ pub use crate::PolicyFailureCategory;
 use crate::{
     AgentId, AssetId, MidasError, Result,
     action::{
-        ActionValidationContext, ActionValidator, LongOnlyActionValidator, ProposedAllocation,
-        ValidatedAllocation,
+        ActionValidationContext, ActionValidator, LongOnlyActionValidator, ProposedAction,
+        ProposedAllocation, ValidatedAction,
     },
     agent::{
         Agent, AgentBuildContext, AgentFactory, AgentSpawnRequest, SpawnMetadata,
@@ -36,11 +36,11 @@ use crate::{
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
-// Version 9 replaces the categorical single-asset action sample and actor
-// layout with bounded stick-breaking Beta latents. Checkpoint 8 cannot be
-// safely migrated because its rollout samples and actor tensors have a
-// different action identity and output dimension.
-pub const CHECKPOINT_VERSION: u32 = 9;
+// Version 11 replaces target allocations with persistent incremental trade
+// impulses and persists their diagnostics in the checkpointed metrics state.
+// Older checkpoints contain incompatible action samples or state layouts and
+// cannot be migrated safely.
+pub const CHECKPOINT_VERSION: u32 = 11;
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum DatasetSplit {
     Training,
@@ -210,6 +210,18 @@ pub struct DecisionTrace {
     pub action_allocations: Vec<f64>,
     pub active_asset_indices: Vec<usize>,
     pub latent_samples: Vec<f32>,
+    pub requested_trade_impulses: Vec<f64>,
+    pub executed_trade_impulses: Vec<f64>,
+    pub trade_scaling_factor: f64,
+    pub requested_buy_notional: f64,
+    pub requested_sell_notional: f64,
+    pub executed_buy_notional: f64,
+    pub executed_sell_notional: f64,
+    pub rejected_notional: f64,
+    pub cash_before: f64,
+    pub cash_after: f64,
+    pub holdings_before: Vec<f64>,
+    pub holdings_after: Vec<f64>,
     pub order_position_allocations: Vec<f64>,
     pub cash_allocation: f64,
     pub maximum_concentration: f64,
@@ -314,6 +326,16 @@ struct TradeSummary {
     trade_count: usize,
     buy_notional: f64,
     sell_notional: f64,
+    requested_trade_impulses: Vec<f64>,
+    executed_trade_impulses: Vec<f64>,
+    trade_scaling_factor: f64,
+    requested_buy_notional: f64,
+    requested_sell_notional: f64,
+    rejected_notional: f64,
+    cash_before: f64,
+    cash_after: f64,
+    holdings_before: Vec<f64>,
+    holdings_after: Vec<f64>,
 }
 struct AdvanceResult {
     events: Vec<DomainEvent>,
@@ -331,14 +353,14 @@ struct PolicyFailureIncident {
 }
 enum PolicyDecisionOutcome {
     Valid {
-        validated: crate::action::ValidatedAllocation,
+        validated: ValidatedAction,
         observation: crate::observation::Observation,
         evaluation: crate::brain::PolicyEvaluation,
         runtime_before: Option<crate::brain::NeuralRuntimeState>,
     },
     RecoverableFailure {
         incident: PolicyFailureIncident,
-        fallback: crate::action::ValidatedAllocation,
+        fallback: ValidatedAction,
         observation: Option<crate::observation::Observation>,
         evaluation: Option<crate::brain::PolicyEvaluation>,
         runtime_before: Option<crate::brain::NeuralRuntimeState>,
@@ -856,9 +878,8 @@ impl SimulationEngine {
                 .map(|genome| genome.traits.maximum_allocation as f64)
                 .unwrap_or(self.config.brain.traits.maximum_allocation.initial as f64);
             let policy_cap = match agent.policy.policy_blueprint() {
-                crate::brain::PolicyBlueprint::Neural | crate::brain::PolicyBlueprint::Random => {
-                    Some(maximum_asset_allocation)
-                }
+                crate::brain::PolicyBlueprint::Random => Some(maximum_asset_allocation),
+                crate::brain::PolicyBlueprint::Neural => None,
                 crate::brain::PolicyBlueprint::Cash
                 | crate::brain::PolicyBlueprint::EqualWeight
                 | crate::brain::PolicyBlueprint::BuyAndHold { .. } => None,
@@ -867,6 +888,11 @@ impl SimulationEngine {
                 asset_count: self.data.assets.len(),
                 tradable: &tradable,
                 policy_maximum_asset_allocation: policy_cap,
+                policy_maximum_trade_fraction: matches!(
+                    agent.policy.policy_blueprint(),
+                    crate::brain::PolicyBlueprint::Neural
+                )
+                .then_some(self.config.brain.trading.maximum_trade_fraction),
                 market_maximum_asset_allocation: None,
             };
             let outcome = self.decide_policy(
@@ -887,13 +913,17 @@ impl SimulationEngine {
                     if matches!(
                         agent.policy.policy_blueprint(),
                         crate::brain::PolicyBlueprint::Neural
-                    ) {
-                        transaction.allocation_stats.record(validated.weights())?;
+                    ) && let ValidatedAction::Allocation(allocation) = &validated
+                    {
+                        transaction.allocation_stats.record(allocation.weights())?;
                     }
                     let trace_observation = observation.clone();
                     let trace_evaluation = evaluation.clone();
                     let trace_runtime_before = runtime_before.clone();
-                    let action_allocations = validated.weights().to_vec();
+                    let mut action_allocations = match &validated {
+                        ValidatedAction::Allocation(allocation) => allocation.weights().to_vec(),
+                        ValidatedAction::TradeImpulses(_) => allocations.clone(),
+                    };
                     let advanced = self.advance_agent(
                         agent,
                         &validated,
@@ -905,6 +935,18 @@ impl SimulationEngine {
                         &actions,
                         false,
                     )?;
+                    if matches!(
+                        agent.policy.policy_blueprint(),
+                        crate::brain::PolicyBlueprint::Neural
+                    ) {
+                        action_allocations = agent.state.portfolio.allocations(&next_prices)?;
+                        transaction.allocation_stats.record(&action_allocations)?;
+                        if let ValidatedAction::TradeImpulses(impulses) = &validated {
+                            transaction
+                                .allocation_stats
+                                .record_impulses(impulses.impulses())?;
+                        }
+                    }
                     transaction.events.extend(advanced.events.clone());
                     let next_value = if advanced.death.is_none()
                         && self.config.learning.implementation == LearningKind::Ppo
@@ -969,8 +1011,9 @@ impl SimulationEngine {
                     if matches!(
                         agent.policy.policy_blueprint(),
                         crate::brain::PolicyBlueprint::Neural
-                    ) {
-                        transaction.allocation_stats.record(fallback.weights())?;
+                    ) && let ValidatedAction::Allocation(allocation) = &fallback
+                    {
+                        transaction.allocation_stats.record(allocation.weights())?;
                     }
                     let failure_event =
                         self.policy_failure_event(agent, observation_date, incident.clone());
@@ -979,7 +1022,10 @@ impl SimulationEngine {
                         agent_id: agent.state.id,
                         date: observation_date,
                     });
-                    let action_allocations = fallback.weights().to_vec();
+                    let mut action_allocations = match &fallback {
+                        ValidatedAction::Allocation(allocation) => allocation.weights().to_vec(),
+                        ValidatedAction::TradeImpulses(_) => allocations.clone(),
+                    };
                     let trace_observation = observation.clone();
                     let trace_evaluation = evaluation.clone();
                     let trace_runtime_before = runtime_before.clone();
@@ -994,6 +1040,18 @@ impl SimulationEngine {
                         &actions,
                         true,
                     )?;
+                    if matches!(
+                        agent.policy.policy_blueprint(),
+                        crate::brain::PolicyBlueprint::Neural
+                    ) {
+                        action_allocations = agent.state.portfolio.allocations(&next_prices)?;
+                        transaction.allocation_stats.record(&action_allocations)?;
+                        if let ValidatedAction::TradeImpulses(impulses) = &fallback {
+                            transaction
+                                .allocation_stats
+                                .record_impulses(impulses.impulses())?;
+                        }
+                    }
                     transaction.events.extend(advanced.events.clone());
                     let next_value = if advanced.death.is_none()
                         && evaluation.is_some()
@@ -1148,10 +1206,17 @@ impl SimulationEngine {
             agent.policy.policy_blueprint(),
             crate::brain::PolicyBlueprint::Neural
         );
-        let evaluation_cap = action_context
-            .policy_maximum_asset_allocation
-            .or(action_context.market_maximum_asset_allocation)
-            .unwrap_or(1.0);
+        let evaluation_cap = if matches!(
+            agent.policy.policy_blueprint(),
+            crate::brain::PolicyBlueprint::Neural
+        ) {
+            self.config.brain.trading.maximum_trade_fraction
+        } else {
+            action_context
+                .policy_maximum_asset_allocation
+                .or(action_context.market_maximum_asset_allocation)
+                .unwrap_or(1.0)
+        };
         let runtime_before = agent.policy.runtime_state();
         let evaluation = match agent.policy.evaluate_action(
             &observation,
@@ -1181,7 +1246,7 @@ impl SimulationEngine {
         };
         let validated = match self
             .validator
-            .validate(evaluation.proposed_allocation.clone(), action_context)
+            .validate_action(evaluation.proposed_action.clone(), action_context)
         {
             Ok(validated) => validated,
             Err(error) => {
@@ -1200,13 +1265,16 @@ impl SimulationEngine {
                 );
             }
         };
-        if validated.used_fallback() {
+        if matches!(&validated, ValidatedAction::Allocation(value) if value.used_fallback()) {
             let incident = PolicyFailureIncident {
                 category: PolicyFailureCategory::InvalidOutput,
-                message: validated
-                    .fallback_reason()
-                    .unwrap_or("invalid policy output")
-                    .to_string(),
+                message: match &validated {
+                    ValidatedAction::Allocation(value) => value
+                        .fallback_reason()
+                        .unwrap_or("invalid policy output")
+                        .to_string(),
+                    ValidatedAction::TradeImpulses(_) => "invalid policy output".into(),
+                },
             };
             self.failure_outcome(
                 agent,
@@ -1234,7 +1302,7 @@ impl SimulationEngine {
         agent: &mut Agent,
         incident: PolicyFailureIncident,
         action_context: &ActionValidationContext<'_>,
-        fallback: Option<ValidatedAllocation>,
+        fallback: Option<ValidatedAction>,
         observation: Option<crate::observation::Observation>,
         evaluation: Option<crate::brain::PolicyEvaluation>,
         runtime_before: Option<crate::brain::NeuralRuntimeState>,
@@ -1255,15 +1323,17 @@ impl SimulationEngine {
             _ => {
                 let fallback = match fallback {
                     Some(value) => value,
-                    None => self.validator.validate(
-                        ProposedAllocation::rebalance(vec![
+                    None => self.validator.validate_action(
+                        ProposedAction::Allocation(ProposedAllocation::rebalance(vec![
                             f64::NAN;
-                            action_context.asset_count + 1
-                        ]),
+                            action_context.asset_count
+                                + 1
+                        ])),
                         action_context,
                     )?,
                 };
-                if !fallback.used_fallback() {
+                if !matches!(&fallback, ValidatedAction::Allocation(value) if value.used_fallback())
+                {
                     return Err(MidasError::Policy(
                         "cash fallback did not produce a validated fallback allocation".into(),
                     ));
@@ -1298,7 +1368,7 @@ impl SimulationEngine {
     fn advance_agent(
         &self,
         agent: &mut Agent,
-        validated: &ValidatedAllocation,
+        validated: &ValidatedAction,
         _observation_date: NaiveDate,
         execution_date: NaiveDate,
         current_prices: &[Option<f64>],
@@ -1309,6 +1379,15 @@ impl SimulationEngine {
     ) -> Result<AdvanceResult> {
         let mut events = Vec::new();
         let turnover_before = agent.state.portfolio.cumulative_turnover;
+        let cash_before = agent.state.portfolio.cash;
+        let holdings_before = agent
+            .state
+            .portfolio
+            .positions
+            .iter()
+            .map(|position| position.quantity)
+            .collect::<Vec<_>>();
+        let current_worth = agent.state.portfolio.value(current_prices)?;
         // Actions take effect at the next open, in the canonical split then
         // dividend order supplied by MarketDataset.
         for action in actions {
@@ -1319,7 +1398,7 @@ impl SimulationEngine {
                 action: action.clone(),
             });
         }
-        let plan = self.planner.plan(
+        let plan = self.planner.plan_action(
             &agent.state.portfolio,
             validated,
             &ExecutionSnapshot {
@@ -1329,6 +1408,31 @@ impl SimulationEngine {
             self.config.simulation.minimum_trade_value,
         )?;
         let report = self.applier.apply(&mut agent.state.portfolio, &plan)?;
+        let mut requested_trade_impulses = Vec::new();
+        let mut executed_trade_impulses = Vec::new();
+        if let ValidatedAction::TradeImpulses(impulses) = validated {
+            requested_trade_impulses = impulses.impulses().to_vec();
+            executed_trade_impulses = vec![0.0; impulses.impulses().len()];
+            let denominator = current_worth * impulses.maximum_trade_fraction();
+            if denominator > 0.0 && denominator.is_finite() {
+                for trade in &report.trades {
+                    if let Some(index) = agent
+                        .state
+                        .portfolio
+                        .positions
+                        .iter()
+                        .position(|position| position.asset_id == trade.asset_id)
+                    {
+                        let sign = if matches!(trade.side, crate::execution::TradeSide::Buy) {
+                            1.0
+                        } else {
+                            -1.0
+                        };
+                        executed_trade_impulses[index] += sign * trade.notional / denominator;
+                    }
+                }
+            }
+        }
         let commission_cost = report
             .trades
             .iter()
@@ -1344,7 +1448,7 @@ impl SimulationEngine {
             .iter()
             .map(|trade| trade.slippage_cost)
             .sum::<f64>();
-        let trade_summary = TradeSummary {
+        let mut trade_summary = TradeSummary {
             transaction_cost: commission_cost + spread_cost + slippage_cost,
             commission_cost,
             spread_cost,
@@ -1363,6 +1467,22 @@ impl SimulationEngine {
                 .filter(|trade| matches!(trade.side, crate::execution::TradeSide::Sell))
                 .map(|trade| trade.notional)
                 .sum(),
+            requested_trade_impulses,
+            executed_trade_impulses,
+            trade_scaling_factor: plan.affordability_scale,
+            requested_buy_notional: plan.requested_buy_notional,
+            requested_sell_notional: plan.requested_sell_notional,
+            rejected_notional: plan.rejected_notional,
+            cash_before,
+            cash_after: agent.state.portfolio.cash,
+            holdings_before,
+            holdings_after: agent
+                .state
+                .portfolio
+                .positions
+                .iter()
+                .map(|position| position.quantity)
+                .collect(),
         };
         for trade in report.trades {
             events.push(DomainEvent::TradeExecuted {
@@ -1405,10 +1525,15 @@ impl SimulationEngine {
         };
         let reward_breakdown = self.reward_function.breakdown(&reward_context)?;
         let reward = reward_breakdown.clipped_total;
-        let trade_summary = TradeSummary {
-            turnover: reward_context.turnover,
-            ..trade_summary
-        };
+        trade_summary.turnover = reward_context.turnover;
+        trade_summary.cash_after = agent.state.portfolio.cash;
+        trade_summary.holdings_after = agent
+            .state
+            .portfolio
+            .positions
+            .iter()
+            .map(|position| position.quantity)
+            .collect();
         events.push(DomainEvent::Valuation {
             agent_id: agent.state.id,
             date: execution_date,
@@ -1519,6 +1644,18 @@ impl SimulationEngine {
             action_allocations: action_allocations.to_vec(),
             active_asset_indices,
             latent_samples,
+            requested_trade_impulses: advanced.trade.requested_trade_impulses.clone(),
+            executed_trade_impulses: advanced.trade.executed_trade_impulses.clone(),
+            trade_scaling_factor: advanced.trade.trade_scaling_factor,
+            requested_buy_notional: advanced.trade.requested_buy_notional,
+            requested_sell_notional: advanced.trade.requested_sell_notional,
+            executed_buy_notional: advanced.trade.buy_notional,
+            executed_sell_notional: advanced.trade.sell_notional,
+            rejected_notional: advanced.trade.rejected_notional,
+            cash_before: advanced.trade.cash_before,
+            cash_after: advanced.trade.cash_after,
+            holdings_before: advanced.trade.holdings_before.clone(),
+            holdings_after: advanced.trade.holdings_after.clone(),
             order_position_allocations,
             cash_allocation,
             maximum_concentration,
@@ -1568,12 +1705,7 @@ impl SimulationEngine {
             episode_steps: self.features.len() - 1,
         })?;
         let allocations = agent.state.portfolio.allocations(prices)?;
-        let maximum_asset_allocation = agent
-            .state
-            .genome
-            .as_ref()
-            .map(|genome| genome.traits.maximum_allocation as f64)
-            .unwrap_or(self.config.brain.traits.maximum_allocation.initial as f64);
+        let maximum_asset_allocation = self.config.brain.trading.maximum_trade_fraction;
         let evaluation = policy.evaluate_action(
             &observation,
             &PolicyContext {
@@ -1598,7 +1730,7 @@ impl SimulationEngine {
         agent: &mut Agent,
         observation: Option<crate::observation::Observation>,
         evaluation: Option<crate::brain::PolicyEvaluation>,
-        action: ValidatedAllocation,
+        action: ValidatedAction,
         reward: f32,
         next_value: Option<f32>,
         done: bool,
@@ -2081,9 +2213,9 @@ impl SimulationEngine {
         factory: Box<dyn AgentFactory>,
     ) -> Result<Self> {
         let bytes = fs::read(path)?;
-        let cp: Checkpoint = bincode::deserialize(&bytes).map_err(|_| {
+        let cp: Checkpoint = bincode::deserialize(&bytes).map_err(|error| {
             MidasError::Checkpoint(format!(
-                "incompatible checkpoint; expected format version {CHECKPOINT_VERSION}; older files use an incompatible neural action-sample layout"
+                "incompatible checkpoint; expected format version {CHECKPOINT_VERSION}; older files use an incompatible neural action-sample layout: {error}"
             ))
         })?;
         if cp.version != CHECKPOINT_VERSION {
@@ -2209,9 +2341,9 @@ impl SimulationEngine {
         split: DatasetSplit,
     ) -> Result<Self> {
         let bytes = fs::read(path)?;
-        let cp: Checkpoint = bincode::deserialize(&bytes).map_err(|_| {
+        let cp: Checkpoint = bincode::deserialize(&bytes).map_err(|error| {
             MidasError::Checkpoint(format!(
-                "incompatible checkpoint; expected format version {CHECKPOINT_VERSION}; older files use an incompatible neural action-sample layout"
+                "incompatible checkpoint; expected format version {CHECKPOINT_VERSION}; older files use an incompatible neural action-sample or metrics layout: {error}"
             ))
         })?;
         if cp.version != CHECKPOINT_VERSION {
@@ -2272,7 +2404,10 @@ impl SimulationEngine {
             state.alive = true;
             state.total_policy_failures = 0;
             state.consecutive_policy_failures = 0;
-            let snapshot = reset_evaluation_snapshot(checkpoint_agent.policy)?;
+            let snapshot = reset_evaluation_snapshot(
+                checkpoint_agent.policy,
+                engine.config.brain.trading.maximum_trade_fraction,
+            )?;
             let mut agent = factory.restore(
                 state,
                 snapshot,
@@ -2363,6 +2498,23 @@ impl SimulationEngine {
             } else {
                 0.0
             },
+            neural_mean_abs_trade_impulse: if self.metrics.neural_impulse_count > 0 {
+                self.metrics.neural_abs_impulse_total / self.metrics.neural_impulse_count as f64
+            } else {
+                0.0
+            },
+            neural_small_trade_impulse_fraction: if self.metrics.neural_impulse_count > 0 {
+                self.metrics.neural_small_impulse_count as f64
+                    / self.metrics.neural_impulse_count as f64
+            } else {
+                0.0
+            },
+            neural_saturated_trade_impulse_fraction: if self.metrics.neural_impulse_count > 0 {
+                self.metrics.neural_saturated_impulse_count as f64
+                    / self.metrics.neural_impulse_count as f64
+            } else {
+                0.0
+            },
             active_lineages: self.evolution.metrics.active_lineages,
             lifecycle: self.lifecycle.clone(),
             failure_reason: match &self.lifecycle {
@@ -2391,12 +2543,18 @@ pub struct SimulationReport {
     pub neural_mean_active_positions: f64,
     pub neural_mean_concentration: f64,
     pub neural_mean_cash_allocation: f64,
+    pub neural_mean_abs_trade_impulse: f64,
+    pub neural_small_trade_impulse_fraction: f64,
+    pub neural_saturated_trade_impulse_fraction: f64,
     pub active_lineages: u64,
     pub lifecycle: SimulationLifecycle,
     pub failure_reason: Option<String>,
 }
 
-fn reset_evaluation_snapshot(snapshot: PolicySnapshot) -> Result<PolicySnapshot> {
+fn reset_evaluation_snapshot(
+    snapshot: PolicySnapshot,
+    maximum_trade_fraction: f64,
+) -> Result<PolicySnapshot> {
     match snapshot {
         PolicySnapshot::Neural {
             genome, state, rng, ..
@@ -2425,6 +2583,7 @@ fn reset_evaluation_snapshot(snapshot: PolicySnapshot) -> Result<PolicySnapshot>
                 genome,
                 state: Box::new(state),
                 rng,
+                maximum_trade_fraction,
             })
         }
         other => Ok(other),

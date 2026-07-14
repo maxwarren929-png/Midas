@@ -1,6 +1,6 @@
 use crate::{
     AssetId, MidasError, Result,
-    action::ValidatedAllocation,
+    action::{ValidatedAction, ValidatedAllocation, ValidatedTradeImpulses},
     config::ExecutionConfig,
     market::{CorporateAction, MarketBar},
 };
@@ -203,6 +203,12 @@ pub struct ExecutionPlan {
     pub trades: Vec<PlannedTrade>,
     pub rejected_assets: Vec<AssetId>,
     pub affordability_scale: f64,
+    #[serde(default)]
+    pub requested_buy_notional: f64,
+    #[serde(default)]
+    pub requested_sell_notional: f64,
+    #[serde(default)]
+    pub rejected_notional: f64,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ExecutionReport {
@@ -217,6 +223,35 @@ pub trait ExecutionPlanner: Send + Sync {
         market: &ExecutionSnapshot<'_>,
         minimum_trade: f64,
     ) -> Result<ExecutionPlan>;
+
+    fn plan_action(
+        &self,
+        portfolio: &Portfolio,
+        action: &ValidatedAction,
+        market: &ExecutionSnapshot<'_>,
+        minimum_trade: f64,
+    ) -> Result<ExecutionPlan> {
+        match action {
+            ValidatedAction::Allocation(allocation) => {
+                self.plan(portfolio, allocation, market, minimum_trade)
+            }
+            ValidatedAction::TradeImpulses(impulses) => {
+                self.plan_trade_impulses(portfolio, impulses, market, minimum_trade)
+            }
+        }
+    }
+
+    fn plan_trade_impulses(
+        &self,
+        _portfolio: &Portfolio,
+        _action: &ValidatedTradeImpulses,
+        _market: &ExecutionSnapshot<'_>,
+        _minimum_trade: f64,
+    ) -> Result<ExecutionPlan> {
+        Err(MidasError::Policy(
+            "execution planner does not support incremental trade impulses".into(),
+        ))
+    }
 }
 pub trait ExecutionApplier: Send + Sync {
     fn apply(&self, portfolio: &mut Portfolio, plan: &ExecutionPlan) -> Result<ExecutionReport>;
@@ -414,6 +449,138 @@ impl ExecutionPlanner for CostExecutionEngine {
                 request * scale,
                 bar.open,
             )?);
+        }
+        Ok(plan)
+    }
+
+    fn plan_trade_impulses(
+        &self,
+        p: &Portfolio,
+        a: &ValidatedTradeImpulses,
+        m: &ExecutionSnapshot<'_>,
+        minimum: f64,
+    ) -> Result<ExecutionPlan> {
+        self.validate_costs()?;
+        if !minimum.is_finite() || minimum < 0.0 {
+            return Err(MidasError::Config(
+                "minimum trade value must be finite and non-negative".into(),
+            ));
+        }
+        if m.bars.len() != p.positions.len() || m.valuation_prices.len() != p.positions.len() {
+            return Err(MidasError::Accounting(
+                "execution snapshot dimension mismatch".into(),
+            ));
+        }
+        if a.impulses().len() != p.positions.len()
+            || m.bars.iter().enumerate().any(|(index, bar)| {
+                bar.is_some_and(|value| value.asset_id != p.positions[index].asset_id)
+            })
+        {
+            return Err(MidasError::Accounting(
+                "incremental trade action or snapshot dimension mismatch".into(),
+            ));
+        }
+        // Trade impulses are sized from the observation close, not from the
+        // next opening print. This keeps the policy's configured fraction a
+        // stable environment-state quantity while execution still uses opens.
+        let worth = p.value(m.valuation_prices)?;
+        if !worth.is_finite() || worth <= 0.0 {
+            return Err(MidasError::Accounting(
+                "incremental trade net worth must be positive and finite".into(),
+            ));
+        }
+        let fraction = a.maximum_trade_fraction();
+        if !fraction.is_finite() || fraction <= 0.0 || fraction > 1.0 {
+            return Err(MidasError::Config(
+                "invalid maximum incremental trade fraction".into(),
+            ));
+        }
+        let mut plan = ExecutionPlan {
+            affordability_scale: 1.0,
+            ..Default::default()
+        };
+        let mut available = p.cash;
+        let mut buys = Vec::<(usize, f64)>::new();
+        for (i, impulse) in a.impulses().iter().copied().enumerate() {
+            if !impulse.is_finite() || !(-1.0..=1.0).contains(&impulse) {
+                return Err(MidasError::Policy(
+                    "validated incremental trade impulse is invalid".into(),
+                ));
+            }
+            let requested = impulse.abs() * fraction * worth;
+            if !requested.is_finite() || requested <= 0.0 {
+                continue;
+            }
+            if impulse < 0.0 {
+                plan.requested_sell_notional += requested;
+                let Some(bar) = m.bars[i].filter(|bar| bar.tradable) else {
+                    plan.rejected_assets.push(p.positions[i].asset_id);
+                    plan.rejected_notional += requested;
+                    continue;
+                };
+                let available_holding = p.positions[i].quantity * bar.open;
+                let notional = requested.min(available_holding.max(0.0));
+                if notional < minimum || notional <= 0.0 {
+                    plan.rejected_notional += requested;
+                    continue;
+                }
+                let trade =
+                    self.trade(p.positions[i].asset_id, TradeSide::Sell, notional, bar.open)?;
+                available += trade.quantity * trade.execution_price - trade.commission;
+                if requested > notional {
+                    plan.rejected_notional += requested - notional;
+                }
+                plan.trades.push(trade);
+            } else {
+                plan.requested_buy_notional += requested;
+                if let Some(bar) = m.bars[i].filter(|bar| bar.tradable) {
+                    if requested >= minimum {
+                        buys.push((i, requested));
+                    } else {
+                        plan.rejected_notional += requested;
+                    }
+                    if !bar.open.is_finite() || bar.open <= 0.0 {
+                        return Err(MidasError::Accounting(
+                            "invalid incremental trade execution price".into(),
+                        ));
+                    }
+                } else {
+                    plan.rejected_assets.push(p.positions[i].asset_id);
+                    plan.rejected_notional += requested;
+                }
+            }
+        }
+        let variable = 1.0
+            + self.costs.commission_rate
+            + self.costs.spread_rate / 2.0
+            + self.costs.slippage_rate;
+        let mut scale = 0.0;
+        loop {
+            if buys.is_empty() {
+                break;
+            }
+            let requested = buys.iter().map(|(_, value)| *value).sum::<f64>();
+            let fixed = self.costs.commission_fixed * buys.len() as f64;
+            scale = ((available - fixed) / requested / variable).clamp(0.0, 1.0);
+            let before = buys.len();
+            buys.retain(|(_, value)| *value * scale >= minimum && *value * scale > 0.0);
+            if buys.len() == before {
+                break;
+            }
+        }
+        plan.affordability_scale = if buys.is_empty() { 0.0 } else { scale };
+        buys.sort_by_key(|(index, _)| p.positions[*index].asset_id);
+        for (i, requested) in buys {
+            let bar = m.bars[i].ok_or_else(|| {
+                MidasError::Accounting("eligible incremental buy is missing a bar".into())
+            })?;
+            let notional = requested * scale;
+            if notional <= 0.0 {
+                continue;
+            }
+            let trade = self.trade(p.positions[i].asset_id, TradeSide::Buy, notional, bar.open)?;
+            plan.trades.push(trade);
+            plan.rejected_notional += (requested - notional).max(0.0);
         }
         Ok(plan)
     }

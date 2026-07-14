@@ -72,6 +72,18 @@ def main() -> None:
                 "action_allocations": json.dumps(row["action_allocations"], separators=(",", ":")),
                 "active_asset_indices": json.dumps(row["active_asset_indices"], separators=(",", ":")),
                 "latent_samples": json.dumps(row["latent_samples"], separators=(",", ":")),
+                "requested_trade_impulses": json.dumps(row.get("requested_trade_impulses", []), separators=(",", ":")),
+                "executed_trade_impulses": json.dumps(row.get("executed_trade_impulses", []), separators=(",", ":")),
+                "trade_scaling_factor": row.get("trade_scaling_factor", 1.0),
+                "requested_buy_notional": row.get("requested_buy_notional", 0.0),
+                "requested_sell_notional": row.get("requested_sell_notional", 0.0),
+                "executed_buy_notional": row.get("executed_buy_notional", row["buy_notional"]),
+                "executed_sell_notional": row.get("executed_sell_notional", row["sell_notional"]),
+                "rejected_notional": row.get("rejected_notional", 0.0),
+                "cash_before": row.get("cash_before", 0.0),
+                "cash_after": row.get("cash_after", 0.0),
+                "holdings_before": json.dumps(row.get("holdings_before", []), separators=(",", ":")),
+                "holdings_after": json.dumps(row.get("holdings_after", []), separators=(",", ":")),
             }
         )
         breakdown = row["reward_breakdown"]
@@ -99,6 +111,7 @@ def main() -> None:
                 "slippage_cost": row["slippage_cost"],
             }
         )
+        requested_impulses = row.get("requested_trade_impulses", [])
         for position, (asset_index, allocation) in enumerate(
             zip(row["active_asset_indices"], row["order_position_allocations"])
         ):
@@ -111,6 +124,7 @@ def main() -> None:
                     "asset_index": asset_index,
                     "asset": assets[int(asset_index)],
                     "allocation": allocation,
+                    "requested_impulse": requested_impulses[int(asset_index)] if requested_impulses else 0.0,
                 }
             )
 

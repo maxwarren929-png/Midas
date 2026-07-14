@@ -203,6 +203,15 @@ fn main() -> Result<()> {
                 } else {
                     0.0
                 },
+                "mean_abs_trade_impulse": if engine.metrics.neural_impulse_count > 0 {
+                    engine.metrics.neural_abs_impulse_total / engine.metrics.neural_impulse_count as f64
+                } else { 0.0 },
+                "small_trade_impulse_fraction": if engine.metrics.neural_impulse_count > 0 {
+                    engine.metrics.neural_small_impulse_count as f64 / engine.metrics.neural_impulse_count as f64
+                } else { 0.0 },
+                "saturated_trade_impulse_fraction": if engine.metrics.neural_impulse_count > 0 {
+                    engine.metrics.neural_saturated_impulse_count as f64 / engine.metrics.neural_impulse_count as f64
+                } else { 0.0 },
             },
             "learning": {
                 "ppo_updates": updates.len(),

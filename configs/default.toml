@@ -52,7 +52,10 @@ hidden_layers = [32, 16]
 memory_size = 8
 activation = "gelu"
 policy = "burn_actor_critic"
-action_distribution = { kind = "bounded_stick_breaking", minimum_shape = 0.1, maximum_shape = 100.0, latent_epsilon = 0.000001, asset_order = "stable" }
+action_distribution = { kind = "bounded_impulse_beta", minimum_shape = 0.1, maximum_shape = 100.0, latent_epsilon = 0.000001, asset_order = "stable" }
+
+[brain.trading]
+maximum_trade_fraction = 0.05
 
 [brain.traits.learning_rate]
 initial = 0.0003
