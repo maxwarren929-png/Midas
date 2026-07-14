@@ -35,6 +35,58 @@ pub struct MetricsCollector {
     pub actor_ineligible_transitions: u64,
     pub critic_ineligible_transitions: u64,
     pub invalid_action_penalty_total: f64,
+    pub neural_action_count: u64,
+    pub neural_multi_asset_actions: u64,
+    pub neural_active_position_total: f64,
+    pub neural_concentration_total: f64,
+    pub neural_cash_allocation_total: f64,
+}
+impl MetricsCollector {
+    pub fn record_neural_allocations(&mut self, stats: &AllocationStats) {
+        self.neural_action_count = self.neural_action_count.saturating_add(stats.actions);
+        self.neural_multi_asset_actions = self
+            .neural_multi_asset_actions
+            .saturating_add(stats.multi_asset_actions);
+        self.neural_active_position_total += stats.active_positions;
+        self.neural_concentration_total += stats.concentration;
+        self.neural_cash_allocation_total += stats.cash_allocation;
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AllocationStats {
+    pub actions: u64,
+    pub multi_asset_actions: u64,
+    pub active_positions: f64,
+    pub concentration: f64,
+    pub cash_allocation: f64,
+}
+impl AllocationStats {
+    pub fn record(&mut self, weights: &[f64]) -> crate::Result<()> {
+        if weights.is_empty()
+            || weights
+                .iter()
+                .any(|weight| !weight.is_finite() || *weight < 0.0)
+            || (weights.iter().sum::<f64>() - 1.0).abs() > 1e-8
+        {
+            return Err(crate::MidasError::Accounting(
+                "invalid neural allocation statistics input".into(),
+            ));
+        }
+        let active = weights
+            .iter()
+            .skip(1)
+            .filter(|weight| **weight > 1e-8)
+            .count();
+        self.actions = self.actions.saturating_add(1);
+        if active >= 2 {
+            self.multi_asset_actions = self.multi_asset_actions.saturating_add(1);
+        }
+        self.active_positions += active as f64;
+        self.concentration += weights.iter().skip(1).copied().fold(0.0, f64::max);
+        self.cash_allocation += weights[0];
+        Ok(())
+    }
 }
 impl EventSink for MetricsCollector {
     fn on_event(&mut self, event: &DomainEvent) {

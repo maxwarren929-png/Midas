@@ -1,0 +1,10 @@
+baseline = experiment-control.toml
+evolution.enabled: {'experiment-control.toml': False,
+ 'experiment-evolution-only.toml': True,
+ 'experiment-ppo-evolution.toml': True,
+ 'experiment-ppo.toml': False}
+learning.implementation: {'experiment-control.toml': 'no_learning',
+ 'experiment-evolution-only.toml': 'no_learning',
+ 'experiment-ppo-evolution.toml': 'ppo',
+ 'experiment-ppo.toml': 'ppo'}
+differing_fields = 2

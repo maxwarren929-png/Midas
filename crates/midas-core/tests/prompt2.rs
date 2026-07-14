@@ -128,6 +128,63 @@ fn prompt2_ppo_updates_full_heads_with_a_frozen_encoder() {
 }
 
 #[test]
+fn prompt3a_multi_asset_portfolios_and_resume_are_deterministic() {
+    let config = prompt2_config();
+    let data = PolarsDataSource.load(&config).unwrap();
+    let mut uninterrupted =
+        SimulationEngine::new(config.clone(), data.clone(), DatasetSplit::Training).unwrap();
+    let first_agent = uninterrupted.agents().next().unwrap().id;
+    let before = uninterrupted
+        .agent_lifetime_parameters(first_agent)
+        .unwrap()
+        .unwrap();
+    let report = uninterrupted.run().unwrap();
+
+    assert_eq!(report.lifecycle, SimulationLifecycle::Completed);
+    assert!(report.neural_action_count > 0);
+    assert!(report.neural_multi_asset_action_fraction > 0.0);
+    assert!(report.neural_mean_active_positions > 1.0);
+    assert_ne!(
+        before.actor.weights,
+        uninterrupted
+            .agent_lifetime_parameters(first_agent)
+            .unwrap()
+            .unwrap()
+            .actor
+            .weights
+    );
+
+    let mut partial =
+        SimulationEngine::new(config.clone(), data.clone(), DatasetSplit::Training).unwrap();
+    partial.run_steps(8).unwrap();
+    let checkpoint = tempfile::NamedTempFile::new().unwrap();
+    partial.save_checkpoint(checkpoint.path()).unwrap();
+    let mut resumed = SimulationEngine::resume(config, data, checkpoint.path()).unwrap();
+    let resumed_report = resumed.run().unwrap();
+
+    assert_eq!(report.steps, resumed_report.steps);
+    assert_eq!(
+        report.neural_multi_asset_action_fraction,
+        resumed_report.neural_multi_asset_action_fraction
+    );
+    assert_eq!(
+        report.neural_mean_active_positions,
+        resumed_report.neural_mean_active_positions
+    );
+    assert_eq!(uninterrupted.domain_events, resumed.domain_events);
+    assert_eq!(
+        uninterrupted.agents().collect::<Vec<_>>(),
+        resumed.agents().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        uninterrupted
+            .agent_lifetime_parameters(first_agent)
+            .unwrap(),
+        resumed.agent_lifetime_parameters(first_agent).unwrap()
+    );
+}
+
+#[test]
 fn automatic_checkpoint_is_written_from_committed_candidate_state() {
     let mut config = prompt2_config();
     let directory = tempfile::tempdir().unwrap();

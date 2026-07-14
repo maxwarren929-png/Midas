@@ -155,6 +155,31 @@ fn main() -> Result<()> {
                 "births": engine.metrics.births,
                 "reproductions": engine.metrics.reproductions,
                 "evolution_fallbacks": engine.metrics.evolution_fallbacks,
+                "neural_action_count": engine.metrics.neural_action_count,
+                "neural_multi_asset_action_fraction": if engine.metrics.neural_action_count > 0 {
+                    engine.metrics.neural_multi_asset_actions as f64
+                        / engine.metrics.neural_action_count as f64
+                } else {
+                    0.0
+                },
+                "neural_mean_active_positions": if engine.metrics.neural_action_count > 0 {
+                    engine.metrics.neural_active_position_total
+                        / engine.metrics.neural_action_count as f64
+                } else {
+                    0.0
+                },
+                "neural_mean_concentration": if engine.metrics.neural_action_count > 0 {
+                    engine.metrics.neural_concentration_total
+                        / engine.metrics.neural_action_count as f64
+                } else {
+                    0.0
+                },
+                "neural_mean_cash_allocation": if engine.metrics.neural_action_count > 0 {
+                    engine.metrics.neural_cash_allocation_total
+                        / engine.metrics.neural_action_count as f64
+                } else {
+                    0.0
+                },
             },
             "learning": {
                 "ppo_updates": updates.len(),

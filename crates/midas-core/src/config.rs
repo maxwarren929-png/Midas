@@ -129,6 +129,8 @@ pub struct BrainConfig {
     pub policy: PolicyKind,
     #[serde(default)]
     pub traits: EvolvableTraitsConfig,
+    #[serde(default)]
+    pub action_distribution: ActionDistributionConfig,
 }
 fn default_activation() -> Activation {
     Activation::Gelu
@@ -153,6 +155,61 @@ pub enum PolicyKind {
     EqualWeight,
     BuyAndHold,
     BurnActorCritic,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionDistributionKind {
+    BoundedStickBreaking,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetOrder {
+    Stable,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActionDistributionConfig {
+    #[serde(default = "default_action_distribution_kind")]
+    pub kind: ActionDistributionKind,
+    #[serde(default = "default_minimum_shape")]
+    pub minimum_shape: f32,
+    #[serde(default = "default_maximum_shape")]
+    pub maximum_shape: f32,
+    #[serde(default = "default_latent_epsilon")]
+    pub latent_epsilon: f32,
+    #[serde(default = "default_asset_order")]
+    pub asset_order: AssetOrder,
+}
+
+fn default_action_distribution_kind() -> ActionDistributionKind {
+    ActionDistributionKind::BoundedStickBreaking
+}
+fn default_minimum_shape() -> f32 {
+    0.1
+}
+fn default_maximum_shape() -> f32 {
+    100.0
+}
+fn default_latent_epsilon() -> f32 {
+    1e-6
+}
+fn default_asset_order() -> AssetOrder {
+    AssetOrder::Stable
+}
+
+impl Default for ActionDistributionConfig {
+    fn default() -> Self {
+        Self {
+            kind: default_action_distribution_kind(),
+            minimum_shape: default_minimum_shape(),
+            maximum_shape: default_maximum_shape(),
+            latent_epsilon: default_latent_epsilon(),
+            asset_order: default_asset_order(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -727,6 +784,20 @@ impl Config {
             || self.brain.memory_size == 0
         {
             return bad("brain architecture dimensions must be positive");
+        }
+        if !matches!(
+            self.brain.action_distribution.kind,
+            ActionDistributionKind::BoundedStickBreaking
+        ) || !self.brain.action_distribution.minimum_shape.is_finite()
+            || !self.brain.action_distribution.maximum_shape.is_finite()
+            || !self.brain.action_distribution.latent_epsilon.is_finite()
+            || self.brain.action_distribution.minimum_shape <= 0.0
+            || self.brain.action_distribution.maximum_shape
+                <= self.brain.action_distribution.minimum_shape
+            || !(0.0..0.5).contains(&self.brain.action_distribution.latent_epsilon)
+            || self.brain.action_distribution.latent_epsilon == 0.0
+        {
+            return bad("bounded stick-breaking action distribution parameters are invalid");
         }
         for (name, value) in [
             ("learning_rate", &self.brain.traits.learning_rate),

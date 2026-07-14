@@ -851,7 +851,9 @@ mod tests {
     use super::*;
     use crate::{
         brain::{BrainArchitecture, MemoryArchitecture},
-        config::{Activation, EvolutionCrossoverConfig, EvolutionMutationConfig},
+        config::{
+            ActionDistributionConfig, Activation, EvolutionCrossoverConfig, EvolutionMutationConfig,
+        },
     };
 
     fn architecture() -> BrainArchitecture {
@@ -865,6 +867,7 @@ mod tests {
             actor_output_size: 2,
             critic_output_size: 1,
             activation: Activation::Relu,
+            action_distribution: ActionDistributionConfig::default(),
         }
     }
 

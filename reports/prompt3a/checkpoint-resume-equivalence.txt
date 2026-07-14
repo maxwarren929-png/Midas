@@ -1,0 +1,4 @@
+control,equivalent=True,steps=16
+ppo,equivalent=True,steps=16
+evolution-only,equivalent=True,steps=16
+ppo-evolution,equivalent=True,steps=16

@@ -1,7 +1,10 @@
 use crate::{
     MidasError, Result,
     action::ProposedAllocation,
-    config::{Activation, BrainConfig, EvolvableTraitsConfig, LearningConfig},
+    config::{
+        ActionDistributionConfig, ActionDistributionKind, Activation, AssetOrder, BrainConfig,
+        EvolvableTraitsConfig, LearningConfig,
+    },
     observation::Observation,
 };
 use burn::{
@@ -10,6 +13,7 @@ use burn::{
 };
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use rand_distr::{Beta, Distribution};
 use serde::{Deserialize, Serialize};
 
 type CpuBackend = NdArray<f32>;
@@ -28,6 +32,7 @@ pub struct BrainArchitecture {
     pub actor_output_size: usize,
     pub critic_output_size: usize,
     pub activation: Activation,
+    pub action_distribution: ActionDistributionConfig,
 }
 impl BrainArchitecture {
     pub fn from_config(
@@ -45,9 +50,10 @@ impl BrainArchitecture {
             memory: MemoryArchitecture {
                 size: c.memory_size,
             },
-            actor_output_size: asset_count + 1,
+            actor_output_size: asset_count * 2,
             critic_output_size: 1,
             activation: c.activation,
+            action_distribution: c.action_distribution.clone(),
         }
     }
 }
@@ -109,7 +115,7 @@ impl BrainGenome {
         let actor = random_dense(a.memory.size, a.actor_output_size, &mut rng);
         let critic = random_dense(a.memory.size, a.critic_output_size, &mut rng);
         let g = Self {
-            genome_format_version: 2,
+            genome_format_version: 3,
             architecture: a.clone(),
             hidden,
             recurrent,
@@ -121,7 +127,7 @@ impl BrainGenome {
         Ok(g)
     }
     pub fn validate(&self, a: &BrainArchitecture) -> Result<()> {
-        if self.genome_format_version != 2 || &self.architecture != a {
+        if self.genome_format_version != 3 || &self.architecture != a {
             return Err(MidasError::Policy(
                 "genome architecture or observation schema mismatch".into(),
             ));
@@ -294,7 +300,10 @@ pub struct NeuralOutput {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PolicyActionSample {
-    pub action_index: usize,
+    pub active_asset_indices: Vec<usize>,
+    pub latent_samples: Vec<f32>,
+    pub allocation: Vec<f64>,
+    pub maximum_asset_allocation: f32,
     pub log_probability: f32,
     pub entropy: f32,
 }
@@ -419,6 +428,9 @@ pub trait NeuralModel: Send {
     }
     fn runtime_state(&self) -> Option<NeuralRuntimeState> {
         None
+    }
+    fn action_distribution(&self) -> ActionDistributionConfig {
+        ActionDistributionConfig::default()
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -633,6 +645,9 @@ impl NeuralModel for BurnNeuralModel {
     fn runtime_state(&self) -> Option<NeuralRuntimeState> {
         Some(self.runtime.clone())
     }
+    fn action_distribution(&self) -> ActionDistributionConfig {
+        self.architecture.action_distribution.clone()
+    }
 }
 impl BurnNeuralModel {
     fn encode_observation(
@@ -842,7 +857,7 @@ fn train_burn_heads_inner(
         }
         let encoded = model.encode_observation(&sample.observation, &sample.recurrent_state)?;
         let output = model.evaluate_representation(&encoded.representation)?;
-        if let Some(action_index) = sample.action_index {
+        if let Some(action_sample) = sample.action_sample.as_ref() {
             let old_log_probability = sample.old_log_probability.ok_or_else(|| {
                 MidasError::Policy("actor sample is missing its old log probability".into())
             })?;
@@ -852,34 +867,19 @@ fn train_burn_heads_inner(
             let temperature = sample
                 .temperature
                 .ok_or_else(|| MidasError::Policy("actor sample is missing temperature".into()))?;
-            if action_index >= model.architecture.actor_output_size {
-                return Err(MidasError::Policy(
-                    "PPO sample action is outside actor output dimensions".into(),
-                ));
-            }
-            let probabilities = single_asset_capped_categorical_probabilities(
+            let distribution = evaluate_bounded_stick_breaking_sample(
                 &output.logits,
                 &sample.tradable,
-                model.architecture.asset_count,
+                action_sample,
                 temperature,
+                &model.architecture.action_distribution,
             )?;
-            let selected_probability = probabilities
-                .get(action_index)
-                .copied()
-                .filter(|probability| probability.is_finite() && *probability > 0.0)
-                .ok_or_else(|| {
-                    MidasError::Policy("PPO sample selected an unavailable action".into())
-                })?;
-            let new_log_probability = selected_probability.ln();
-            let sample_entropy = probabilities
-                .iter()
-                .filter(|probability| **probability > 0.0)
-                .map(|probability| -probability * probability.ln())
-                .sum::<f64>() as f32;
+            let new_log_probability = distribution.log_probability;
+            let sample_entropy = distribution.entropy;
             let target_return = sample.return_value.unwrap_or(output.value);
             let loss = crate::learning::ppo_loss(
                 old_log_probability,
-                new_log_probability as f32,
+                new_log_probability,
                 advantage,
                 output.value,
                 target_return,
@@ -904,22 +904,21 @@ fn train_burn_heads_inner(
             let mut actor_output_gradient = vec![0.0_f32; actor_outputs];
             if !clipped_active {
                 let coefficient = ratio * advantage;
-                for (index, probability) in probabilities.iter().enumerate() {
-                    actor_output_gradient[index] += coefficient
-                        * (*probability as f32 - if index == action_index { 1.0 } else { 0.0 })
-                        / temperature;
+                for decision in &distribution.decisions {
+                    actor_output_gradient[decision.actor_alpha_index] +=
+                        -coefficient * decision.d_log_probability_d_raw_alpha;
+                    actor_output_gradient[decision.actor_beta_index] +=
+                        -coefficient * decision.d_log_probability_d_raw_beta;
                 }
             }
-            // The entropy derivative is the exact derivative of the
-            // categorical entropy with respect to logits.
+            // The entropy derivative is the exact derivative of each Beta
+            // factor, chained through the bounded softplus shape transform.
             if config.entropy_coefficient > 0.0 {
-                for (index, probability) in probabilities.iter().enumerate() {
-                    if *probability > 0.0 {
-                        actor_output_gradient[index] += config.entropy_coefficient
-                            * (*probability as f32)
-                            * (probability.ln() as f32 + sample_entropy)
-                            / temperature;
-                    }
+                for decision in &distribution.decisions {
+                    actor_output_gradient[decision.actor_alpha_index] +=
+                        -config.entropy_coefficient * decision.d_entropy_d_raw_alpha;
+                    actor_output_gradient[decision.actor_beta_index] +=
+                        -config.entropy_coefficient * decision.d_entropy_d_raw_beta;
                 }
             }
             accumulate_dense_gradient(
@@ -1244,13 +1243,14 @@ impl Policy for NeuralPolicy {
         maximum_asset_allocation: f64,
     ) -> Result<PolicyEvaluation> {
         let out = self.model.forward(&NeuralInput { observation: o })?;
-        let evaluation = single_asset_capped_categorical_evaluation(
+        let evaluation = bounded_stick_breaking_evaluation(
             out,
             c.tradable,
             maximum_asset_allocation,
             stochastic,
             self.temperature,
             &mut self.rng,
+            &self.model.action_distribution(),
         )?;
         // Exploration is part of stochastic acting only. Deterministic
         // evaluation and critic bootstrap must be side-effect free so merely
@@ -1305,72 +1305,84 @@ impl Policy for NeuralPolicy {
     }
 }
 
-/// The training distribution is a single-asset capped categorical action
-/// space: cash, or one tradable asset at the configured maximum allocation
-/// with the remainder in cash. It is deliberately not a general multi-asset
-/// simplex distribution. The sampled action and log probability therefore
-/// remain in the same legal action space without post-hoc clipping.
-fn single_asset_capped_categorical_evaluation(
+/// A bounded stick-breaking portfolio distribution. The PPO action is the
+/// vector of latent Beta samples, not the final portfolio weights. For each
+/// tradable asset in stable asset order, `weight = cap * u`; cash receives the
+/// residual. This makes the concentration cap part of the action mapping and
+/// leaves the joint log probability as the sum of the exact Beta log densities.
+#[derive(Clone, Debug)]
+struct BetaDecision {
+    actor_alpha_index: usize,
+    actor_beta_index: usize,
+    alpha: f64,
+    beta: f64,
+    latent: f64,
+    d_log_probability_d_raw_alpha: f32,
+    d_log_probability_d_raw_beta: f32,
+    d_entropy_d_raw_alpha: f32,
+    d_entropy_d_raw_beta: f32,
+}
+
+#[derive(Clone, Debug)]
+struct StickBreakingEvaluation {
+    log_probability: f32,
+    entropy: f32,
+    decisions: Vec<BetaDecision>,
+}
+
+fn bounded_stick_breaking_evaluation(
     output: NeuralOutput,
     tradable: &[bool],
     maximum_asset_allocation: f64,
     stochastic: bool,
     temperature: f32,
     rng: &mut ChaCha8Rng,
+    config: &ActionDistributionConfig,
 ) -> Result<PolicyEvaluation> {
-    if output.logits.len() != tradable.len() + 1
-        || !output.value.is_finite()
-        || !temperature.is_finite()
-        || temperature <= 0.0
-        || !maximum_asset_allocation.is_finite()
-        || !(0.0..=1.0).contains(&maximum_asset_allocation)
-    {
-        return Err(MidasError::Policy(
-            "invalid single-asset capped categorical output or action bounds".into(),
-        ));
-    }
-    let probabilities = single_asset_capped_categorical_probabilities(
+    validate_distribution_inputs(
+        &output,
+        tradable,
+        maximum_asset_allocation,
+        temperature,
+        config,
+    )?;
+    let active_asset_indices = active_asset_indices(tradable, config)?;
+    let latents = if stochastic {
+        sample_latents(
+            &output.logits,
+            &active_asset_indices,
+            temperature,
+            config,
+            rng,
+        )?
+    } else {
+        deterministic_latents(&output.logits, &active_asset_indices, temperature, config)?
+    };
+    let (weights, decisions) = evaluate_latents(
         &output.logits,
         tradable,
-        tradable.len(),
+        &active_asset_indices,
+        &latents,
+        maximum_asset_allocation,
         temperature,
+        config,
     )?;
-    let entropy = probabilities
+    let log_probability = decisions
         .iter()
-        .filter(|probability| **probability > 0.0)
-        .map(|probability| -probability * probability.ln())
-        .sum::<f64>() as f32;
-    let selected = if stochastic {
-        let draw = rng.r#gen::<f64>();
-        let mut cumulative = 0.0;
-        probabilities
-            .iter()
-            .position(|probability| {
-                cumulative += *probability;
-                draw < cumulative
-            })
-            .unwrap_or(0)
-    } else {
-        probabilities
-            .iter()
-            .enumerate()
-            .max_by(|(_, left), (_, right)| left.total_cmp(right))
-            .map(|(index, _)| index)
-            .unwrap_or(0)
-    };
-    let mut weights = vec![0.0; tradable.len() + 1];
-    if selected == 0 {
-        weights[0] = 1.0;
-    } else {
-        weights[0] = 1.0 - maximum_asset_allocation;
-        weights[selected] = maximum_asset_allocation;
-    }
-    let proposed = ProposedAllocation::rebalance(weights);
-    let log_probability = probabilities[selected].max(f64::MIN_POSITIVE).ln() as f32;
+        .map(|decision| beta_log_probability(decision.alpha, decision.beta, decision.latent))
+        .sum::<Result<f64>>()? as f32;
+    let entropy = decisions
+        .iter()
+        .map(|decision| beta_entropy(decision.alpha, decision.beta))
+        .sum::<Result<f64>>()? as f32;
+    let proposed = ProposedAllocation::rebalance(weights.clone());
     Ok(PolicyEvaluation {
         proposed_allocation: proposed,
         action_sample: stochastic.then_some(PolicyActionSample {
-            action_index: selected,
+            active_asset_indices,
+            latent_samples: latents.iter().map(|value| *value as f32).collect(),
+            allocation: weights,
+            maximum_asset_allocation: maximum_asset_allocation as f32,
             log_probability,
             entropy,
         }),
@@ -1382,59 +1394,421 @@ fn single_asset_capped_categorical_evaluation(
     })
 }
 
-fn single_asset_capped_categorical_probabilities(
-    logits: &[f32],
+fn validate_distribution_inputs(
+    output: &NeuralOutput,
     tradable: &[bool],
-    asset_count: usize,
+    maximum_asset_allocation: f64,
     temperature: f32,
-) -> Result<Vec<f64>> {
-    if logits.len() != asset_count + 1 || tradable.len() != asset_count {
+    config: &ActionDistributionConfig,
+) -> Result<()> {
+    if !matches!(config.kind, ActionDistributionKind::BoundedStickBreaking)
+        || !matches!(config.asset_order, AssetOrder::Stable)
+        || output.logits.len() != tradable.len() * 2
+        || !output.value.is_finite()
+        || output.logits.iter().any(|value| !value.is_finite())
+        || !temperature.is_finite()
+        || temperature <= 0.0
+        || !maximum_asset_allocation.is_finite()
+        || !(0.0..=1.0).contains(&maximum_asset_allocation)
+        || maximum_asset_allocation == 0.0
+        || !config.minimum_shape.is_finite()
+        || !config.maximum_shape.is_finite()
+        || config.minimum_shape <= 0.0
+        || config.maximum_shape <= config.minimum_shape
+        || !config.latent_epsilon.is_finite()
+        || !(0.0..0.5).contains(&config.latent_epsilon)
+        || config.latent_epsilon == 0.0
+    {
         return Err(MidasError::Policy(
-            "single-asset capped categorical dimensions mismatch".into(),
+            "invalid bounded stick-breaking output or action bounds".into(),
         ));
     }
-    if !temperature.is_finite() || temperature <= 0.0 {
-        return Err(MidasError::Policy(
-            "single-asset capped categorical temperature is invalid".into(),
+    Ok(())
+}
+
+fn active_asset_indices(
+    tradable: &[bool],
+    config: &ActionDistributionConfig,
+) -> Result<Vec<usize>> {
+    if !matches!(config.asset_order, AssetOrder::Stable) {
+        return Err(MidasError::Config(
+            "unsupported bounded stick-breaking asset order".into(),
         ));
     }
-    let scaled = logits
+    Ok(tradable
         .iter()
         .enumerate()
-        .map(|(index, value)| {
-            if index > 0 && !tradable[index - 1] {
-                f64::NEG_INFINITY
-            } else {
-                (*value as f64) / temperature as f64
+        .filter_map(|(index, is_tradable)| is_tradable.then_some(index))
+        .collect())
+}
+
+fn sample_latents(
+    logits: &[f32],
+    active_asset_indices: &[usize],
+    temperature: f32,
+    config: &ActionDistributionConfig,
+    rng: &mut ChaCha8Rng,
+) -> Result<Vec<f64>> {
+    active_asset_indices
+        .iter()
+        .map(|asset_index| {
+            let (alpha, beta, _, _) = beta_shapes(
+                logits[asset_index * 2],
+                logits[asset_index * 2 + 1],
+                temperature,
+                config,
+            )?;
+            let distribution = Beta::new(alpha, beta).map_err(|error| {
+                MidasError::Policy(format!("invalid Beta action parameters: {error}"))
+            })?;
+            let sample = distribution.sample(rng).clamp(
+                config.latent_epsilon as f64,
+                1.0 - config.latent_epsilon as f64,
+            );
+            if !sample.is_finite() {
+                return Err(MidasError::Policy(
+                    "non-finite bounded stick-breaking sample".into(),
+                ));
             }
+            Ok(sample)
         })
-        .collect::<Vec<_>>();
-    if scaled.iter().any(|value| value.is_nan()) {
+        .collect()
+}
+
+fn deterministic_latents(
+    logits: &[f32],
+    active_asset_indices: &[usize],
+    temperature: f32,
+    config: &ActionDistributionConfig,
+) -> Result<Vec<f64>> {
+    active_asset_indices
+        .iter()
+        .map(|asset_index| {
+            let (alpha, beta, _, _) = beta_shapes(
+                logits[asset_index * 2],
+                logits[asset_index * 2 + 1],
+                temperature,
+                config,
+            )?;
+            Ok((alpha / (alpha + beta)).clamp(
+                config.latent_epsilon as f64,
+                1.0 - config.latent_epsilon as f64,
+            ))
+        })
+        .collect()
+}
+
+fn evaluate_latents(
+    logits: &[f32],
+    tradable: &[bool],
+    active_asset_indices: &[usize],
+    latents: &[f64],
+    maximum_asset_allocation: f64,
+    temperature: f32,
+    config: &ActionDistributionConfig,
+) -> Result<(Vec<f64>, Vec<BetaDecision>)> {
+    if active_asset_indices.len() != latents.len() || logits.len() != tradable.len() * 2 {
         return Err(MidasError::Policy(
-            "non-finite single-asset capped categorical logits".into(),
+            "bounded stick-breaking latent dimensions mismatch".into(),
         ));
     }
-    let peak = scaled.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let mut probabilities = scaled
+    let mut weights = vec![0.0; tradable.len() + 1];
+    let mut remaining = 1.0_f64;
+    let mut decisions = Vec::with_capacity(active_asset_indices.len());
+    for (position, asset_index) in active_asset_indices.iter().copied().enumerate() {
+        let latent = latents[position];
+        if !latent.is_finite()
+            || latent < config.latent_epsilon as f64
+            || latent > 1.0 - config.latent_epsilon as f64
+        {
+            return Err(MidasError::Policy(
+                "bounded stick-breaking latent is outside the supported interior".into(),
+            ));
+        }
+        let (alpha, beta, d_alpha_d_raw, d_beta_d_raw) = beta_shapes(
+            logits[asset_index * 2],
+            logits[asset_index * 2 + 1],
+            temperature,
+            config,
+        )?;
+        let cap = maximum_asset_allocation.min(remaining);
+        let weight = cap * latent;
+        if !weight.is_finite() || weight < 0.0 || weight > cap + 1e-12 {
+            return Err(MidasError::Policy(
+                "bounded stick-breaking allocation is invalid".into(),
+            ));
+        }
+        weights[asset_index + 1] = weight;
+        remaining -= weight;
+        let log_gradient_alpha = beta_log_probability_derivative_alpha(alpha, beta, latent)?;
+        let log_gradient_beta = beta_log_probability_derivative_beta(alpha, beta, latent)?;
+        let entropy_gradient_alpha = beta_entropy_derivative_alpha(alpha, beta)?;
+        let entropy_gradient_beta = beta_entropy_derivative_beta(alpha, beta)?;
+        decisions.push(BetaDecision {
+            actor_alpha_index: asset_index * 2,
+            actor_beta_index: asset_index * 2 + 1,
+            alpha,
+            beta,
+            latent,
+            d_log_probability_d_raw_alpha: (log_gradient_alpha * d_alpha_d_raw) as f32,
+            d_log_probability_d_raw_beta: (log_gradient_beta * d_beta_d_raw) as f32,
+            d_entropy_d_raw_alpha: (entropy_gradient_alpha * d_alpha_d_raw) as f32,
+            d_entropy_d_raw_beta: (entropy_gradient_beta * d_beta_d_raw) as f32,
+        });
+    }
+    weights[0] = remaining;
+    let total = weights.iter().sum::<f64>();
+    if !total.is_finite() || total <= 0.0 {
+        return Err(MidasError::Policy(
+            "bounded stick-breaking weights are non-finite".into(),
+        ));
+    }
+    let drift = 1.0 - total;
+    if drift.abs() > 1e-10 {
+        weights[0] += drift;
+    }
+    if weights
         .iter()
-        .map(|value| {
-            if value.is_finite() {
-                (*value - peak).exp()
+        .any(|weight| !weight.is_finite() || *weight < 0.0)
+        || (weights.iter().sum::<f64>() - 1.0).abs() > 1e-9
+    {
+        return Err(MidasError::Policy(
+            "bounded stick-breaking weights failed simplex validation".into(),
+        ));
+    }
+    Ok((weights, decisions))
+}
+
+fn evaluate_bounded_stick_breaking_sample(
+    logits: &[f32],
+    tradable: &[bool],
+    sample: &PolicyActionSample,
+    temperature: f32,
+    config: &ActionDistributionConfig,
+) -> Result<StickBreakingEvaluation> {
+    validate_distribution_inputs(
+        &NeuralOutput {
+            logits: logits.to_vec(),
+            value: 0.0,
+        },
+        tradable,
+        sample.maximum_asset_allocation as f64,
+        temperature,
+        config,
+    )?;
+    let expected_indices = active_asset_indices(tradable, config)?;
+    if sample.active_asset_indices != expected_indices
+        || sample.latent_samples.len() != expected_indices.len()
+        || sample.allocation.len() != tradable.len() + 1
+    {
+        return Err(MidasError::Policy(
+            "PPO portfolio action sample dimensions or mask mismatch".into(),
+        ));
+    }
+    let latents = sample
+        .latent_samples
+        .iter()
+        .map(|value| *value as f64)
+        .collect::<Vec<_>>();
+    let (allocation, decisions) = evaluate_latents(
+        logits,
+        tradable,
+        &expected_indices,
+        &latents,
+        sample.maximum_asset_allocation as f64,
+        temperature,
+        config,
+    )?;
+    if allocation
+        .iter()
+        .zip(&sample.allocation)
+        .any(|(actual, stored)| !stored.is_finite() || (actual - stored).abs() > 1e-5)
+    {
+        return Err(MidasError::Policy(
+            "PPO portfolio action sample allocation does not match its latent action".into(),
+        ));
+    }
+    let log_probability = decisions
+        .iter()
+        .map(|decision| beta_log_probability(decision.alpha, decision.beta, decision.latent))
+        .sum::<Result<f64>>()? as f32;
+    let entropy = decisions
+        .iter()
+        .map(|decision| beta_entropy(decision.alpha, decision.beta))
+        .sum::<Result<f64>>()? as f32;
+    if !log_probability.is_finite() || !entropy.is_finite() {
+        return Err(MidasError::Policy(
+            "non-finite bounded stick-breaking PPO density".into(),
+        ));
+    }
+    Ok(StickBreakingEvaluation {
+        log_probability,
+        entropy,
+        decisions,
+    })
+}
+
+fn beta_shapes(
+    raw_alpha: f32,
+    raw_beta: f32,
+    temperature: f32,
+    config: &ActionDistributionConfig,
+) -> Result<(f64, f64, f64, f64)> {
+    let shape = |raw: f32| -> Result<(f64, f64)> {
+        if !raw.is_finite() {
+            return Err(MidasError::Policy("non-finite Beta shape logit".into()));
+        }
+        let raw = raw as f64;
+        let base = softplus(raw) + config.minimum_shape as f64;
+        let unclamped = base / temperature as f64;
+        let shape = unclamped.clamp(config.minimum_shape as f64, config.maximum_shape as f64);
+        let derivative =
+            if unclamped > config.minimum_shape as f64 && unclamped < config.maximum_shape as f64 {
+                sigmoid(raw) / temperature as f64
             } else {
                 0.0
-            }
-        })
-        .collect::<Vec<_>>();
-    let sum = probabilities.iter().sum::<f64>();
-    if !sum.is_finite() || sum <= 0.0 {
+            };
+        if !shape.is_finite() || shape <= 0.0 || !derivative.is_finite() {
+            return Err(MidasError::Policy("invalid bounded Beta shape".into()));
+        }
+        Ok((shape, derivative))
+    };
+    let (alpha, d_alpha) = shape(raw_alpha)?;
+    let (beta, d_beta) = shape(raw_beta)?;
+    Ok((alpha, beta, d_alpha, d_beta))
+}
+
+fn softplus(value: f64) -> f64 {
+    if value > 20.0 {
+        value
+    } else {
+        (1.0 + value.exp()).ln()
+    }
+}
+
+fn sigmoid(value: f64) -> f64 {
+    if value >= 0.0 {
+        1.0 / (1.0 + (-value).exp())
+    } else {
+        let exp = value.exp();
+        exp / (1.0 + exp)
+    }
+}
+
+fn beta_log_probability(alpha: f64, beta: f64, latent: f64) -> Result<f64> {
+    if !alpha.is_finite()
+        || !beta.is_finite()
+        || alpha <= 0.0
+        || beta <= 0.0
+        || !latent.is_finite()
+        || !(0.0..1.0).contains(&latent)
+    {
         return Err(MidasError::Policy(
-            "single-asset capped categorical probabilities are invalid".into(),
+            "invalid Beta log-probability input".into(),
         ));
     }
-    for probability in &mut probabilities {
-        *probability /= sum;
+    let value = (alpha - 1.0) * latent.ln() + (beta - 1.0) * (1.0 - latent).ln()
+        - beta_log_normalizer(alpha, beta);
+    if !value.is_finite() {
+        return Err(MidasError::Policy("non-finite Beta log probability".into()));
     }
-    Ok(probabilities)
+    Ok(value)
+}
+
+fn beta_log_normalizer(alpha: f64, beta: f64) -> f64 {
+    libm::lgamma(alpha) + libm::lgamma(beta) - libm::lgamma(alpha + beta)
+}
+
+fn beta_log_probability_derivative_alpha(alpha: f64, beta: f64, latent: f64) -> Result<f64> {
+    let value = latent.ln() - digamma(alpha) + digamma(alpha + beta);
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(MidasError::Policy(
+            "non-finite Beta alpha log-probability gradient".into(),
+        ))
+    }
+}
+
+fn beta_log_probability_derivative_beta(alpha: f64, beta: f64, latent: f64) -> Result<f64> {
+    let value = (1.0 - latent).ln() - digamma(beta) + digamma(alpha + beta);
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(MidasError::Policy(
+            "non-finite Beta beta log-probability gradient".into(),
+        ))
+    }
+}
+
+fn beta_entropy(alpha: f64, beta: f64) -> Result<f64> {
+    let sum = alpha + beta;
+    let value = beta_log_normalizer(alpha, beta)
+        - (alpha - 1.0) * digamma(alpha)
+        - (beta - 1.0) * digamma(beta)
+        + (sum - 2.0) * digamma(sum);
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(MidasError::Policy("non-finite Beta entropy".into()))
+    }
+}
+
+fn beta_entropy_derivative_alpha(alpha: f64, beta: f64) -> Result<f64> {
+    let value = -(alpha - 1.0) * trigamma(alpha) + (alpha + beta - 2.0) * trigamma(alpha + beta);
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(MidasError::Policy(
+            "non-finite Beta entropy gradient".into(),
+        ))
+    }
+}
+
+fn beta_entropy_derivative_beta(alpha: f64, beta: f64) -> Result<f64> {
+    let value = -(beta - 1.0) * trigamma(beta) + (alpha + beta - 2.0) * trigamma(alpha + beta);
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(MidasError::Policy(
+            "non-finite Beta entropy gradient".into(),
+        ))
+    }
+}
+
+// Recurrence plus an asymptotic expansion gives stable digamma/trigamma
+// values for the bounded positive shapes used by the action distribution.
+fn digamma(mut value: f64) -> f64 {
+    let mut result = 0.0;
+    while value < 8.0 {
+        result -= 1.0 / value;
+        value += 1.0;
+    }
+    let inverse = 1.0 / value;
+    let inverse_squared = inverse * inverse;
+    result + value.ln()
+        - 0.5 * inverse
+        - inverse_squared
+            * (1.0 / 12.0
+                - inverse_squared
+                    * (1.0 / 120.0
+                        - inverse_squared
+                            * (1.0 / 252.0
+                                - inverse_squared * (1.0 / 240.0 - inverse_squared * 1.0 / 132.0))))
+}
+
+fn trigamma(mut value: f64) -> f64 {
+    let mut result = 0.0;
+    while value < 8.0 {
+        result += 1.0 / (value * value);
+        value += 1.0;
+    }
+    let inverse = 1.0 / value;
+    let inverse_squared = inverse * inverse;
+    result + inverse + 0.5 * inverse_squared + inverse_squared * inverse / 6.0
+        - inverse_squared * inverse_squared * inverse / 30.0
+        + inverse_squared.powi(3) * inverse / 42.0
+        - inverse_squared.powi(4) * inverse / 30.0
 }
 
 pub struct CashPolicy;
@@ -1582,6 +1956,7 @@ impl Policy for BuyAndHoldPolicy {
 mod tests {
     use super::*;
     use crate::{
+        action::{ActionValidationContext, ActionValidator, LongOnlyActionValidator},
         config::{Activation, EvolvableTraitsConfig, LearningConfig, LearningKind},
         learning::{PpoTrainingBatch, PpoTrainingSample},
     };
@@ -1597,6 +1972,7 @@ mod tests {
             actor_output_size: 2,
             critic_output_size: 1,
             activation: Activation::Relu,
+            action_distribution: ActionDistributionConfig::default(),
         }
     }
 
@@ -1630,7 +2006,17 @@ mod tests {
                 schema_hash: "schema".into(),
                 values,
             },
-            action_index: Some(action_index),
+            action_sample: Some(PolicyActionSample {
+                active_asset_indices: vec![0],
+                latent_samples: vec![if action_index == 0 { 0.25 } else { 0.75 }],
+                allocation: vec![
+                    if action_index == 0 { 0.75 } else { 0.25 },
+                    if action_index == 0 { 0.25 } else { 0.75 },
+                ],
+                maximum_asset_allocation: 1.0,
+                log_probability: old_log_probability,
+                entropy: 0.0,
+            }),
             old_log_probability: Some(old_log_probability),
             advantage: Some(advantage),
             return_value: Some(return_value),
@@ -1709,7 +2095,14 @@ mod tests {
                     schema_hash: "schema".into(),
                     values: vec![0.2, -0.1],
                 },
-                action_index: Some(0),
+                action_sample: Some(PolicyActionSample {
+                    active_asset_indices: vec![0],
+                    latent_samples: vec![0.5],
+                    allocation: vec![0.5, 0.5],
+                    maximum_asset_allocation: 1.0,
+                    log_probability: -std::f32::consts::LN_2,
+                    entropy: 0.0,
+                }),
                 old_log_probability: Some(-std::f32::consts::LN_2),
                 advantage: Some(1.0),
                 return_value: Some(1.0),
@@ -1733,35 +2126,10 @@ mod tests {
 
     #[test]
     fn ppo_head_learning_changes_actor_weights_regression() {
-        let architecture = architecture();
-        let traits = EvolvableTraitsConfig::default();
-        let genome = BrainGenome::random(&architecture, &traits, 11).unwrap();
-        let device = ComputeDevice::CpuNdArray {
-            device: "default".into(),
-        };
-        let mut model = BurnNeuralModelFactory
-            .build(&genome, &architecture, &device)
-            .unwrap();
+        let mut model = deterministic_head_model();
         let before = model.lifetime_parameters().unwrap();
         let batch = PpoTrainingBatch {
-            samples: vec![PpoTrainingSample {
-                observation: Observation {
-                    schema_hash: "schema".into(),
-                    values: vec![0.8, -0.3],
-                },
-                action_index: Some(1),
-                old_log_probability: Some(-0.7),
-                advantage: Some(1.0),
-                return_value: Some(0.5),
-                value_estimate: Some(0.0),
-                recurrent_state: NeuralRuntimeState {
-                    memory: vec![0.0],
-                    inference_steps: 0,
-                },
-                tradable: vec![true],
-                temperature: Some(1.0),
-                invalid_action: false,
-            }],
+            samples: vec![ppo_sample(vec![0.8, 0.3], 1, 1.0, 0.5, -0.7)],
             sequence_length: 1,
         };
 
@@ -1779,12 +2147,7 @@ mod tests {
         let genome =
             BrainGenome::random(&architecture, &EvolvableTraitsConfig::default(), 41).unwrap();
         let before_genome = genome.clone();
-        let device = ComputeDevice::CpuNdArray {
-            device: "default".into(),
-        };
-        let mut model = BurnNeuralModelFactory
-            .build(&genome, &architecture, &device)
-            .unwrap();
+        let mut model = deterministic_head_model();
         let before = model.lifetime_parameters().unwrap();
         let builds_before = model.runtime_parameter_builds();
         let batch = PpoTrainingBatch {
@@ -1963,15 +2326,38 @@ mod tests {
         let output_b = model
             .evaluate_representation(&state_b.representation)
             .unwrap();
-        let probabilities_a =
-            single_asset_capped_categorical_probabilities(&output_a.logits, &[true], 1, 1.0)
-                .unwrap();
-        let probabilities_b =
-            single_asset_capped_categorical_probabilities(&output_b.logits, &[true], 1, 1.0)
-                .unwrap();
-        assert!(probabilities_a[1] > probabilities_a[0]);
-        assert!(probabilities_b[0] > probabilities_b[1]);
-        assert!(probabilities_a[1] > probabilities_b[1] + 1e-4);
+        let evaluation_a = bounded_stick_breaking_evaluation(
+            output_a,
+            &[true],
+            1.0,
+            false,
+            1.0,
+            &mut ChaCha8Rng::seed_from_u64(1),
+            &model.architecture.action_distribution,
+        )
+        .unwrap();
+        let evaluation_b = bounded_stick_breaking_evaluation(
+            output_b,
+            &[true],
+            1.0,
+            false,
+            1.0,
+            &mut ChaCha8Rng::seed_from_u64(1),
+            &model.architecture.action_distribution,
+        )
+        .unwrap();
+        assert!(
+            evaluation_a.proposed_allocation.weights()[1]
+                > evaluation_b.proposed_allocation.weights()[1]
+        );
+        assert!(
+            evaluation_a.proposed_allocation.weights()[1]
+                > 1.0 - evaluation_a.proposed_allocation.weights()[1]
+        );
+        assert!(
+            evaluation_b.proposed_allocation.weights()[0]
+                > evaluation_b.proposed_allocation.weights()[1]
+        );
     }
 
     #[test]
@@ -2088,19 +2474,20 @@ mod tests {
     }
 
     #[test]
-    fn categorical_policy_is_masked_and_seed_reproducible() {
+    fn bounded_stick_breaking_is_masked_and_seed_reproducible() {
         let output = NeuralOutput {
-            logits: vec![0.0, 2.0, 1.0],
+            logits: vec![0.0, 2.0, 0.0, 1.0],
             value: 0.0,
         };
         let mut deterministic_rng = ChaCha8Rng::seed_from_u64(1);
-        let deterministic = single_asset_capped_categorical_evaluation(
+        let deterministic = bounded_stick_breaking_evaluation(
             output.clone(),
             &[true, false],
             0.5,
             false,
             1.0,
             &mut deterministic_rng,
+            &ActionDistributionConfig::default(),
         )
         .unwrap();
         assert!(
@@ -2116,24 +2503,216 @@ mod tests {
         assert_eq!(deterministic.proposed_allocation.weights()[2], 0.0);
         let mut left_rng = ChaCha8Rng::seed_from_u64(5);
         let mut right_rng = ChaCha8Rng::seed_from_u64(5);
-        let left = single_asset_capped_categorical_evaluation(
+        let left = bounded_stick_breaking_evaluation(
             output.clone(),
             &[true, true],
             0.5,
             true,
             1.0,
             &mut left_rng,
+            &ActionDistributionConfig::default(),
         )
         .unwrap();
-        let right = single_asset_capped_categorical_evaluation(
+        let right = bounded_stick_breaking_evaluation(
             output,
             &[true, true],
             0.5,
             true,
             1.0,
             &mut right_rng,
+            &ActionDistributionConfig::default(),
         )
         .unwrap();
         assert_eq!(left, right);
+    }
+
+    #[test]
+    fn neural_policy_can_allocate_positive_weight_to_two_assets() {
+        let output = NeuralOutput {
+            logits: vec![0.0, 0.0, 0.0, 0.0],
+            value: 0.0,
+        };
+        let mut rng = ChaCha8Rng::seed_from_u64(9);
+        let evaluation = bounded_stick_breaking_evaluation(
+            output,
+            &[true, true],
+            0.5,
+            false,
+            1.0,
+            &mut rng,
+            &ActionDistributionConfig::default(),
+        )
+        .unwrap();
+        let weights = evaluation.proposed_allocation.weights();
+        assert!(weights[1] > 0.0, "first asset must receive positive weight");
+        assert!(
+            weights[2] > 0.0,
+            "second asset must receive positive weight"
+        );
+    }
+
+    #[test]
+    fn bounded_stick_breaking_distribution_is_valid_across_masks_caps_and_seeds() {
+        for (tradable, cap) in [
+            (vec![true, true, true], 1.0),
+            (vec![true, false, true], 0.5),
+            (vec![false, false, false], 0.25),
+            (vec![true, true, true], 0.01),
+        ] {
+            for seed in 0..32_u64 {
+                let output = NeuralOutput {
+                    logits: vec![0.3, -0.2, 1.0, -1.0, -0.7, 0.8],
+                    value: 0.0,
+                };
+                let evaluation = bounded_stick_breaking_evaluation(
+                    output,
+                    &tradable,
+                    cap,
+                    true,
+                    1.0,
+                    &mut ChaCha8Rng::seed_from_u64(seed),
+                    &ActionDistributionConfig::default(),
+                )
+                .unwrap();
+                let weights = evaluation.proposed_allocation.weights();
+                assert_eq!(weights.len(), 4);
+                assert!(
+                    weights
+                        .iter()
+                        .all(|weight| weight.is_finite() && *weight >= 0.0)
+                );
+                assert!((weights.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+                for (index, is_tradable) in tradable.iter().enumerate() {
+                    if !is_tradable {
+                        assert_eq!(weights[index + 1], 0.0);
+                    } else {
+                        assert!(weights[index + 1] <= cap + 1e-9);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_stick_breaking_log_probability_recomputes_exactly() {
+        let output = NeuralOutput {
+            logits: vec![0.3, -0.2, 1.0, -1.0, -0.7, 0.8],
+            value: 0.0,
+        };
+        let config = ActionDistributionConfig::default();
+        let evaluation = bounded_stick_breaking_evaluation(
+            output.clone(),
+            &[true, false, true],
+            0.5,
+            true,
+            1.0,
+            &mut ChaCha8Rng::seed_from_u64(12),
+            &config,
+        )
+        .unwrap();
+        let sample = evaluation.action_sample.as_ref().unwrap();
+        let recomputed = evaluate_bounded_stick_breaking_sample(
+            &output.logits,
+            &[true, false, true],
+            sample,
+            1.0,
+            &config,
+        )
+        .unwrap();
+        assert!((sample.log_probability - recomputed.log_probability).abs() < 1e-6);
+        assert!((sample.entropy - recomputed.entropy).abs() < 1e-6);
+    }
+
+    #[test]
+    fn deterministic_stick_breaking_evaluation_does_not_consume_rng() {
+        let output = NeuralOutput {
+            logits: vec![0.0, 0.0, 0.0, 0.0],
+            value: 0.0,
+        };
+        let mut rng = ChaCha8Rng::seed_from_u64(77);
+        let mut expected = rng.clone();
+        bounded_stick_breaking_evaluation(
+            output,
+            &[true, true],
+            0.5,
+            false,
+            1.0,
+            &mut rng,
+            &ActionDistributionConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(rng.r#gen::<u64>(), expected.r#gen::<u64>());
+    }
+
+    #[test]
+    fn sampled_valid_allocation_survives_central_validation_unchanged() {
+        let evaluation = bounded_stick_breaking_evaluation(
+            NeuralOutput {
+                logits: vec![0.2, -0.3, 0.4, 0.1],
+                value: 0.0,
+            },
+            &[true, true],
+            0.5,
+            true,
+            1.0,
+            &mut ChaCha8Rng::seed_from_u64(3),
+            &ActionDistributionConfig::default(),
+        )
+        .unwrap();
+        let proposed = evaluation.proposed_allocation.clone();
+        let validated = LongOnlyActionValidator
+            .validate(
+                proposed,
+                &ActionValidationContext {
+                    asset_count: 2,
+                    tradable: &[true, true],
+                    policy_maximum_asset_allocation: Some(0.5),
+                    market_maximum_asset_allocation: None,
+                },
+            )
+            .unwrap();
+        assert!(
+            validated
+                .weights()
+                .iter()
+                .zip(evaluation.proposed_allocation.weights())
+                .all(|(actual, proposed)| (actual - proposed).abs() < 1e-9)
+        );
+    }
+
+    #[test]
+    fn beta_log_probability_gradient_matches_finite_difference() {
+        let config = ActionDistributionConfig::default();
+        let raw_alpha = 0.35_f32;
+        let raw_beta = -0.4_f32;
+        let latent = 0.37_f64;
+        let (alpha, beta, d_alpha, _) = beta_shapes(raw_alpha, raw_beta, 1.0, &config).unwrap();
+        let analytic =
+            beta_log_probability_derivative_alpha(alpha, beta, latent).unwrap() * d_alpha;
+        let step = 1e-4_f32;
+        let shifted = |raw: f32| {
+            let (a, b, _, _) = beta_shapes(raw, raw_beta, 1.0, &config).unwrap();
+            beta_log_probability(a, b, latent).unwrap()
+        };
+        let finite_difference =
+            (shifted(raw_alpha + step) - shifted(raw_alpha - step)) / (2.0 * step as f64);
+        assert!((analytic - finite_difference).abs() < 2e-3);
+    }
+
+    #[test]
+    fn beta_entropy_gradient_matches_finite_difference() {
+        let config = ActionDistributionConfig::default();
+        let raw_alpha = 0.35_f32;
+        let raw_beta = -0.4_f32;
+        let (alpha, beta, d_alpha, _) = beta_shapes(raw_alpha, raw_beta, 1.0, &config).unwrap();
+        let analytic = beta_entropy_derivative_alpha(alpha, beta).unwrap() * d_alpha;
+        let step = 1e-4_f32;
+        let shifted = |raw: f32| {
+            let (a, b, _, _) = beta_shapes(raw, raw_beta, 1.0, &config).unwrap();
+            beta_entropy(a, b).unwrap()
+        };
+        let finite_difference =
+            (shifted(raw_alpha + step) - shifted(raw_alpha - step)) / (2.0 * step as f64);
+        assert!((analytic - finite_difference).abs() < 2e-3);
     }
 }

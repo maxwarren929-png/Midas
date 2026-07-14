@@ -36,7 +36,7 @@ pub struct Transition {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PpoTrainingSample {
     pub observation: Observation,
-    pub action_index: Option<usize>,
+    pub action_sample: Option<PolicyActionSample>,
     pub old_log_probability: Option<f32>,
     pub advantage: Option<f32>,
     pub return_value: Option<f32>,
@@ -286,12 +286,7 @@ impl PpoLearning {
                             .zip(transition.temperature)
                             .zip(advantage)
                             .map(|((old_log_probability, temperature), advantage)| {
-                                (
-                                    sample.action_index,
-                                    old_log_probability,
-                                    temperature,
-                                    advantage,
-                                )
+                                (sample.clone(), old_log_probability, temperature, advantage)
                             })
                     });
                 let critic_sample = transition
@@ -303,14 +298,14 @@ impl PpoLearning {
                 }
                 Some(PpoTrainingSample {
                     observation,
-                    action_index: actor_sample.map(|sample| sample.0),
-                    old_log_probability: actor_sample.map(|sample| sample.1),
-                    advantage: actor_sample.map(|sample| sample.3),
+                    action_sample: actor_sample.as_ref().map(|sample| sample.0.clone()),
+                    old_log_probability: actor_sample.as_ref().map(|sample| sample.1),
+                    advantage: actor_sample.as_ref().map(|sample| sample.3),
                     return_value: critic_sample.map(|sample| sample.1),
                     value_estimate: critic_sample.map(|sample| sample.0),
                     recurrent_state,
                     tradable: transition.tradable.clone(),
-                    temperature: actor_sample.map(|sample| sample.2),
+                    temperature: actor_sample.as_ref().map(|sample| sample.2),
                     invalid_action: transition.invalid_action,
                 })
             })
@@ -660,7 +655,10 @@ mod tests {
             }),
             action,
             action_sample: Some(PolicyActionSample {
-                action_index: 0,
+                active_asset_indices: vec![0],
+                latent_samples: vec![0.5],
+                allocation: vec![0.5, 0.5],
+                maximum_asset_allocation: 1.0,
                 log_probability: -std::f32::consts::LN_2,
                 entropy: std::f32::consts::LN_2,
             }),

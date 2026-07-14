@@ -6,6 +6,7 @@ from __future__ import annotations
 import csv
 import json
 import statistics
+import argparse
 from pathlib import Path
 
 CONDITIONS = ("control", "ppo", "evolution-only", "ppo-evolution")
@@ -74,6 +75,11 @@ def run_row(condition, seed):
         "mutations": evolution.get("mutation_count", diagnostic["evolution"]["mutations_observed"]),
         "random_fallback_births": evolution.get("random_fallback_births", 0),
         "diversity_relaxations": evolution.get("diversity_constraint_relaxations", 0),
+        "neural_action_count": diagnostic["mechanics"].get("neural_action_count", 0),
+        "neural_multi_asset_action_fraction": diagnostic["mechanics"].get("neural_multi_asset_action_fraction", 0.0),
+        "neural_mean_active_positions": diagnostic["mechanics"].get("neural_mean_active_positions", 0.0),
+        "neural_mean_concentration": diagnostic["mechanics"].get("neural_mean_concentration", 0.0),
+        "neural_mean_cash_allocation": diagnostic["mechanics"].get("neural_mean_cash_allocation", 0.0),
         "actor_delta": diagnostic["learning"]["actor_head_delta_norm"],
         "critic_delta": diagnostic["learning"]["critic_head_delta_norm"],
         "hidden_delta": diagnostic["learning"]["hidden_delta_norm"],
@@ -95,21 +101,29 @@ def write_csv(path, rows, fields):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--reports-dir", default="reports")
+    parser.add_argument("--output-dir", default=None)
+    args = parser.parse_args()
+    global REPORTS
+    REPORTS = Path(args.reports_dir)
+    output = Path(args.output_dir) if args.output_dir else REPORTS
+    output.mkdir(parents=True, exist_ok=True)
     rows = [run_row(condition, seed) for condition in CONDITIONS for seed in SEEDS]
-    write_csv(REPORTS / "run-level-results.csv", rows, list(rows[0]))
+    write_csv(output / "run-level-results.csv", rows, list(rows[0]))
     ppo_fields = [
         "condition", "seed", "ppo_updates", "optimizer_steps", "actor_delta", "critic_delta",
         "hidden_delta", "recurrent_delta", "genome_matches", "mean_policy_loss",
         "mean_value_loss", "mean_entropy", "mean_gradient_norm", "masked_rollout_entries",
         "actor_ineligible_entries", "critic_ineligible_entries",
     ]
-    write_csv(REPORTS / "ppo-diagnostics.csv", [{key: row[key] for key in ppo_fields} for row in rows], ppo_fields)
+    write_csv(output / "ppo-diagnostics.csv", [{key: row[key] for key in ppo_fields} for row in rows], ppo_fields)
     evolution_fields = [
         "condition", "seed", "deaths", "births", "reproductions", "crossovers", "mutations",
         "random_fallback_births", "max_generation_depth", "active_lineages", "mean_genetic_distance",
         "minimum_genetic_distance", "mean_lifespan", "diversity_relaxations",
     ]
-    write_csv(REPORTS / "evolution-diagnostics.csv", [{key: row[key] for key in evolution_fields} for row in rows], evolution_fields)
+    write_csv(output / "evolution-diagnostics.csv", [{key: row[key] for key in evolution_fields} for row in rows], evolution_fields)
 
     summary = []
     for condition in CONDITIONS:
@@ -130,10 +144,14 @@ def main():
             "reproductions": mean([row["reproductions"] for row in group]),
             "max_generation_depth": max(row["max_generation_depth"] for row in group),
             "active_lineages": mean([row["active_lineages"] for row in group]),
+            "multi_asset_action_fraction": mean([row["neural_multi_asset_action_fraction"] for row in group]),
+            "mean_active_positions": mean([row["neural_mean_active_positions"] for row in group]),
+            "mean_concentration": mean([row["neural_mean_concentration"] for row in group]),
+            "mean_cash_allocation": mean([row["neural_mean_cash_allocation"] for row in group]),
             "seed_mean_std": statistics.stdev([row["mean_final_net_worth"] for row in group]),
         })
     fields = list(summary[0])
-    write_csv(REPORTS / "experiment-summary.csv", summary, fields)
+    write_csv(output / "experiment-summary.csv", summary, fields)
 
     benchmark_rows = []
     for seed in SEEDS:
@@ -143,7 +161,7 @@ def main():
                 if ": ending_net_worth=" in line:
                     policy, value = line.split(": ending_net_worth=")
                     benchmark_rows.append({"seed": seed, "split": split, "policy": policy, "ending_net_worth": float(value)})
-    write_csv(REPORTS / "benchmark-results.csv", benchmark_rows, ["seed", "split", "policy", "ending_net_worth"])
+    write_csv(output / "benchmark-results.csv", benchmark_rows, ["seed", "split", "policy", "ending_net_worth"])
 
     control = {row["seed"]: row for row in rows if row["condition"] == "control"}
     comparisons = []
@@ -158,7 +176,7 @@ def main():
             "seeds_beating_control": sum(value > 0.0 for value in differences),
             "seeds": len(differences),
         })
-    write_csv(REPORTS / "condition-comparisons.csv", comparisons, list(comparisons[0]))
+    write_csv(output / "condition-comparisons.csv", comparisons, list(comparisons[0]))
 
 
 if __name__ == "__main__":

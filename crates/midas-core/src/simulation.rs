@@ -23,7 +23,7 @@ use crate::{
     market::{
         BackwardFeaturePipeline, CorporateAction, FeaturePipeline, FeatureRow, MarketDataset,
     },
-    metrics::{EventSink, MetricsCollector},
+    metrics::{AllocationStats, EventSink, MetricsCollector},
     observation::{
         ObservationBuilder, ObservationContext, ObservationSchema, SchemaObservationBuilder,
     },
@@ -36,10 +36,11 @@ use crate::{
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
-// Version 8 adds masked chronological rollout entries and benchmark-aware
-// action-validation state. Checkpoint 7 cannot be safely migrated because
-// its transition eligibility and allocation-cap semantics are absent.
-pub const CHECKPOINT_VERSION: u32 = 8;
+// Version 9 replaces the categorical single-asset action sample and actor
+// layout with bounded stick-breaking Beta latents. Checkpoint 8 cannot be
+// safely migrated because its rollout samples and actor tensors have a
+// different action identity and output dimension.
+pub const CHECKPOINT_VERSION: u32 = 9;
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum DatasetSplit {
     Training,
@@ -237,6 +238,7 @@ struct StepTransaction {
     events: Vec<DomainEvent>,
     replacement: Option<Box<dyn ReplacementStrategy>>,
     evolution: EvolutionState,
+    allocation_stats: AllocationStats,
 }
 type AdvanceResult = (Vec<DomainEvent>, Option<(AgentId, NaiveDate)>, f32);
 #[derive(Clone, Debug)]
@@ -536,6 +538,7 @@ impl SimulationEngine {
             events: Vec::new(),
             replacement: None,
             evolution: self.evolution.clone(),
+            allocation_stats: AllocationStats::default(),
         };
         let mut transaction = transaction;
         match self.execute_step(&mut transaction) {
@@ -632,6 +635,7 @@ impl SimulationEngine {
             for event in &transaction.events {
                 candidate_metrics.on_event(event);
             }
+            candidate_metrics.record_neural_allocations(&transaction.allocation_stats);
             let mut candidate_events = self.domain_events.clone();
             candidate_events.extend(transaction.events.clone());
             let checkpoint = self.checkpoint_from_state(
@@ -651,10 +655,12 @@ impl SimulationEngine {
             events,
             replacement,
             evolution,
+            allocation_stats,
         } = transaction;
         self.agents = agents;
         self.next_agent_id = next_agent_id;
         self.evolution = evolution;
+        self.metrics.record_neural_allocations(&allocation_stats);
         if let Some(replacement) = replacement {
             self.replacement = replacement;
         }
@@ -746,6 +752,12 @@ impl SimulationEngine {
                     evaluation,
                     runtime_before,
                 } => {
+                    if matches!(
+                        agent.policy.policy_blueprint(),
+                        crate::brain::PolicyBlueprint::Neural
+                    ) {
+                        transaction.allocation_stats.record(validated.weights())?;
+                    }
                     let (events, death, reward) = self.advance_agent(
                         agent,
                         &validated,
@@ -796,6 +808,12 @@ impl SimulationEngine {
                     evaluation,
                     runtime_before,
                 } => {
+                    if matches!(
+                        agent.policy.policy_blueprint(),
+                        crate::brain::PolicyBlueprint::Neural
+                    ) {
+                        transaction.allocation_stats.record(fallback.weights())?;
+                    }
                     let failure_event =
                         self.policy_failure_event(agent, observation_date, incident.clone());
                     transaction.events.push(failure_event);
@@ -1708,12 +1726,14 @@ impl SimulationEngine {
         let bytes = fs::read(path)?;
         let cp: Checkpoint = bincode::deserialize(&bytes).map_err(|_| {
             MidasError::Checkpoint(format!(
-                "incompatible checkpoint; expected format version {CHECKPOINT_VERSION}; older files omit masked rollout eligibility and benchmark allocation semantics"
+                "incompatible checkpoint; expected format version {CHECKPOINT_VERSION}; older files use an incompatible neural action-sample layout"
             ))
         })?;
         if cp.version != CHECKPOINT_VERSION {
             let detail = if cp.version == 6 {
                 "; checkpoint 6 contains bias-only optimizer state and cannot be migrated safely"
+            } else if cp.version == 8 {
+                "; checkpoint 8 contains single-asset categorical action samples and cannot be migrated safely"
             } else {
                 ""
             };
@@ -1833,12 +1853,12 @@ impl SimulationEngine {
         let bytes = fs::read(path)?;
         let cp: Checkpoint = bincode::deserialize(&bytes).map_err(|_| {
             MidasError::Checkpoint(format!(
-                "incompatible checkpoint; expected format version {CHECKPOINT_VERSION}"
+                "incompatible checkpoint; expected format version {CHECKPOINT_VERSION}; older files use an incompatible neural action-sample layout"
             ))
         })?;
         if cp.version != CHECKPOINT_VERSION {
             return Err(MidasError::Checkpoint(format!(
-                "checkpoint version {} is incompatible with {CHECKPOINT_VERSION}",
+                "checkpoint version {} is incompatible with {CHECKPOINT_VERSION}; neural action distribution layouts are not migrated",
                 cp.version
             )));
         }
@@ -1959,6 +1979,28 @@ impl SimulationEngine {
             learning_implementation: learning_implementation.into(),
             learning_updates: self.metrics.learning_updates,
             evolutionary_births: self.metrics.reproductions,
+            neural_action_count: self.metrics.neural_action_count,
+            neural_multi_asset_action_fraction: if self.metrics.neural_action_count > 0 {
+                self.metrics.neural_multi_asset_actions as f64
+                    / self.metrics.neural_action_count as f64
+            } else {
+                0.0
+            },
+            neural_mean_active_positions: if self.metrics.neural_action_count > 0 {
+                self.metrics.neural_active_position_total / self.metrics.neural_action_count as f64
+            } else {
+                0.0
+            },
+            neural_mean_concentration: if self.metrics.neural_action_count > 0 {
+                self.metrics.neural_concentration_total / self.metrics.neural_action_count as f64
+            } else {
+                0.0
+            },
+            neural_mean_cash_allocation: if self.metrics.neural_action_count > 0 {
+                self.metrics.neural_cash_allocation_total / self.metrics.neural_action_count as f64
+            } else {
+                0.0
+            },
             active_lineages: self.evolution.metrics.active_lineages,
             lifecycle: self.lifecycle.clone(),
             failure_reason: match &self.lifecycle {
@@ -1982,6 +2024,11 @@ pub struct SimulationReport {
     pub learning_implementation: String,
     pub learning_updates: u64,
     pub evolutionary_births: u64,
+    pub neural_action_count: u64,
+    pub neural_multi_asset_action_fraction: f64,
+    pub neural_mean_active_positions: f64,
+    pub neural_mean_concentration: f64,
+    pub neural_mean_cash_allocation: f64,
     pub active_lineages: u64,
     pub lifecycle: SimulationLifecycle,
     pub failure_reason: Option<String>,

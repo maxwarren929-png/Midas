@@ -1,6 +1,19 @@
 # Implementation Status
 
-## Prompt 2.5 experimental correctness repair
+## Prompt 3A: multi-asset portfolio policy distribution
+
+Implemented the transition from the restricted single-asset categorical action space to a mathematically valid bounded stick-breaking portfolio distribution. The actor output is now `2 * asset_count`: one raw alpha and beta shape value per asset. For each tradable asset in stable order, the transformed shapes parameterise an independent Beta latent; the sampled latent is mapped to `min(maximum_allocation, remaining) * u`, and cash receives the residual. This supports simultaneous positive allocations to multiple assets while guaranteeing finite, non-negative, simplex-valid actions and exact zero for unavailable assets.
+
+- `ActionDistributionConfig` is typed and validated (`bounded_stick_breaking`, minimum/maximum shape, latent epsilon, stable asset order). The distribution identity is embedded in `BrainArchitecture`, configuration hashes, and checkpoint compatibility.
+- `PolicyActionSample` stores active asset indices, latent samples, final allocation, cap, exact joint log probability, and entropy. PPO treats the latent vector as the action; no post-hoc cap clipping or unchanged-probability renormalisation is used.
+- Burn training recomputes the exact Beta log density and entropy. Actor gradients include digamma/trigamma derivatives, softplus and temperature chain rules, PPO clipping, entropy regularisation, and joint gradient clipping. Critic training remains unchanged. Hidden and recurrent parameters stay frozen; birth genomes remain immutable.
+- Deterministic evaluation uses Beta means without consuming RNG or decaying exploration temperature. The central action validator confirms sampled allocations without changing their semantics beyond numerical tolerance.
+- Checkpoint format is now 9. Formats 6, 7, and 8 are rejected explicitly because their optimizer, rollout, or categorical action-sample layouts cannot be migrated safely. Evolution crossover, mutation, genome distance, and genome-only inheritance use the expanded actor matrices through architecture validation.
+- Regression coverage includes the formerly failing two-asset allocation test, masks, caps from `0.01` through `1.0`, no-tradable cash fallback, deterministic RNG behavior, exact log-probability recomputation, finite-difference Beta gradients, full-head PPO updates, frozen encoders, multi-asset execution, and checkpoint rejection.
+
+The previous controlled experiment suite was rerun with the same synthetic data, seeds, survival pressure, costs, reward, fitness, and horizon after implementation. Results are recorded in `reports/PROMPT3A_CONTROLLED_EXPERIMENT.md`; they remain short-horizon CPU evidence rather than profitability evidence. The stable sequential stick-breaking order is a known ordering bias, and full recurrent BPTT, alternate action distributions, GPU execution, and turnover-penalty experiments remain outside this prompt.
+
+## Prompt 2.5 experimental correctness repair (historical; superseded by Prompt 3A checkpoint v9)
 
 The pre-experiment correctness pass is implemented. Checkpoint format is now 8 because rollout entries carry explicit masked-timestep and actor/critic eligibility state, while action validation records separate policy and universal-market caps.
 
@@ -13,7 +26,7 @@ Regression coverage is now 25 core unit tests, 48 foundation tests, and 5 Prompt
 
 Files changed in this pass: `src/lib.rs`, `src/action.rs`, `src/agent.rs`, `src/brain.rs`, `src/evolution.rs`, `src/learning.rs`, `src/metrics.rs`, `src/replacement.rs`, `src/simulation.rs`, the foundation and Prompt 2 integration tests, `README.md`, `docs/EXTENDING.md`, and this status document. Verification passed with `cargo fmt --all --check`, workspace check, Clippy with `-D warnings`, the full workspace test suite, all focused recovery/selection/benchmark/temperature/mutation/checkpoint/atomic filters, and the release CLI validation, simulation, benchmark, and evolution-report commands. The synthetic Prompt 2 run completed 7 steps with 6 PPO updates and no deaths; this is a correctness smoke test, not an experiment claim.
 
-## Prompt 2.25 verification and hardening
+## Prompt 2.25 verification and hardening (historical action-space description; superseded by Prompt 3A)
 
 State-dependent frozen-encoder PPO head learning is implemented and tested. Burn now uses one shared encoded-state path for inference and training. The hidden and recurrent layers remain frozen, while actor and critic dense output weights and biases are lifetime parameters updated by PPO. Gradient accumulation uses the outer product of the encoded representation and the categorical logit/value gradients; entropy, clipping, joint gradient clipping, finite checks, and shape-complete momentum state are included. The birth genome remains immutable.
 
@@ -25,7 +38,7 @@ State-dependent frozen-encoder PPO head learning is implemented and tested. Burn
 
 Current test totals are 21 core unit tests, 45 foundation regressions, and 4 Prompt 2 integration tests (70 tests, no failures). Only CPU Burn `NdArray` is implemented. Full recurrent BPTT, hidden-layer training, alternate allocation distributions, GPU, distributed learning, topology evolution, and Lamarckian inheritance remain outside this prompt.
 
-## Prompt 2: lifetime learning and evolution
+## Prompt 2: lifetime learning and evolution (historical action-space description; superseded by Prompt 3A)
 
 The Prompt 2 implementation is present and verified at the current foundation boundary.
 

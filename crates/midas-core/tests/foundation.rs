@@ -968,7 +968,7 @@ fn checkpoint_v6_is_rejected_as_bias_only_optimizer_layout() {
     let file = tempfile::NamedTempFile::new().unwrap();
     engine.save_checkpoint(file.path()).unwrap();
     let mut bytes = fs::read(file.path()).unwrap();
-    assert_eq!(bytes.first().copied(), Some(8));
+    assert_eq!(bytes.first().copied(), Some(9));
     bytes[0] = 6;
     fs::write(file.path(), bytes).unwrap();
     let error = match SimulationEngine::resume(c, data, file.path()) {
@@ -976,6 +976,26 @@ fn checkpoint_v6_is_rejected_as_bias_only_optimizer_layout() {
         Err(error) => error,
     };
     assert!(error.to_string().contains("bias-only optimizer"));
+}
+
+#[test]
+fn checkpoint_v8_is_rejected_as_single_asset_action_layout() {
+    let c = config();
+    let data = loaded(&c);
+    let mut engine =
+        SimulationEngine::new(c.clone(), data.clone(), DatasetSplit::Training).unwrap();
+    engine.run_steps(1).unwrap();
+    let file = tempfile::NamedTempFile::new().unwrap();
+    engine.save_checkpoint(file.path()).unwrap();
+    let mut bytes = fs::read(file.path()).unwrap();
+    assert_eq!(bytes.first().copied(), Some(9));
+    bytes[0] = 8;
+    fs::write(file.path(), bytes).unwrap();
+    let error = match SimulationEngine::resume(c, data, file.path()) {
+        Ok(_) => panic!("checkpoint 8 was accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("single-asset categorical"));
 }
 
 struct MockModel {
@@ -1803,6 +1823,7 @@ fn neural_memory_resets_and_genome_validates_full_schema() {
         actor_output_size: 2,
         critic_output_size: 1,
         activation: midas_core::config::Activation::Relu,
+        action_distribution: midas_core::config::ActionDistributionConfig::default(),
     };
     let c = config();
     let genome = BrainGenome::random(&architecture, &c.brain.traits, 1).unwrap();
