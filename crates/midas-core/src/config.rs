@@ -1,7 +1,7 @@
 use crate::{MidasError, Result};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
-use std::{fs, path::Path};
+use std::{collections::BTreeMap, fs, path::Path};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -14,6 +14,8 @@ pub struct Config {
     pub features: FeatureConfig,
     #[serde(default)]
     pub observation: ObservationConfig,
+    #[serde(default)]
+    pub observations: ObservationRegistryConfig,
     #[serde(default)]
     pub corporate_actions: CorporateActionConfig,
     #[serde(default)]
@@ -342,6 +344,115 @@ impl Default for ObservationConfig {
                 ObservationFeatureKind::TurnoverToNetWorth,
                 ObservationFeatureKind::NormalizedAge,
             ],
+        }
+    }
+}
+
+/// Registry selection and per-name normalisation overrides.  The singular
+/// `observation` table remains the backwards-compatible compact schema source;
+/// this table controls which sensor providers are registered.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationRegistryConfig {
+    #[serde(default = "default_observation_schema_name")]
+    pub schema: String,
+    #[serde(default = "default_observation_providers")]
+    pub providers: Vec<String>,
+    #[serde(default)]
+    pub normalizations: BTreeMap<String, ObservationNormalizationConfig>,
+}
+
+fn default_observation_schema_name() -> String {
+    "default".into()
+}
+
+fn default_observation_providers() -> Vec<String> {
+    vec!["market".into(), "portfolio".into(), "agent_state".into()]
+}
+
+impl Default for ObservationRegistryConfig {
+    fn default() -> Self {
+        Self {
+            schema: default_observation_schema_name(),
+            providers: default_observation_providers(),
+            normalizations: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationNormalizationKind {
+    None,
+    RatioClipped,
+    MinMax,
+    ZScore,
+    Log,
+    SignedLog,
+    Percentage,
+    Custom,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationNormalizationConfig {
+    pub kind: ObservationNormalizationKind,
+    #[serde(default)]
+    pub minimum: Option<f64>,
+    #[serde(default)]
+    pub maximum: Option<f64>,
+    #[serde(default)]
+    pub mean: Option<f64>,
+    #[serde(default)]
+    pub standard_deviation: Option<f64>,
+    #[serde(default)]
+    pub scale: Option<f64>,
+    #[serde(default)]
+    pub offset: Option<f64>,
+}
+
+impl ObservationNormalizationConfig {
+    pub fn validate(&self) -> Result<()> {
+        let all_finite = [
+            self.minimum,
+            self.maximum,
+            self.mean,
+            self.standard_deviation,
+            self.scale,
+            self.offset,
+        ]
+        .into_iter()
+        .flatten()
+        .all(f64::is_finite);
+        if !all_finite {
+            return Err(MidasError::Config(
+                "observation normalization values must be finite".into(),
+            ));
+        }
+        let valid = match self.kind {
+            ObservationNormalizationKind::None
+            | ObservationNormalizationKind::Log
+            | ObservationNormalizationKind::SignedLog => true,
+            ObservationNormalizationKind::RatioClipped | ObservationNormalizationKind::MinMax => {
+                self.minimum
+                    .zip(self.maximum)
+                    .is_some_and(|(minimum, maximum)| minimum < maximum)
+            }
+            ObservationNormalizationKind::ZScore => self
+                .mean
+                .zip(self.standard_deviation)
+                .is_some_and(|(_, standard_deviation)| standard_deviation > 0.0),
+            ObservationNormalizationKind::Percentage => {
+                self.scale.is_some_and(|scale| scale != 0.0)
+            }
+            ObservationNormalizationKind::Custom => self.scale.is_some() && self.offset.is_some(),
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(MidasError::Config(
+                "observation normalization configuration is incomplete or invalid".into(),
+            ))
         }
     }
 }
@@ -863,6 +974,42 @@ impl Config {
         }
         if self.observation.version == 0 || self.observation.features.is_empty() {
             return bad("observation schema version and features must be non-empty");
+        }
+        if self.observations.schema.trim().is_empty() || self.observations.providers.is_empty() {
+            return bad("observation registry schema and providers must be non-empty");
+        }
+        if self.observations.schema != "default" {
+            return bad(
+                "only the built-in observation schema named default is currently supported",
+            );
+        }
+        let mut observation_providers = self.observations.providers.clone();
+        observation_providers.sort();
+        observation_providers.dedup();
+        if observation_providers.len() != self.observations.providers.len()
+            || observation_providers
+                .iter()
+                .any(|provider| provider.trim().is_empty())
+        {
+            return bad("observation registry providers must be unique non-empty names");
+        }
+        for normalization in self.observations.normalizations.values() {
+            normalization.validate()?;
+        }
+        let observation_schema = crate::observation::ObservationSchema::try_from_config(self)?;
+        let used_observation_providers = observation_schema
+            .entries
+            .iter()
+            .map(|entry| entry.provider.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let configured_observation_providers = self
+            .observations
+            .providers
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        if used_observation_providers != configured_observation_providers {
+            return bad("configured observation providers must each have schema entries");
         }
         if self.corporate_actions.discontinuity_threshold <= 0.0
             || self.corporate_actions.discontinuity_threshold >= 1.0

@@ -1,5 +1,17 @@
 # Implementation Status
 
+## Prompt 5: modular observation architecture
+
+Prompt 5 replaces the positional observation-builder implementation with a versioned registry of read-only sensor providers while preserving Prompt 4's default vector values and trading behaviour.
+
+- `ObservationProvider` publishes named raw values through a registry-owned sink. The built-in `market`, `portfolio`, and `agent_state` providers are independent of PPO, neural models, execution, rewards, evolution, and checkpoints. Metadata records name, provider, description, units, shape, normalisation, version, and tags.
+- `ObservationSchema` now compiles each neural input into an explicit index/name/provider/source/component/normalisation entry. Registry registration order cannot alter the input vector. The default schema remains the existing market, portfolio, and agent-state ordering; the `modular_default_builder_matches_prompt4_positional_vector` regression compares it exactly with the retired positional contract.
+- `[observations]` selects the implemented default registry and provider set. Optional per-name `[observations.normalizations]` overrides support none, clipped ratio, min/max, z-score, log, signed log, percentage, and finite custom affine rules. Invalid names, duplicate metadata or indices, missing/unused registrations, dimensions, non-finite values, and invalid normalisation fail before simulation steps begin.
+- `midas observations list`, `schema`, `describe`, and `validate` provide deterministic offline introspection. The registry reuses per-builder scratch buffers instead of creating a provider-to-neural-vector path on every call.
+- Checkpoint format is now 12. Format 11 is rejected because it cannot prove compatibility with the registry-backed schema identity; no unsafe positional migration is provided. Schema hash remains part of the brain architecture and checkpoint validation.
+
+Prompt 5 deliberately adds no technical indicators, reward changes, PPO changes, evolution changes, or policy/action changes. Future providers can be added through the registry/schema boundary; evolutionary sensor selection is not yet implemented. [Default Observation Equivalence](reports/PROMPT5_OBSERVATION_EQUIVALENCE.md) records an exact Prompt 4 versus Prompt 5 economic-report comparison for the preserved seed-41 control run. Verification passed with `cargo fmt --all --check`, workspace check, Clippy with `-D warnings`, `cargo test --workspace --all-features` (**102 passed, 0 failed, 0 ignored**), observation and checkpoint filters, release config validation, observation CLI introspection, simulation, benchmark, and an exact partial-checkpoint/resume report comparison.
+
 ## Prompt 4: persistent incremental trade policy
 
 Prompt 4 replaces the neural target-portfolio action with persistent incremental trade impulses. The actor still emits two bounded-Beta shape values per asset, but the latent action is now mapped to one impulse in `[-1, 1]` per tradable asset (`2u - 1`). The configured `[brain.trading].maximum_trade_fraction` scales each impulse by current close net worth. Cash is implicit; existing holdings persist between decisions.
@@ -8,7 +20,7 @@ Prompt 4 replaces the neural target-portfolio action with persistent incremental
 - `ExecutionPlanner::plan_action` performs sells first, then fixed/variable-cost-aware common scaling of buys, minimum-trade filtering, and deterministic stable-ID ordering. `ExecutionApplier` remains atomic and rejects negative cash, holdings, leverage, and tampered economics. Impossible requests are broker constraints, not policy failures.
 - PPO continues to use the exact independent Beta latent log probability and entropy; deterministic evaluation uses Beta means and does not consume RNG or decay temperature. Full actor/critic head training, frozen encoder, reward, and evolution are unchanged.
 - Decision traces now include requested/executed impulses, notionals, scaling, rejected notional, cash and holdings before/after, and impulse magnitude/saturation metrics. Portfolio allocation metrics describe the persistent post-execution holdings.
-- Checkpoint format is now 11. Format 10 and formats 6 through 9 are rejected because their action samples, rollout/policy snapshots, or metrics layouts are incompatible; no unsafe migration is attempted. Birth genomes remain immutable and replacement lifetime state is fresh.
+- Checkpoint format was 11 for Prompt 4 and is now 12 after Prompt 5's schema-identity change. Format 10 and formats 6 through 11 are rejected because their action samples, rollout/policy snapshots, metrics, or observation layouts are incompatible; no unsafe migration is attempted. Birth genomes remain immutable and replacement lifetime state is fresh.
 
 Prompt 4's controlled rerun is recorded in [Prompt 4 Persistent Incremental Trade Experiment](reports/PROMPT4_INCREMENTAL_TRADE_EXPERIMENT.md). It is a mechanical action-interface change, not evidence of profitability or intelligence. Known limitations are the independent per-asset Beta impulse factorisation, stable latent ordering, and frozen hidden/recurrent encoder.
 

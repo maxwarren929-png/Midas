@@ -40,7 +40,8 @@ use std::{fs, path::Path};
 // impulses and persists their diagnostics in the checkpointed metrics state.
 // Older checkpoints contain incompatible action samples or state layouts and
 // cannot be migrated safely.
-pub const CHECKPOINT_VERSION: u32 = 11;
+/// Format 12 records the modular observation-registry schema identity.
+pub const CHECKPOINT_VERSION: u32 = 12;
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum DatasetSplit {
     Training,
@@ -2219,7 +2220,9 @@ impl SimulationEngine {
             ))
         })?;
         if cp.version != CHECKPOINT_VERSION {
-            let detail = if cp.version == 6 {
+            let detail = if cp.version == 11 {
+                "; checkpoint 11 predates the modular observation registry and cannot be migrated safely"
+            } else if cp.version == 6 {
                 "; checkpoint 6 contains bias-only optimizer state and cannot be migrated safely"
             } else if cp.version == 8 {
                 "; checkpoint 8 contains single-asset categorical action samples and cannot be migrated safely"
@@ -2348,7 +2351,7 @@ impl SimulationEngine {
         })?;
         if cp.version != CHECKPOINT_VERSION {
             return Err(MidasError::Checkpoint(format!(
-                "checkpoint version {} is incompatible with {CHECKPOINT_VERSION}; neural action distribution layouts are not migrated",
+                "checkpoint version {} is incompatible with {CHECKPOINT_VERSION}; observation-registry and neural action distribution layouts are not migrated",
                 cp.version
             )));
         }

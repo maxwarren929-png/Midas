@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use midas_core::{
     config::{Config, LearningKind, PolicyKind},
     market::{MarketDataSource, PolarsDataSource},
+    observation::{ObservationBuilder, ObservationSchema, SchemaObservationBuilder},
     simulation::{DatasetSplit, SimulationEngine},
 };
 use std::path::PathBuf;
@@ -65,6 +66,35 @@ enum Command {
         config: PathBuf,
         #[arg(long, value_enum, default_value = "test")]
         split: SplitArg,
+    },
+    Observations {
+        #[command(subcommand)]
+        command: ObservationCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ObservationCommand {
+    /// List named observations published by the configured providers.
+    List {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Show the authoritative neural-input index mapping.
+    Schema {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Describe one named observation.
+    Describe {
+        #[arg(long)]
+        config: PathBuf,
+        name: String,
+    },
+    /// Validate provider registration, schema compilation, and normalisation.
+    Validate {
+        #[arg(long)]
+        config: PathBuf,
     },
 }
 
@@ -174,6 +204,82 @@ fn main() -> Result<()> {
                 }))?
             );
         }
+        Command::Observations { command } => match command {
+            ObservationCommand::List { config } => {
+                let (_, schema, builder) = observation_builder(&config)?;
+                let metadata = builder.registry().metadata();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": schema.version,
+                        "providers": schema.providers,
+                        "observations": metadata,
+                    }))?
+                );
+            }
+            ObservationCommand::Schema { config } => {
+                let (_, schema, _) = observation_builder(&config)?;
+                println!("{}", serde_json::to_string_pretty(&schema)?);
+            }
+            ObservationCommand::Describe { config, name } => {
+                let (_, _, builder) = observation_builder(&config)?;
+                let metadata = builder.registry().metadata_by_name(&name).ok_or_else(|| {
+                    anyhow::anyhow!("configured observation {name} does not exist")
+                })?;
+                println!("{}", serde_json::to_string_pretty(metadata)?);
+            }
+            ObservationCommand::Validate { config } => {
+                let (asset_count, schema, builder) = observation_builder(&config)?;
+                println!(
+                    "valid observation schema version={} dimension={} hash={}",
+                    schema.version,
+                    builder.schema().dimension(asset_count),
+                    schema.identity(asset_count)?
+                );
+            }
+        },
     }
     Ok(())
+}
+
+fn observation_builder(
+    path: &PathBuf,
+) -> Result<(usize, ObservationSchema, SchemaObservationBuilder)> {
+    let config = Config::load(path)?;
+    let asset_count = config.market.assets.len();
+    let schema = ObservationSchema::from_config(&config);
+    let builder = SchemaObservationBuilder::new(
+        schema.clone(),
+        config.features.features.clone(),
+        asset_count,
+    )?;
+    Ok((asset_count, schema, builder))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn observations_subcommands_parse_and_expose_schema_metadata() {
+        let cli = Cli::try_parse_from([
+            "midas",
+            "observations",
+            "describe",
+            "--config",
+            "configs/test.toml",
+            "portfolio.cash_fraction",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Command::Observations { .. }));
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let (_, schema, builder) = observation_builder(&root.join("configs/test.toml")).unwrap();
+        assert_eq!(schema.entries.len(), schema.dimension(3));
+        let metadata = builder
+            .registry()
+            .metadata_by_name("portfolio.cash_fraction")
+            .unwrap();
+        assert_eq!(metadata.provider, "portfolio");
+        assert_eq!(metadata.units, "ratio");
+    }
 }

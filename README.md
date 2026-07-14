@@ -12,6 +12,7 @@ cargo run -p midas-cli -- inspect-data --config configs/test.toml
 cargo run -p midas-cli -- simulate --config configs/test.toml --split training
 cargo run -p midas-cli -- benchmark --config configs/test.toml
 cargo run -p midas-cli -- evolution-report --config configs/prompt2.toml --split training
+cargo run -p midas-cli -- observations schema --config configs/default.toml
 ```
 
 Save a complete final checkpoint with `--checkpoint checkpoints/run.bin`. The `resume` command accepts checkpoints captured at any deterministic step boundary:
@@ -28,7 +29,7 @@ An optional `data.corporate_actions_path` CSV uses `date,asset,kind,value`, wher
 
 At close on day `t`, a policy sees features and availability known through `t`; its proposal is validated centrally and executes at open on `t+1`. Missing `t+1` bars reject that asset's order. Holdings in unavailable assets use the latest known close for valuation. Each step is transactional: policy state, neural memory, portfolios, counters, events, metrics, replacement state, RNG state, and `next_step` are committed together only after the full step succeeds.
 
-Feature rows are calculated from current and earlier bars only. A complete versioned observation schema orders market, portfolio, and agent-state features and derives the neural input dimension. Its stable hash is part of `BrainArchitecture` and checkpoint compatibility. Checkpoint format version 11 rejects older layouts, including format 10's pre-impulse metrics state, format 9's target-portfolio action samples, format 8's masked rollout and allocation-cap semantics, format 6's bias-only optimizer state, learning or evolution changes, and backend identities explicitly.
+Feature rows are calculated from current and earlier bars only. The modular observation registry has read-only market, portfolio, and agent-state providers that publish named raw values. A complete versioned schema, rather than provider registration order, maps those names to neural indices and applies the configured normalisation. Its stable hash is part of `BrainArchitecture` and checkpoint compatibility. Use `midas observations list`, `schema`, `describe <name>`, or `validate` with `--config` for offline introspection. Checkpoint format version 12 rejects format 11 because its positional observation-schema identity cannot establish compatibility with the provider registry; older action, rollout, learning, evolution, and backend incompatibilities remain rejected explicitly.
 
 ## Architecture
 
@@ -36,7 +37,8 @@ Feature rows are calculated from current and earlier bars only. A complete versi
 
 - `MarketDataSource`: load a canonical `MarketDataset`.
 - `FeaturePipeline`: publish a versioned schema and legal feature rows.
-- `Policy`: consume a typed observation and emit an untrusted `ProposedAllocation`.
+- `ObservationProvider` and `ObservationRegistry`: publish named, typed read-only sensor values; `ObservationSchema` is the sole index/normalisation compiler.
+- `Policy`: consume a typed observation and emit an untrusted `ProposedAction`.
 - `ActionValidator`: authoritatively mask, normalise, cap, or fall back before execution.
 - `ExecutionPlanner` and `ExecutionApplier`: create an immutable cost-aware proportional plan, then apply it atomically.
 - `NeuralModel` and `NeuralModelFactory`: isolate Burn from policy and simulation interfaces; the current implementation is CPU `NdArray` only.
@@ -48,7 +50,7 @@ Feature rows are calculated from current and earlier bars only. A complete versi
 
 The stable `BrainGenome` stores explicit matrix shapes, values, configured bounded traits, and complete architecture metadata. A neural policy keeps the immutable genome separate from mutable lifetime parameters, optimizer state, and simple recurrent runtime memory. Burn caches runtime tensors when a model is built or restored; serialisation and simulation interfaces do not expose Burn tensor types. Neural PPO now uses an **independent bounded Beta impulse distribution**: the actor emits two raw values per asset, which become positive Beta shapes through `(softplus(raw) + minimum_shape) / temperature`; each active asset samples a latent `u` and maps it to the incremental trade impulse `2u - 1`. The impulse is scaled by `[brain.trading].maximum_trade_fraction` of current net worth and executed against the persistent portfolio. Cash is not an action dimension. Unavailable assets are omitted from the latent vector and receive exact zero impulses. The latent vector is the PPO action, so its exact joint log probability is the sum of Beta log densities and its entropy is the sum of Beta entropies; no post-hoc clipping or fabricated probability is used. Stable asset order is explicit and remains a deterministic ordering choice for this version. Deterministic evaluation uses Beta means without consuming RNG or decaying temperature. The frozen hidden/recurrent encoder supplies a state representation to trainable actor and critic dense output heads, so head weights learn state-dependent trade impulses. Sequence minibatches preserve recurrent timestep order and are shuffled deterministically by sequence. Policy failures preserve diagnostics in `DomainEvent::PolicyFailure` and follow the configured failure limits before any cash fallback is used. A recoverable incident emits exactly `PolicyFailure` then `ActionFallback`, executes the fallback economically, and records one masked chronological rollout entry with the configured invalid-action penalty. Actor and critic eligibility are independent; inference and observation failures never fabricate probabilities or values. `KillAgent` kills the agent during the decision phase, emits `PolicyFailure` then `AgentDied`, and applies no next-day actions, trades, costs, age, or reward. `StopExperiment` discards the in-progress step, enters `SimulationLifecycle::Failed { reason }`, and preserves the last committed checkpoint boundary; repeated `run` and `run_steps` calls return the same failure without mutation. A valid validated action alone resets consecutive failures; total failures reset only for a newly spawned replacement. Built-in cash, equal-weight, and buy-and-hold benchmarks are exempt from neural concentration caps; buy-and-hold invests once then holds. At death, fitness is recorded and the evolutionary replacement strategy selects eligible parents, applies mating distance as a constraint on the configured fitness selector (with explicit relaxation events), crosses and mutates their birth genomes, assigns new genome/lineage identities, and spawns fresh lifetime state.
 
-See [Extending Midas](docs/EXTENDING.md) for subsystem-specific extension steps and [Implementation Status](IMPLEMENTATION_STATUS.md) for the exact implementation boundary and limitations.
+See [Observation Architecture](docs/OBSERVATIONS.md), [Extending Midas](docs/EXTENDING.md), and [Implementation Status](IMPLEMENTATION_STATUS.md) for subsystem-specific extension steps and the exact implementation boundary.
 
 ### Prompt 3B diagnostics
 

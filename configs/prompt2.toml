@@ -41,6 +41,10 @@ clip = 10.0
 version = 2
 features = ["market", "cash_allocation", "asset_allocation", "unrealized_return", "net_worth_to_starting", "current_drawdown", "portfolio_return1", "turnover_to_net_worth", "normalized_age"]
 
+[observations]
+schema = "default"
+providers = ["market", "portfolio", "agent_state"]
+
 [corporate_actions]
 mode = "reject"
 discontinuity_threshold = 0.35

@@ -1101,7 +1101,7 @@ fn checkpoint_v6_is_rejected_as_bias_only_optimizer_layout() {
     let file = tempfile::NamedTempFile::new().unwrap();
     engine.save_checkpoint(file.path()).unwrap();
     let mut bytes = fs::read(file.path()).unwrap();
-    assert_eq!(bytes.first().copied(), Some(11));
+    assert_eq!(bytes.first().copied(), Some(12));
     bytes[0] = 6;
     fs::write(file.path(), bytes).unwrap();
     let error = match SimulationEngine::resume(c, data, file.path()) {
@@ -1121,7 +1121,7 @@ fn checkpoint_v8_is_rejected_as_single_asset_action_layout() {
     let file = tempfile::NamedTempFile::new().unwrap();
     engine.save_checkpoint(file.path()).unwrap();
     let mut bytes = fs::read(file.path()).unwrap();
-    assert_eq!(bytes.first().copied(), Some(11));
+    assert_eq!(bytes.first().copied(), Some(12));
     bytes[0] = 8;
     fs::write(file.path(), bytes).unwrap();
     let error = match SimulationEngine::resume(c, data, file.path()) {
@@ -1141,14 +1141,34 @@ fn checkpoint_v10_is_rejected_as_pre_impulse_metrics_layout() {
     let file = tempfile::NamedTempFile::new().unwrap();
     engine.save_checkpoint(file.path()).unwrap();
     let mut bytes = fs::read(file.path()).unwrap();
-    assert_eq!(bytes.first().copied(), Some(11));
+    assert_eq!(bytes.first().copied(), Some(12));
     bytes[0] = 10;
     fs::write(file.path(), bytes).unwrap();
     let error = match SimulationEngine::resume(c, data, file.path()) {
         Ok(_) => panic!("checkpoint 10 was accepted"),
         Err(error) => error,
     };
-    assert!(error.to_string().contains("incompatible with 11"));
+    assert!(error.to_string().contains("incompatible with 12"));
+}
+
+#[test]
+fn checkpoint_v11_is_rejected_as_pre_registry_observation_layout() {
+    let c = config();
+    let data = loaded(&c);
+    let mut engine =
+        SimulationEngine::new(c.clone(), data.clone(), DatasetSplit::Training).unwrap();
+    engine.run_steps(1).unwrap();
+    let file = tempfile::NamedTempFile::new().unwrap();
+    engine.save_checkpoint(file.path()).unwrap();
+    let mut bytes = fs::read(file.path()).unwrap();
+    assert_eq!(bytes.first().copied(), Some(12));
+    bytes[0] = 11;
+    fs::write(file.path(), bytes).unwrap();
+    let error = match SimulationEngine::resume(c, data, file.path()) {
+        Ok(_) => panic!("checkpoint 11 was accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("modular observation registry"));
 }
 
 #[test]
