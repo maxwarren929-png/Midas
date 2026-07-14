@@ -1,5 +1,17 @@
 # Implementation Status
 
+## Prompt 3B: long-horizon diagnosis and adaptive reward experiment
+
+Prompt 3B adds report-only observability and a frozen, long-horizon experimental protocol. The implementation commit tested for the suite is `c692101`. The generated market contains 1,800 business dates, four assets, 1,259 training steps, and frozen validation/test splits; its SHA-256 is recorded in `reports/PROMPT3B_DIAGNOSTIC_EXPERIMENT.md`.
+
+- `RewardBreakdown`, transactional `DecisionTrace`, and `PpoUpdateTrace` expose return components, costs, turnover, allocations, stick-breaking order positions, PPO KL/clipping, gradients, and head deltas without changing the reward scalar or checkpointed simulation state. The diagnostics binary writes compact JSONL/CSV traces.
+- Forty primary CLI runs (control, PPO, evolution-only, and PPO+evolution; seeds 41-50) and eighteen three-seed ablations completed. Checkpoint/resume matched for representative runs. Recoverable-failure learning and benchmark exposure regressions remain covered by tests.
+- PPO underperformance is primarily associated with extreme turnover and execution costs: the representative PPO trace had about 6,257 turnover units and $75,623 execution cost per agent-day versus about 40 and $488 for control. Stable order bias is measurable; naive episode rotation increased turnover and worsened results. Short-rollout PPO over-updating is supported as a contributing factor because a conservative schedule improved all three paired ablation seeds, but it is not yet a final selected policy.
+- Real PPO+evolution CLI runs produced deaths, two-parent reproduction, crossover, mutation, ancestry, and generation depth. Evolution did not show consistent performance improvement. No permanent turnover or concentration penalty was added; the turnover ablation was unit-mismatched and clipped heavily.
+- A correctness issue found during the protocol was fixed: frozen evaluation now disables automatic checkpoint writes after validating the training checkpoint identity, so evaluation cannot overwrite a training checkpoint. This is covered by `evaluation_does_not_overwrite_training_checkpoint`.
+
+The complete results, raw-output index, exact test totals, limitations, and next-experiment recommendation are in [Prompt 3B Diagnostic Experiment](reports/PROMPT3B_DIAGNOSTIC_EXPERIMENT.md). This suite does not support claims of profitability or intelligence. The next experiment should validate the conservative PPO schedule at full seed count and calibrate any turnover ablation in compatible units before combining changes.
+
 ## Prompt 3A: multi-asset portfolio policy distribution
 
 Implemented the transition from the restricted single-asset categorical action space to a mathematically valid bounded stick-breaking portfolio distribution. The actor output is now `2 * asset_count`: one raw alpha and beta shape value per asset. For each tradable asset in stable order, the transformed shapes parameterise an independent Beta latent; the sampled latent is mapped to `min(maximum_allocation, remaining) * u`, and cash receives the residual. This supports simultaneous positive allocations to multiple assets while guaranteeing finite, non-negative, simplex-valid actions and exact zero for unavailable assets.

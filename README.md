@@ -50,6 +50,10 @@ The stable `BrainGenome` stores explicit matrix shapes, values, configured bound
 
 See [Extending Midas](docs/EXTENDING.md) for subsystem-specific extension steps and [Implementation Status](IMPLEMENTATION_STATUS.md) for the exact implementation boundary and limitations.
 
+### Prompt 3B diagnostics
+
+The long-horizon diagnostic suite is preserved in [reports/PROMPT3B_DIAGNOSTIC_EXPERIMENT.md](reports/PROMPT3B_DIAGNOSTIC_EXPERIMENT.md). It uses a frozen 1,800-date synthetic market, chronological training/validation/test splits, 10 paired primary seeds, and report-only JSONL/CSV traces. The traces decompose reward and execution costs, measure turnover and concentration, record stick-breaking order positions, and expose PPO KL, clipping, entropy, gradients, and head deltas. The measured short-rollout PPO baseline paid substantially higher trading costs than static control; a conservative update schedule is the next isolated correction to validate, while no permanent turnover penalty is enabled. Real PPO-plus-evolution runs exercised deaths and two-parent reproduction, but did not establish evolutionary improvement. These are mechanical diagnostics, not profitability or intelligence claims.
+
 ## Data layout
 
 Raw source files belong in `data/raw/` and should be treated as immutable. Reproducibly processed Parquet files belong in `data/processed/`. Assets, dimensions, dates, costs, population, capital, seeds, architecture, paths, policy, backend selection, and replacement selection are configuration values or derived runtime metadata.

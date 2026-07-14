@@ -1,0 +1,48 @@
+[experiment-ppo]
+learning.implementation: 'no_learning' -> 'ppo'
+[experiment-evolution-only]
+evolution.enabled: False -> True
+[experiment-ppo-evolution]
+evolution.enabled: False -> True
+learning.implementation: 'no_learning' -> 'ppo'
+[experiment-conservative]
+learning.implementation: 'no_learning' -> 'ppo'
+learning.minibatch_size: 2 -> 32
+learning.optimisation_epochs: 4 -> 2
+learning.rollout_length: 4 -> 64
+learning.sequence_length: 2 -> 16
+[experiment-low-rate]
+brain.traits.learning_rate.initial: 0.0003 -> 0.0001
+learning.implementation: 'no_learning' -> 'ppo'
+learning.learning_rate: 0.0003 -> 0.0001
+learning.minibatch_size: 2 -> 32
+learning.optimisation_epochs: 4 -> 2
+learning.rollout_length: 4 -> 64
+learning.sequence_length: 2 -> 16
+[experiment-low-entropy]
+brain.traits.entropy_coefficient.initial: 0.01 -> 0.001
+learning.entropy_coefficient: 0.01 -> 0.001
+learning.implementation: 'no_learning' -> 'ppo'
+learning.minibatch_size: 2 -> 32
+learning.optimisation_epochs: 4 -> 2
+learning.rollout_length: 4 -> 64
+learning.sequence_length: 2 -> 16
+[experiment-rotated-order]
+brain.action_distribution.asset_order: 'stable' -> 'episode_rotated'
+learning.implementation: 'no_learning' -> 'ppo'
+[experiment-mild-turnover]
+learning.implementation: 'no_learning' -> 'ppo'
+learning.minibatch_size: 2 -> 32
+learning.optimisation_epochs: 4 -> 2
+learning.rollout_length: 4 -> 64
+learning.sequence_length: 2 -> 16
+reward.kind: 'log_return' -> 'risk_adjusted_return'
+reward.turnover_penalty_weight: 0.0 -> 0.0005
+[experiment-moderate-turnover]
+learning.implementation: 'no_learning' -> 'ppo'
+learning.minibatch_size: 2 -> 32
+learning.optimisation_epochs: 4 -> 2
+learning.rollout_length: 4 -> 64
+learning.sequence_length: 2 -> 16
+reward.kind: 'log_return' -> 'risk_adjusted_return'
+reward.turnover_penalty_weight: 0.0 -> 0.001

@@ -1,0 +1,124 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.53s
+     Running unittests src/bin/diagnostics.rs (target/debug/deps/diagnostics-34e799f2875c1579)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/midas_cli-67407d743cf3ee5e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/midas_core-832191a6158f3a07)
+
+running 32 tests
+test brain::tests::beta_log_probability_gradient_matches_finite_difference ... ok
+test brain::tests::beta_entropy_gradient_matches_finite_difference ... ok
+test brain::tests::bounded_stick_breaking_is_masked_and_seed_reproducible ... ok
+test brain::tests::bounded_stick_breaking_log_probability_recomputes_exactly ... ok
+test brain::tests::bounded_stick_breaking_distribution_is_valid_across_masks_caps_and_seeds ... ok
+test brain::tests::dense_gradient_matches_outer_product_exactly ... ok
+test brain::tests::deterministic_stick_breaking_evaluation_does_not_consume_rng ... ok
+test brain::tests::burn_training_changes_lifetime_parameters_without_changing_genome ... ok
+test brain::tests::full_head_training_updates_heads_but_freezes_encoder_and_genome ... ok
+test brain::tests::clipped_policy_gradient_suppresses_head_update_but_keeps_objective_valid ... ok
+test brain::tests::genome_validation_rejects_hidden_layout_changes ... ok
+test brain::tests::neural_policy_can_allocate_positive_weight_to_two_assets ... ok
+test brain::tests::malformed_full_head_optimizer_state_is_rejected_on_restore ... ok
+test brain::tests::deterministic_evaluation_does_not_decay_temperature ... ok
+test brain::tests::sampled_valid_allocation_survives_central_validation_unchanged ... ok
+test evolution::tests::diversity_metrics_are_finite_and_deterministic ... ok
+test evolution::tests::distance_is_symmetric_and_zero_for_identical_genomes ... ok
+test evolution::tests::crossover_and_disabled_mutation_preserve_validity ... ok
+test evolution::tests::first_completed_life_updates_finite_population_metrics ... ok
+test evolution::tests::seeded_mutation_repeats_exactly ... ok
+test evolution::tests::ancestry_registry_records_parent_generation_and_reason ... ok
+test evolution::tests::tournament_selection_is_deterministic_under_seed ... ok
+test learning::tests::gae_matches_terminal_hand_calculation ... ok
+test learning::tests::masked_failure_reward_remains_in_chronological_returns ... ok
+test learning::tests::ppo_clipping_handles_both_advantage_signs ... ok
+test learning::tests::ppo_loss_rejects_non_finite_hyperparameters_and_includes_regularizers ... ok
+test evolution::tests::mating_distance_relaxes_deterministically_when_no_pair_qualifies ... ok
+test evolution::tests::reset_mutation_covers_weights_and_biases ... ok
+test learning::tests::rollout_update_is_bounded_and_commit_clears_it ... ok
+test brain::tests::ppo_head_learning_changes_actor_weights_regression ... ok
+test brain::tests::critic_learning_is_state_dependent_for_two_encoded_states ... ok
+test brain::tests::actor_learning_is_state_dependent_for_two_encoded_states ... ok
+
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/foundation.rs (target/debug/deps/foundation-3c42f6445f2df5bc)
+
+running 49 tests
+test action_validator_masks_caps_and_falls_back ... ok
+test action_validator_handles_edge_cases_without_drift_or_looping ... ok
+test buy_and_hold_is_fully_invested_even_when_neural_cap_is_half ... ok
+test checkpoint_v6_is_rejected_as_bias_only_optimizer_layout ... ok
+test checkpoint_rejects_observation_schema_change ... ok
+test checkpoint_rejects_brain_architecture_change ... ok
+test backend_identity_is_configuration_driven_and_checkpoint_checked ... ok
+test dividend_is_credited_once_on_declared_event ... ok
+test earlier_observations_do_not_change_with_extreme_future_price ... ok
+test checkpoint_v8_is_rejected_as_single_asset_action_layout ... ok
+test checkpoint_rejects_corporate_action_data_change ... ok
+test configured_no_replacement_is_respected ... ok
+test burn_model_is_deterministic_and_memory_is_checkpointed ... ok
+test continuing_bootstrap_fork_failure_is_transactional_and_not_zero ... ok
+test execution_uses_stable_asset_ids_and_rejects_tampered_plans ... ok
+test execution_rate_validation_rejects_invalid_economics ... ok
+test equal_weight_benchmark_ignores_neural_concentration_cap ... ok
+test malformed_ohlc_and_duplicates_are_rejected ... ok
+test neural_memory_resets_and_genome_validates_full_schema ... ok
+test engine_corporate_actions_apply_once_across_resume_and_repeat ... ok
+test no_hardcoded_observation_formula_remains ... ok
+test minimum_trade_filter_stabilizes_and_apply_is_atomic ... ok
+test observation_schema_drives_dimension_order_and_unrealized_return ... ok
+test observation_hash_includes_market_version_and_normalization ... ok
+test planned_trade_values_are_positive_and_commission_non_negative ... ok
+test invalid_policy_output_is_one_recoverable_failure ... ok
+test fatal_agent_policy_failure_dies_before_next_day_actions_without_fallback ... ok
+test proportional_planning_includes_costs_and_is_order_invariant ... ok
+test random_and_malicious_proposals_cannot_bypass_concentration ... ok
+test reject_mode_refuses_actions_adjustments_and_discontinuities ... ok
+test independent_agents_and_buy_hold_behavior_are_preserved ... ok
+test checkpoint_domain_history_and_completion_are_deterministic ... ok
+test reverse_and_multiple_splits_compose_without_feature_discontinuity ... ok
+test csv_and_parquet_round_trip ... ok
+test same_day_split_and_dividend_follow_documented_order ... ok
+test split_features_are_point_in_time_and_future_safe ... ok
+test split_preserves_value_and_entry_price ... ok
+test recoverable_policy_failure_has_one_fallback_and_advances_normally ... ok
+test replacement_context_supports_deterministic_read_only_selection ... ok
+test policy_failures_emit_diagnostics_and_obey_limits ... ok
+test survival_liability_remains_in_net_worth ... ok
+test recoverable_invalid_output_creates_penalized_chronological_rollout_entry ... ok
+test stop_experiment_failure_replays_identically_from_last_good_checkpoint ... ok
+test stop_experiment_discards_the_entire_failed_step_and_is_idempotent ... ok
+test valid_action_resets_only_consecutive_policy_failures ... ok
+test stop_on_policy_failure_preserves_original_failure_event ... ok
+test simulation_runs_mock_and_burn_neural_models ... ok
+test replacements_preserve_every_policy_blueprint ... ok
+test planned_and_applied_allocations_never_make_balances_negative ... ok
+
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.10s
+
+     Running tests/prompt2.rs (target/debug/deps/prompt2-825319a9ccffae2a)
+
+running 7 tests
+test evolutionary_replacement_selects_two_parents_and_reports_mutation ... ok
+test mating_distance_preserves_configured_selection_pressure ... ok
+test automatic_checkpoint_is_written_from_committed_candidate_state ... ok
+test prompt2_ppo_updates_full_heads_with_a_frozen_encoder ... ok
+test frozen_evaluation_reuses_trained_checkpoint_without_learning ... ok
+test ppo_learning_and_checkpoint_resume_are_deterministic ... ok
+test prompt3a_multi_asset_portfolios_and_resume_are_deterministic ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s
+
+   Doc-tests midas_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

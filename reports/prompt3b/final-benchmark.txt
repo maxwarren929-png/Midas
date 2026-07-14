@@ -1,0 +1,6 @@
+    Finished `release` profile [optimized] target(s) in 0.34s
+     Running `target/release/midas-cli benchmark --config configs/prompt3b/experiment-ppo.toml`
+Cash: ending_net_worth=9865.5000
+Random: ending_net_worth=8940.4721
+EqualWeight: ending_net_worth=9746.7361
+BuyAndHold: ending_net_worth=8943.4865

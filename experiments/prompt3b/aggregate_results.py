@@ -84,6 +84,10 @@ def main() -> None:
         diagnostics = REPORTS / f"{condition}-seed-{seed}-diagnostics.json"
         diag = read_json(diagnostics) if diagnostics.exists() else {}
         learning = diag.get("learning", {})
+        evolution_report_path = REPORTS / f"{condition}-seed-{seed}-evolution-report.json"
+        evolution_metrics = {}
+        if evolution_report_path.exists():
+            evolution_metrics = read_json(evolution_report_path).get("evolution", {}).get("metrics", {})
         per_seed.append(
             {
                 "condition": condition,
@@ -99,8 +103,8 @@ def main() -> None:
                 "deaths": train.get("deaths", 0),
                 "births": train.get("births", 0),
                 "reproductions": train.get("evolutionary_births", 0),
-                "max_generation_depth": train.get("maximum_generation_depth", 0),
-                "active_lineages": train.get("active_lineages", 0),
+                "max_generation_depth": evolution_metrics.get("maximum_generation_depth", train.get("maximum_generation_depth", 0)),
+                "active_lineages": evolution_metrics.get("active_lineages", train.get("active_lineages", 0)),
                 "ppo_updates": learning.get("ppo_updates", train.get("learning_updates", 0)),
                 "mean_kl": learning.get("mean_approximate_kl", 0.0),
                 "clip_fraction": learning.get("mean_clip_fraction", 0.0),
