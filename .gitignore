@@ -2,3 +2,13 @@
 /checkpoints/
 /data/processed/
 *.proptest-regressions
+
+# Prompt 3B raw traces and calibration outputs are reproducible and kept locally;
+# compact summaries and representative diagnostics under reports/prompt3b are tracked.
+/reports/prompt3b/*-seed-*
+/reports/prompt3b/traces-*/
+/reports/prompt3b/long-ppo-seed42*
+/reports/prompt3b/allocation-by-order.csv
+/reports/prompt3b/calibration-*.json
+/reports/prompt3b/prompt3a-baseline-*
+/reports/prompt3b/final-evolution-report.json
