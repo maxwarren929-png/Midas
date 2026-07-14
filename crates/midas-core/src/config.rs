@@ -167,6 +167,7 @@ pub enum ActionDistributionKind {
 #[serde(rename_all = "snake_case")]
 pub enum AssetOrder {
     Stable,
+    EpisodeRotated,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

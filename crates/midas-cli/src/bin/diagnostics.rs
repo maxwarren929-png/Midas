@@ -5,10 +5,10 @@ use midas_core::{
     config::Config,
     learning::{LearningStrategyState, TrainingMetrics},
     market::{MarketDataSource, PolarsDataSource},
-    simulation::{DatasetSplit, DomainEvent, SimulationEngine},
+    simulation::{DatasetSplit, DomainEvent, ReportTrace, SimulationEngine},
 };
 use serde_json::json;
-use std::path::PathBuf;
+use std::{fs, io::Write, path::PathBuf};
 
 #[derive(Parser)]
 #[command(name = "midas-diagnostics", about = "Offline experiment diagnostics")]
@@ -17,6 +17,9 @@ struct Args {
     config: PathBuf,
     #[arg(long, value_enum)]
     split: SplitArg,
+    /// Optional directory for transactionally committed decision/PPO traces.
+    #[arg(long)]
+    trace_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -54,6 +57,16 @@ fn main() -> Result<()> {
     let mut engine = SimulationEngine::new(config, data, args.split.into())?;
     let report = engine.run()?;
 
+    if let Some(trace_dir) = &args.trace_dir {
+        fs::create_dir_all(trace_dir)?;
+        let path = trace_dir.join("traces.jsonl");
+        let mut file = fs::File::create(path)?;
+        for trace in &engine.report_traces {
+            serde_json::to_writer(&mut file, trace)?;
+            file.write_all(b"\n")?;
+        }
+    }
+
     let mut updates = Vec::<TrainingMetrics>::new();
     let mut masked = 0_u64;
     let mut crossover = 0_u64;
@@ -74,6 +87,8 @@ fn main() -> Result<()> {
                 entropy: *entropy,
                 total_loss: 0.0,
                 gradient_norm: *gradient_norm,
+                approximate_kl: 0.0,
+                clip_fraction: 0.0,
                 update_index: updates.len() as u64,
             }),
             DomainEvent::LearningTransitionMasked { .. } => masked += 1,
@@ -92,6 +107,14 @@ fn main() -> Result<()> {
     let mut birth_genome_matches = true;
     let mut neural_agents = 0_u64;
     let mut temperatures = Vec::new();
+    let ppo_traces = engine
+        .report_traces
+        .iter()
+        .filter_map(|trace| match trace {
+            ReportTrace::PpoUpdate(update) => Some(update),
+            ReportTrace::Decision(_) => None,
+        })
+        .collect::<Vec<_>>();
     for state in engine.agents() {
         let Some(genome) = state.genome.as_ref() else {
             continue;
@@ -189,6 +212,14 @@ fn main() -> Result<()> {
                 "mean_value_loss": mean(|m| f64::from(m.value_loss)),
                 "mean_entropy": mean(|m| f64::from(m.entropy)),
                 "mean_gradient_norm": mean(|m| f64::from(m.gradient_norm)),
+                "mean_approximate_kl": if ppo_traces.is_empty() { 0.0 } else {
+                    ppo_traces.iter().map(|trace| f64::from(trace.approximate_kl)).sum::<f64>()
+                        / ppo_traces.len() as f64
+                },
+                "mean_clip_fraction": if ppo_traces.is_empty() { 0.0 } else {
+                    ppo_traces.iter().map(|trace| f64::from(trace.clip_fraction)).sum::<f64>()
+                        / ppo_traces.len() as f64
+                },
                 "actor_head_delta_norm": actor_delta,
                 "critic_head_delta_norm": critic_delta,
                 "hidden_delta_norm": hidden_delta,

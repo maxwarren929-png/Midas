@@ -998,6 +998,26 @@ fn checkpoint_v8_is_rejected_as_single_asset_action_layout() {
     assert!(error.to_string().contains("single-asset categorical"));
 }
 
+#[test]
+fn evaluation_does_not_overwrite_training_checkpoint() {
+    let mut c = config();
+    c.learning.implementation = LearningKind::NoLearning;
+    c.evolution.enabled = false;
+    let data = loaded(&c);
+    let checkpoint = tempfile::NamedTempFile::new().unwrap();
+    let mut training =
+        SimulationEngine::new(c.clone(), data.clone(), DatasetSplit::Training).unwrap();
+    training.run().unwrap();
+    training.save_checkpoint(checkpoint.path()).unwrap();
+    let before = fs::read(checkpoint.path()).unwrap();
+
+    let mut evaluation =
+        SimulationEngine::evaluate_checkpoint(c, data, checkpoint.path(), DatasetSplit::Validation)
+            .unwrap();
+    evaluation.run().unwrap();
+    assert_eq!(before, fs::read(checkpoint.path()).unwrap());
+}
+
 struct MockModel {
     schema: String,
     size: usize,

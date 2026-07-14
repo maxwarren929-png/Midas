@@ -31,7 +31,7 @@ use crate::{
         LivingAgentSummary, NonEvolutionaryRandomGenomeReplacement, ReplacementContext,
         ReplacementStrategy,
     },
-    reward::{RewardContext, RewardFunction, configured_reward},
+    reward::{RewardBreakdown, RewardContext, RewardFunction, configured_reward},
 };
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
@@ -182,6 +182,69 @@ pub enum DomainEvent {
 pub enum OperationalEvent {
     CheckpointSaved { date: NaiveDate, path: String },
 }
+
+/// Report-only per-decision data. It is committed transactionally, but is not
+/// authoritative simulation state and is intentionally excluded from
+/// checkpoints so diagnostics do not alter resume compatibility.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct DecisionTrace {
+    pub observation_date: NaiveDate,
+    pub execution_date: NaiveDate,
+    pub agent_id: AgentId,
+    pub genome_id: Option<crate::evolution::GenomeId>,
+    pub generation_depth: Option<u32>,
+    pub policy: crate::brain::PolicyBlueprint,
+    pub previous_net_worth: f64,
+    pub current_net_worth: f64,
+    pub reward: f32,
+    pub reward_breakdown: RewardBreakdown,
+    pub transaction_cost: f64,
+    pub commission_cost: f64,
+    pub spread_cost: f64,
+    pub slippage_cost: f64,
+    pub turnover: f64,
+    pub trade_count: usize,
+    pub buy_notional: f64,
+    pub sell_notional: f64,
+    pub current_allocations: Vec<f64>,
+    pub action_allocations: Vec<f64>,
+    pub active_asset_indices: Vec<usize>,
+    pub latent_samples: Vec<f32>,
+    pub order_position_allocations: Vec<f64>,
+    pub cash_allocation: f64,
+    pub maximum_concentration: f64,
+    pub active_positions: usize,
+    pub entropy: f32,
+    pub old_log_probability: Option<f32>,
+    pub value_estimate: Option<f32>,
+    pub temperature: Option<f32>,
+    pub invalid_action: bool,
+    pub failure_category: Option<PolicyFailureCategory>,
+    pub actor_eligible: bool,
+    pub critic_eligible: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PpoUpdateTrace {
+    pub agent_id: AgentId,
+    pub date: NaiveDate,
+    pub rollout_size: usize,
+    pub policy_loss: f32,
+    pub value_loss: f32,
+    pub entropy: f32,
+    pub gradient_norm: f32,
+    pub approximate_kl: f32,
+    pub clip_fraction: f32,
+    pub actor_delta_norm: f64,
+    pub critic_delta_norm: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+pub enum ReportTrace {
+    Decision(DecisionTrace),
+    PpoUpdate(PpoUpdateTrace),
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct AgentCheckpoint {
     state: crate::agent::AgentState,
@@ -227,6 +290,7 @@ pub struct SimulationEngine {
     pub metrics: MetricsCollector,
     pub domain_events: Vec<DomainEvent>,
     pub operational_events: Vec<OperationalEvent>,
+    pub report_traces: Vec<ReportTrace>,
     event_sinks: Vec<Box<dyn EventSink>>,
     next_step: usize,
     next_agent_id: u64,
@@ -239,8 +303,27 @@ struct StepTransaction {
     replacement: Option<Box<dyn ReplacementStrategy>>,
     evolution: EvolutionState,
     allocation_stats: AllocationStats,
+    traces: Vec<ReportTrace>,
 }
-type AdvanceResult = (Vec<DomainEvent>, Option<(AgentId, NaiveDate)>, f32);
+struct TradeSummary {
+    transaction_cost: f64,
+    commission_cost: f64,
+    spread_cost: f64,
+    slippage_cost: f64,
+    turnover: f64,
+    trade_count: usize,
+    buy_notional: f64,
+    sell_notional: f64,
+}
+struct AdvanceResult {
+    events: Vec<DomainEvent>,
+    death: Option<(AgentId, NaiveDate)>,
+    reward: f32,
+    reward_breakdown: RewardBreakdown,
+    trade: TradeSummary,
+    previous_net_worth: f64,
+    current_net_worth: f64,
+}
 #[derive(Clone, Debug)]
 struct PolicyFailureIncident {
     category: PolicyFailureCategory,
@@ -266,6 +349,48 @@ enum PolicyDecisionOutcome {
     FatalExperimentFailure {
         incident: PolicyFailureIncident,
     },
+}
+
+fn learning_eligibility(
+    observation: &Option<crate::observation::Observation>,
+    evaluation: &Option<crate::brain::PolicyEvaluation>,
+    runtime_before: &Option<crate::brain::NeuralRuntimeState>,
+    invalid_action: bool,
+) -> (bool, bool) {
+    let action_sample = evaluation
+        .as_ref()
+        .and_then(|evaluation| evaluation.action_sample.as_ref());
+    let log_probability = evaluation
+        .as_ref()
+        .and_then(|evaluation| evaluation.log_probability);
+    let temperature = evaluation.as_ref().map(|evaluation| evaluation.temperature);
+    let value_estimate = evaluation
+        .as_ref()
+        .map(|evaluation| evaluation.value_estimate)
+        .filter(|value| value.is_finite());
+    let actor_eligible = !invalid_action
+        && observation.is_some()
+        && runtime_before.is_some()
+        && action_sample.is_some()
+        && log_probability.is_some()
+        && temperature.is_some();
+    let critic_eligible =
+        observation.is_some() && runtime_before.is_some() && value_estimate.is_some();
+    (actor_eligible, critic_eligible)
+}
+
+fn dense_parameter_delta(
+    before: &crate::brain::DenseGenome,
+    after: &crate::brain::DenseGenome,
+) -> f64 {
+    before
+        .weights
+        .iter()
+        .zip(&after.weights)
+        .chain(before.bias.iter().zip(&after.bias))
+        .map(|(left, right)| f64::from(*left - *right).powi(2))
+        .sum::<f64>()
+        .sqrt()
 }
 enum StepAbort {
     Error(MidasError),
@@ -420,6 +545,7 @@ impl SimulationEngine {
             metrics,
             domain_events,
             operational_events: Vec::new(),
+            report_traces: Vec::new(),
             event_sinks: Vec::new(),
             next_step: 0,
             next_agent_id,
@@ -539,6 +665,7 @@ impl SimulationEngine {
             replacement: None,
             evolution: self.evolution.clone(),
             allocation_stats: AllocationStats::default(),
+            traces: Vec::new(),
         };
         let mut transaction = transaction;
         match self.execute_step(&mut transaction) {
@@ -571,6 +698,7 @@ impl SimulationEngine {
     fn flush_learning(&mut self) -> Result<()> {
         let mut agents = self.fork_agents()?;
         let mut events = Vec::new();
+        let mut traces = Vec::new();
         let date = self.features.last().expect("validated features").date;
         for agent in &mut agents {
             if agent.state.alive {
@@ -580,6 +708,7 @@ impl SimulationEngine {
                     agent.state.portfolio.net_worth,
                     true,
                     &mut events,
+                    &mut traces,
                 )?;
             }
         }
@@ -587,6 +716,7 @@ impl SimulationEngine {
         for event in events {
             self.emit(event);
         }
+        self.report_traces.extend(traces);
         Ok(())
     }
 
@@ -656,11 +786,13 @@ impl SimulationEngine {
             replacement,
             evolution,
             allocation_stats,
+            traces,
         } = transaction;
         self.agents = agents;
         self.next_agent_id = next_agent_id;
         self.evolution = evolution;
         self.metrics.record_neural_allocations(&allocation_stats);
+        self.report_traces.extend(traces);
         if let Some(replacement) = replacement {
             self.replacement = replacement;
         }
@@ -758,7 +890,11 @@ impl SimulationEngine {
                     ) {
                         transaction.allocation_stats.record(validated.weights())?;
                     }
-                    let (events, death, reward) = self.advance_agent(
+                    let trace_observation = observation.clone();
+                    let trace_evaluation = evaluation.clone();
+                    let trace_runtime_before = runtime_before.clone();
+                    let action_allocations = validated.weights().to_vec();
+                    let advanced = self.advance_agent(
                         agent,
                         &validated,
                         observation_date,
@@ -769,8 +905,8 @@ impl SimulationEngine {
                         &actions,
                         false,
                     )?;
-                    transaction.events.extend(events);
-                    let next_value = if death.is_none()
+                    transaction.events.extend(advanced.events.clone());
+                    let next_value = if advanced.death.is_none()
                         && self.config.learning.implementation == LearningKind::Ppo
                     {
                         Some(self.next_value_estimate(
@@ -787,17 +923,39 @@ impl SimulationEngine {
                         Some(observation),
                         Some(evaluation),
                         validated,
-                        reward,
+                        advanced.reward,
                         next_value,
-                        death.is_some(),
+                        advanced.death.is_some(),
                         observation_date,
                         &tradable,
                         runtime_before,
                         false,
                         None,
                         &mut transaction.events,
+                        &mut transaction.traces,
                     )?;
-                    if let Some(death) = death {
+                    let (actor_eligible, critic_eligible) = learning_eligibility(
+                        &Some(trace_observation.clone()),
+                        &Some(trace_evaluation.clone()),
+                        &trace_runtime_before,
+                        false,
+                    );
+                    transaction
+                        .traces
+                        .push(ReportTrace::Decision(self.decision_trace(
+                            agent,
+                            observation_date,
+                            execution_date,
+                            &allocations,
+                            &action_allocations,
+                            Some(&trace_evaluation),
+                            &advanced,
+                            false,
+                            None,
+                            actor_eligible,
+                            critic_eligible,
+                        )));
+                    if let Some(death) = advanced.death {
                         deaths.push(death);
                     }
                 }
@@ -821,7 +979,11 @@ impl SimulationEngine {
                         agent_id: agent.state.id,
                         date: observation_date,
                     });
-                    let (events, death, reward) = self.advance_agent(
+                    let action_allocations = fallback.weights().to_vec();
+                    let trace_observation = observation.clone();
+                    let trace_evaluation = evaluation.clone();
+                    let trace_runtime_before = runtime_before.clone();
+                    let advanced = self.advance_agent(
                         agent,
                         &fallback,
                         observation_date,
@@ -832,8 +994,8 @@ impl SimulationEngine {
                         &actions,
                         true,
                     )?;
-                    transaction.events.extend(events);
-                    let next_value = if death.is_none()
+                    transaction.events.extend(advanced.events.clone());
+                    let next_value = if advanced.death.is_none()
                         && evaluation.is_some()
                         && self.config.learning.implementation == LearningKind::Ppo
                     {
@@ -851,17 +1013,39 @@ impl SimulationEngine {
                         observation,
                         evaluation,
                         fallback,
-                        reward,
+                        advanced.reward,
                         next_value,
-                        death.is_some(),
+                        advanced.death.is_some(),
                         observation_date,
                         &tradable,
                         runtime_before,
                         true,
                         Some(incident.category.clone()),
                         &mut transaction.events,
+                        &mut transaction.traces,
                     )?;
-                    if let Some(death) = death {
+                    let (actor_eligible, critic_eligible) = learning_eligibility(
+                        &trace_observation,
+                        &trace_evaluation,
+                        &trace_runtime_before,
+                        true,
+                    );
+                    transaction
+                        .traces
+                        .push(ReportTrace::Decision(self.decision_trace(
+                            agent,
+                            observation_date,
+                            execution_date,
+                            &allocations,
+                            &action_allocations,
+                            trace_evaluation.as_ref(),
+                            &advanced,
+                            true,
+                            Some(&incident.category),
+                            actor_eligible,
+                            critic_eligible,
+                        )));
+                    if let Some(death) = advanced.death {
                         deaths.push(death);
                     }
                 }
@@ -884,6 +1068,7 @@ impl SimulationEngine {
                         final_net_worth,
                         false,
                         &mut transaction.events,
+                        &mut transaction.traces,
                     )?;
                     transaction.events.push(self.policy_failure_event(
                         agent,
@@ -1144,6 +1329,41 @@ impl SimulationEngine {
             self.config.simulation.minimum_trade_value,
         )?;
         let report = self.applier.apply(&mut agent.state.portfolio, &plan)?;
+        let commission_cost = report
+            .trades
+            .iter()
+            .map(|trade| trade.commission)
+            .sum::<f64>();
+        let spread_cost = report
+            .trades
+            .iter()
+            .map(|trade| trade.spread_cost)
+            .sum::<f64>();
+        let slippage_cost = report
+            .trades
+            .iter()
+            .map(|trade| trade.slippage_cost)
+            .sum::<f64>();
+        let trade_summary = TradeSummary {
+            transaction_cost: commission_cost + spread_cost + slippage_cost,
+            commission_cost,
+            spread_cost,
+            slippage_cost,
+            turnover: 0.0,
+            trade_count: report.trades.len(),
+            buy_notional: report
+                .trades
+                .iter()
+                .filter(|trade| matches!(trade.side, crate::execution::TradeSide::Buy))
+                .map(|trade| trade.notional)
+                .sum(),
+            sell_notional: report
+                .trades
+                .iter()
+                .filter(|trade| matches!(trade.side, crate::execution::TradeSide::Sell))
+                .map(|trade| trade.notional)
+                .sum(),
+        };
         for trade in report.trades {
             events.push(DomainEvent::TradeExecuted {
                 agent_id: agent.state.id,
@@ -1175,14 +1395,20 @@ impl SimulationEngine {
                 .maximum_drawdown
                 .max(1.0 - current / agent.state.maximum_net_worth);
         }
-        let reward = self.reward_function.reward(&RewardContext {
+        let reward_context = RewardContext {
             previous_net_worth: previous,
             current_net_worth: current,
             maximum_drawdown: agent.state.maximum_drawdown,
             turnover: (agent.state.portfolio.cumulative_turnover - turnover_before).max(0.0),
             bankrupt,
             invalid_action,
-        })?;
+        };
+        let reward_breakdown = self.reward_function.breakdown(&reward_context)?;
+        let reward = reward_breakdown.clipped_total;
+        let trade_summary = TradeSummary {
+            turnover: reward_context.turnover,
+            ..trade_summary
+        };
         events.push(DomainEvent::Valuation {
             agent_id: agent.state.id,
             date: execution_date,
@@ -1202,9 +1428,114 @@ impl SimulationEngine {
                 maximum_net_worth: agent.state.maximum_net_worth,
                 cause: DeathCause::Bankruptcy,
             });
-            return Ok((events, Some((agent.state.id, execution_date)), reward));
+            return Ok(AdvanceResult {
+                events,
+                death: Some((agent.state.id, execution_date)),
+                reward,
+                reward_breakdown,
+                trade: trade_summary,
+                previous_net_worth: previous,
+                current_net_worth: current,
+            });
         }
-        Ok((events, None, reward))
+        Ok(AdvanceResult {
+            events,
+            death: None,
+            reward,
+            reward_breakdown,
+            trade: trade_summary,
+            previous_net_worth: previous,
+            current_net_worth: current,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decision_trace(
+        &self,
+        agent: &Agent,
+        observation_date: NaiveDate,
+        execution_date: NaiveDate,
+        current_allocations: &[f64],
+        action_allocations: &[f64],
+        evaluation: Option<&crate::brain::PolicyEvaluation>,
+        advanced: &AdvanceResult,
+        invalid_action: bool,
+        failure_category: Option<&PolicyFailureCategory>,
+        actor_eligible: bool,
+        critic_eligible: bool,
+    ) -> DecisionTrace {
+        let sample = evaluation.and_then(|evaluation| evaluation.action_sample.as_ref());
+        let active_asset_indices = sample
+            .map(|sample| sample.active_asset_indices.clone())
+            .unwrap_or_default();
+        let latent_samples = sample
+            .map(|sample| sample.latent_samples.clone())
+            .unwrap_or_default();
+        let order_position_allocations = active_asset_indices
+            .iter()
+            .map(|asset_index| {
+                action_allocations
+                    .get(asset_index + 1)
+                    .copied()
+                    .unwrap_or(0.0)
+            })
+            .collect::<Vec<_>>();
+        let cash_allocation = action_allocations.first().copied().unwrap_or(0.0);
+        let maximum_concentration = action_allocations
+            .iter()
+            .skip(1)
+            .copied()
+            .fold(0.0_f64, f64::max);
+        let active_positions = action_allocations
+            .iter()
+            .skip(1)
+            .filter(|weight| **weight > 1e-8)
+            .count();
+        let generation_depth = agent
+            .state
+            .genome_id
+            .and_then(|genome_id| self.evolution.genome_registry.get(&genome_id))
+            .map(|record| record.generation_depth);
+        DecisionTrace {
+            observation_date,
+            execution_date,
+            agent_id: agent.state.id,
+            genome_id: agent.state.genome_id,
+            generation_depth,
+            policy: agent.policy.policy_blueprint(),
+            previous_net_worth: advanced.previous_net_worth,
+            current_net_worth: advanced.current_net_worth,
+            reward: advanced.reward,
+            reward_breakdown: advanced.reward_breakdown,
+            transaction_cost: advanced.trade.transaction_cost,
+            commission_cost: advanced.trade.commission_cost,
+            spread_cost: advanced.trade.spread_cost,
+            slippage_cost: advanced.trade.slippage_cost,
+            turnover: advanced.trade.turnover,
+            trade_count: advanced.trade.trade_count,
+            buy_notional: advanced.trade.buy_notional,
+            sell_notional: advanced.trade.sell_notional,
+            current_allocations: current_allocations.to_vec(),
+            action_allocations: action_allocations.to_vec(),
+            active_asset_indices,
+            latent_samples,
+            order_position_allocations,
+            cash_allocation,
+            maximum_concentration,
+            active_positions,
+            entropy: evaluation
+                .map(|evaluation| evaluation.entropy)
+                .unwrap_or(0.0),
+            old_log_probability: evaluation.and_then(|evaluation| evaluation.log_probability),
+            value_estimate: evaluation
+                .map(|evaluation| evaluation.value_estimate)
+                .filter(|value| value.is_finite()),
+            temperature: evaluation.map(|evaluation| evaluation.temperature),
+            invalid_action,
+            failure_category: failure_category.cloned(),
+            actor_eligible,
+            critic_eligible,
+        }
     }
 
     fn next_value_estimate(
@@ -1277,6 +1608,7 @@ impl SimulationEngine {
         invalid_action: bool,
         failure_category: Option<PolicyFailureCategory>,
         events: &mut Vec<DomainEvent>,
+        traces: &mut Vec<ReportTrace>,
     ) -> Result<()> {
         let after = agent.policy.runtime_state();
         let action_sample = evaluation
@@ -1329,7 +1661,7 @@ impl SimulationEngine {
             });
         }
         let update = agent.learning.observe_transition(transition)?;
-        self.apply_learning_update(agent, update, date, events)?;
+        self.apply_learning_update(agent, update, date, events, traces)?;
         if done {
             self.finish_learning_episode(
                 agent,
@@ -1337,6 +1669,7 @@ impl SimulationEngine {
                 agent.state.portfolio.net_worth,
                 false,
                 events,
+                traces,
             )?;
         }
         Ok(())
@@ -1349,13 +1682,14 @@ impl SimulationEngine {
         final_value: f64,
         truncated: bool,
         events: &mut Vec<DomainEvent>,
+        traces: &mut Vec<ReportTrace>,
     ) -> Result<()> {
         let update = agent.learning.end_episode(&EpisodeEndContext {
             date,
             final_value: final_value as f32,
             truncated,
         })?;
-        self.apply_learning_update(agent, update, date, events)
+        self.apply_learning_update(agent, update, date, events, traces)
     }
 
     fn apply_learning_update(
@@ -1364,14 +1698,37 @@ impl SimulationEngine {
         update: LearningUpdate,
         date: NaiveDate,
         events: &mut Vec<DomainEvent>,
+        traces: &mut Vec<ReportTrace>,
     ) -> Result<()> {
         if let LearningUpdate::Ppo(batch) = update {
             let learning_config = agent
                 .learning
                 .training_config()
                 .unwrap_or_else(|| self.config.learning.clone());
+            let lifetime_before = agent.policy.lifetime_parameters()?;
             let metrics = agent.policy.apply_learning(&batch, &learning_config)?;
+            let lifetime_after = agent.policy.lifetime_parameters()?;
             agent.learning.commit_update()?;
+            let (actor_delta_norm, critic_delta_norm) = match (lifetime_before, lifetime_after) {
+                (Some(before), Some(after)) => (
+                    dense_parameter_delta(&before.actor, &after.actor),
+                    dense_parameter_delta(&before.critic, &after.critic),
+                ),
+                _ => (0.0, 0.0),
+            };
+            traces.push(ReportTrace::PpoUpdate(PpoUpdateTrace {
+                agent_id: agent.state.id,
+                date,
+                rollout_size: metrics.rollout_size,
+                policy_loss: metrics.policy_loss,
+                value_loss: metrics.value_loss,
+                entropy: metrics.entropy,
+                gradient_norm: metrics.gradient_norm,
+                approximate_kl: metrics.approximate_kl,
+                clip_fraction: metrics.clip_fraction,
+                actor_delta_norm,
+                critic_delta_norm,
+            }));
             events.push(DomainEvent::LearningUpdate {
                 agent_id: agent.state.id,
                 date,
@@ -1832,6 +2189,7 @@ impl SimulationEngine {
             metrics: cp.metrics,
             domain_events: cp.domain_events,
             operational_events: Vec::new(),
+            report_traces: Vec::new(),
             event_sinks: Vec::new(),
             next_step: cp.next_step,
             next_agent_id: cp.next_agent_id,
@@ -1875,6 +2233,10 @@ impl SimulationEngine {
         evaluation_config.learning.implementation = LearningKind::NoLearning;
         evaluation_config.evolution.enabled = false;
         evaluation_config.simulation.death_handling = DeathHandling::LeaveVacant;
+        // Evaluation is a read-only replay of a training checkpoint. It must
+        // never overwrite that checkpoint with a different split or config
+        // hash through the automatic cadence.
+        evaluation_config.checkpoint.every_steps = 0;
         let mut engine = Self::new(evaluation_config, data, split)?;
         let schema_hash = engine
             .observation_schema

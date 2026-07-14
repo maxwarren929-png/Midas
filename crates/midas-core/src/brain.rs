@@ -778,6 +778,8 @@ fn train_burn_heads(
                 aggregate.entropy += metrics.entropy;
                 aggregate.total_loss += metrics.total_loss;
                 aggregate.gradient_norm += metrics.gradient_norm;
+                aggregate.approximate_kl += metrics.approximate_kl;
+                aggregate.clip_fraction += metrics.clip_fraction;
                 aggregate.update_index = metrics.update_index;
                 updates += 1;
             }
@@ -790,6 +792,8 @@ fn train_burn_heads(
             aggregate.entropy /= divisor;
             aggregate.total_loss /= divisor;
             aggregate.gradient_norm /= divisor;
+            aggregate.approximate_kl /= divisor;
+            aggregate.clip_fraction /= divisor;
         }
         Ok(aggregate)
     })();
@@ -848,6 +852,8 @@ fn train_burn_heads_inner(
     let mut total_loss = 0.0_f32;
     let mut actor_count = 0usize;
     let mut critic_count = 0usize;
+    let mut approximate_kl = 0.0_f32;
+    let mut clipped_samples = 0usize;
 
     for sample in &batch.samples {
         if sample.recurrent_state.memory.len() != model.architecture.memory.size {
@@ -901,6 +907,10 @@ fn train_burn_heads_inner(
             } else {
                 clipped > unclipped
             };
+            approximate_kl += old_log_probability - new_log_probability;
+            if clipped_active {
+                clipped_samples += 1;
+            }
             let mut actor_output_gradient = vec![0.0_f32; actor_outputs];
             if !clipped_active {
                 let coefficient = ratio * advantage;
@@ -1072,6 +1082,8 @@ fn train_burn_heads_inner(
         entropy: entropy / actor_divisor,
         total_loss: total_loss / (actor_count.max(critic_count).max(1) as f32),
         gradient_norm,
+        approximate_kl: approximate_kl / actor_divisor,
+        clip_fraction: clipped_samples as f32 / actor_divisor,
         update_index: model.optimizer.step,
     })
 }
@@ -1242,8 +1254,13 @@ impl Policy for NeuralPolicy {
         stochastic: bool,
         maximum_asset_allocation: f64,
     ) -> Result<PolicyEvaluation> {
+        let order_offset = self
+            .model
+            .runtime_state()
+            .map(|state| state.inference_steps as usize)
+            .unwrap_or(0);
         let out = self.model.forward(&NeuralInput { observation: o })?;
-        let evaluation = bounded_stick_breaking_evaluation(
+        let evaluation = bounded_stick_breaking_evaluation_with_order(
             out,
             c.tradable,
             maximum_asset_allocation,
@@ -1251,6 +1268,7 @@ impl Policy for NeuralPolicy {
             self.temperature,
             &mut self.rng,
             &self.model.action_distribution(),
+            order_offset,
         )?;
         // Exploration is part of stochastic acting only. Deterministic
         // evaluation and critic bootstrap must be side-effect free so merely
@@ -1330,6 +1348,7 @@ struct StickBreakingEvaluation {
     decisions: Vec<BetaDecision>,
 }
 
+#[cfg(test)]
 fn bounded_stick_breaking_evaluation(
     output: NeuralOutput,
     tradable: &[bool],
@@ -1339,6 +1358,29 @@ fn bounded_stick_breaking_evaluation(
     rng: &mut ChaCha8Rng,
     config: &ActionDistributionConfig,
 ) -> Result<PolicyEvaluation> {
+    bounded_stick_breaking_evaluation_with_order(
+        output,
+        tradable,
+        maximum_asset_allocation,
+        stochastic,
+        temperature,
+        rng,
+        config,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bounded_stick_breaking_evaluation_with_order(
+    output: NeuralOutput,
+    tradable: &[bool],
+    maximum_asset_allocation: f64,
+    stochastic: bool,
+    temperature: f32,
+    rng: &mut ChaCha8Rng,
+    config: &ActionDistributionConfig,
+    order_offset: usize,
+) -> Result<PolicyEvaluation> {
     validate_distribution_inputs(
         &output,
         tradable,
@@ -1346,7 +1388,7 @@ fn bounded_stick_breaking_evaluation(
         temperature,
         config,
     )?;
-    let active_asset_indices = active_asset_indices(tradable, config)?;
+    let active_asset_indices = ordered_asset_indices(tradable, config, order_offset)?;
     let latents = if stochastic {
         sample_latents(
             &output.logits,
@@ -1402,7 +1444,10 @@ fn validate_distribution_inputs(
     config: &ActionDistributionConfig,
 ) -> Result<()> {
     if !matches!(config.kind, ActionDistributionKind::BoundedStickBreaking)
-        || !matches!(config.asset_order, AssetOrder::Stable)
+        || !matches!(
+            config.asset_order,
+            AssetOrder::Stable | AssetOrder::EpisodeRotated
+        )
         || output.logits.len() != tradable.len() * 2
         || !output.value.is_finite()
         || output.logits.iter().any(|value| !value.is_finite())
@@ -1426,20 +1471,25 @@ fn validate_distribution_inputs(
     Ok(())
 }
 
-fn active_asset_indices(
-    tradable: &[bool],
-    config: &ActionDistributionConfig,
-) -> Result<Vec<usize>> {
-    if !matches!(config.asset_order, AssetOrder::Stable) {
-        return Err(MidasError::Config(
-            "unsupported bounded stick-breaking asset order".into(),
-        ));
-    }
+fn active_asset_indices(tradable: &[bool]) -> Result<Vec<usize>> {
     Ok(tradable
         .iter()
         .enumerate()
         .filter_map(|(index, is_tradable)| is_tradable.then_some(index))
         .collect())
+}
+
+fn ordered_asset_indices(
+    tradable: &[bool],
+    config: &ActionDistributionConfig,
+    order_offset: usize,
+) -> Result<Vec<usize>> {
+    let mut indices = active_asset_indices(tradable)?;
+    if matches!(config.asset_order, AssetOrder::EpisodeRotated) && !indices.is_empty() {
+        let length = indices.len();
+        indices.rotate_left(order_offset % length);
+    }
+    Ok(indices)
 }
 
 fn sample_latents(
@@ -1596,8 +1646,11 @@ fn evaluate_bounded_stick_breaking_sample(
         temperature,
         config,
     )?;
-    let expected_indices = active_asset_indices(tradable, config)?;
-    if sample.active_asset_indices != expected_indices
+    let expected_indices = sample.active_asset_indices.clone();
+    let mut sorted_indices = expected_indices.clone();
+    sorted_indices.sort_unstable();
+    let canonical_indices = active_asset_indices(tradable)?;
+    if sorted_indices != canonical_indices
         || sample.latent_samples.len() != expected_indices.len()
         || sample.allocation.len() != tradable.len() + 1
     {

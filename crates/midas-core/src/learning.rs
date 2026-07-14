@@ -75,6 +75,8 @@ pub struct TrainingMetrics {
     pub entropy: f32,
     pub total_loss: f32,
     pub gradient_norm: f32,
+    pub approximate_kl: f32,
+    pub clip_fraction: f32,
     pub update_index: u64,
 }
 impl TrainingMetrics {
@@ -86,6 +88,8 @@ impl TrainingMetrics {
             entropy: 0.0,
             total_loss: 0.0,
             gradient_norm: 0.0,
+            approximate_kl: 0.0,
+            clip_fraction: 0.0,
             update_index: 0,
         }
     }

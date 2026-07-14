@@ -1,0 +1,178 @@
+[market]
+assets = ["SPY", "AAA", "BBB", "CCC"]
+benchmark_asset = "SPY"
+
+[data]
+path = "data/prompt3b/market.csv"
+format = "csv"
+
+[splits.training]
+start = "2010-01-04"
+end = "2014-10-31"
+[splits.validation]
+start = "2014-11-03"
+end = "2015-11-13"
+[splits.test]
+start = "2015-11-16"
+end = "2016-11-25"
+
+[simulation]
+population_size = 8
+starting_cash = 10000.0
+bankruptcy_threshold = 8950.0
+daily_survival_cost = 0.5
+minimum_trade_value = 1.0
+seed = 41
+forced_liquidation = false
+death_handling = "replace"
+
+[execution]
+commission_fixed = 0.0
+commission_rate = 0.0005
+spread_rate = 0.001
+slippage_rate = 0.0002
+
+[features]
+schema_version = 1
+features = ["return1", "return5", "return20", "price_to_ma20", "price_to_ma50", "volatility20", "volume_change", "volume_to_ma20", "distance_high20", "tradable"]
+clip = 10.0
+
+[observation]
+version = 2
+features = ["market", "cash_allocation", "asset_allocation", "unrealized_return", "net_worth_to_starting", "current_drawdown", "portfolio_return1", "turnover_to_net_worth", "normalized_age"]
+
+[corporate_actions]
+mode = "reject"
+discontinuity_threshold = 0.35
+adjusted_price_tolerance = 0.000001
+
+[brain]
+architecture_version = 1
+hidden_layers = [32, 16]
+memory_size = 8
+activation = "gelu"
+policy = "burn_actor_critic"
+action_distribution = { kind = "bounded_stick_breaking", minimum_shape = 0.1, maximum_shape = 100.0, latent_epsilon = 0.000001, asset_order = "stable" }
+
+[brain.traits.learning_rate]
+initial = 0.0003
+minimum = 0.00001
+maximum = 0.01
+mutation_scale = 0.0
+evolvable = false
+
+[brain.traits.entropy_coefficient]
+initial = 0.01
+minimum = 0.0
+maximum = 0.1
+mutation_scale = 0.0
+evolvable = false
+
+[brain.traits.action_temperature]
+initial = 1.0
+minimum = 0.1
+maximum = 3.0
+mutation_scale = 0.0
+evolvable = false
+
+[brain.traits.temperature_decay]
+initial = 0.999
+minimum = 0.9
+maximum = 1.0
+mutation_scale = 0.0
+evolvable = false
+
+[brain.traits.drawdown_sensitivity]
+initial = 0.1
+minimum = 0.0
+maximum = 2.0
+mutation_scale = 0.0
+evolvable = false
+
+[brain.traits.turnover_sensitivity]
+initial = 0.01
+minimum = 0.0
+maximum = 1.0
+mutation_scale = 0.0
+evolvable = false
+
+[brain.traits.maximum_allocation]
+initial = 0.5
+minimum = 0.01
+maximum = 1.0
+mutation_scale = 0.0
+evolvable = false
+
+[learning]
+implementation = "no_learning"
+learning_rate = 0.0003
+gamma = 0.99
+gae_lambda = 0.95
+ppo_clip = 0.2
+critic_coefficient = 0.5
+entropy_coefficient = 0.01
+gradient_clip = 1.0
+rollout_length = 4
+minibatch_size = 2
+sequence_length = 2
+normalize_advantages = true
+optimisation_epochs = 4
+
+[evolution]
+enabled = true
+fallback = "random_genome"
+inheritance_mode = "genome_only"
+
+[evolution.selection]
+method = "tournament"
+tournament_size = 2
+minimum_age = 0
+allow_self_parenting = false
+minimum_net_worth = 0.0
+
+[evolution.crossover]
+method = "uniform_element_wise"
+
+[evolution.mutation]
+weight_probability = 0.01
+weight_sigma = 0.01
+bias_probability = 0.01
+bias_sigma = 0.01
+reset_probability = 0.0
+trait_probability = 0.01
+
+[evolution.diversity]
+fitness_sharing = true
+sharing_radius = 0.15
+minimum_mating_distance = 0.0
+
+[evolution.fitness]
+return_weight = 1.0
+survival_weight = 0.01
+drawdown_weight = 0.5
+turnover_weight = 0.001
+
+[backend]
+kind = "cpu"
+device = "default"
+
+[policy_failures]
+maximum_consecutive = 3
+maximum_total = 20
+behavior = "kill_agent"
+
+[replacement]
+strategy = "non_evolutionary_random_genome"
+
+[checkpoint]
+path = "checkpoints/prompt3b/evolution-only-seed-41.bin"
+every_steps = 128
+
+[reward]
+kind = "log_return"
+drawdown_penalty_weight = 0.0
+turnover_penalty_weight = 0.0
+invalid_action_penalty = 0.05
+bankruptcy_penalty = 1.0
+clip_min = -5.0
+clip_max = 5.0
