@@ -1,0 +1,6 @@
+    Finished `release` profile [optimized] target(s) in 0.26s
+     Running `target/release/midas-cli benchmark --config configs/runs/control-seed-45.toml --split test`
+Cash: ending_net_worth=9996.0000
+Random: ending_net_worth=10019.7329
+EqualWeight: ending_net_worth=10013.4739
+BuyAndHold: ending_net_worth=10012.1205

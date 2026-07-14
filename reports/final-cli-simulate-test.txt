@@ -1,0 +1,60 @@
+    Finished `release` profile [optimized] target(s) in 0.27s
+     Running `target/release/midas-cli simulate --config configs/test.toml --split training`
+{
+  "split": "Training",
+  "steps": 7,
+  "agents": [
+    [
+      0,
+      {
+        "starting_net_worth": 10000.0,
+        "ending_net_worth": 9913.93068939274,
+        "total_return": -0.008606931060725964,
+        "annualised_return": -0.26742579962483537,
+        "volatility": 0.0036873338477382525,
+        "maximum_drawdown": 0.008606931060725964,
+        "sharpe_like": -72.52551861797645,
+        "sortino_like": -13.415134891436136,
+        "turnover": 14937.339241410464,
+        "trades": 7,
+        "total_fees": 7.468669620705231,
+        "spread_cost": 7.468669620705231,
+        "slippage_cost": 2.9874678482820927,
+        "survival_days": 7,
+        "bankrupt": false
+      }
+    ],
+    [
+      1,
+      {
+        "starting_net_worth": 10000.0,
+        "ending_net_worth": 10200.993252048575,
+        "total_return": 0.020099325204857355,
+        "annualised_return": 1.0470505631142193,
+        "volatility": 0.013995191632529335,
+        "maximum_drawdown": 0.0,
+        "sharpe_like": 74.81502151642829,
+        "sortino_like": 0.0,
+        "turnover": 5112.3361895476155,
+        "trades": 7,
+        "total_fees": 2.556168094773808,
+        "spread_cost": 2.556168094773808,
+        "slippage_cost": 1.022467237909523,
+        "survival_days": 7,
+        "bankrupt": false
+      }
+    ]
+  ],
+  "deaths": 0,
+  "births": 2,
+  "invalid_actions": 0,
+  "dataset_identity": "ecccb703c6ab4dff5ee74000fb266df76b430c5fa70bb065986918af89abb3e4",
+  "observation_schema_identity": "dd1e0b478566c14554288e3226ec1379ec26f75ac5c9680133bebeeb377eb580",
+  "replacement_strategy": "non_evolutionary_random_genome",
+  "learning_implementation": "no_learning",
+  "learning_updates": 0,
+  "evolutionary_births": 0,
+  "active_lineages": 2,
+  "lifecycle": "Completed",
+  "failure_reason": null
+}

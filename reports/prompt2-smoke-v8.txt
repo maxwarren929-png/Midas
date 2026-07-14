@@ -1,0 +1,80 @@
+    Finished `release` profile [optimized] target(s) in 0.27s
+     Running `target/release/midas-cli simulate --config configs/prompt2.toml --split training --checkpoint checkpoints/prompt2-smoke-v8.bin`
+{
+  "split": "Training",
+  "steps": 7,
+  "agents": [
+    [
+      0,
+      {
+        "starting_net_worth": 10000.0,
+        "ending_net_worth": 10006.291025438826,
+        "total_return": 0.0006291025438827091,
+        "annualised_return": 0.02289881366695301,
+        "volatility": 0.014464507563650445,
+        "maximum_drawdown": 0.0017952787533183079,
+        "sharpe_like": 1.5831035772346733,
+        "sortino_like": 2.0263532904020662,
+        "turnover": 55143.54334205786,
+        "trades": 11,
+        "total_fees": 27.57177167102893,
+        "spread_cost": 27.57177167102893,
+        "slippage_cost": 11.028708668411571,
+        "survival_days": 7,
+        "bankrupt": false
+      }
+    ],
+    [
+      1,
+      {
+        "starting_net_worth": 10000.0,
+        "ending_net_worth": 9957.068872136137,
+        "total_return": -0.004293112786386333,
+        "annualised_return": -0.14348613005200694,
+        "volatility": 0.013971349003036844,
+        "maximum_drawdown": 0.005020021564048904,
+        "sharpe_like": -10.270026897246535,
+        "sortino_like": -8.710830538036328,
+        "turnover": 55026.15957352535,
+        "trades": 11,
+        "total_fees": 27.513079786762674,
+        "spread_cost": 27.513079786762674,
+        "slippage_cost": 11.00523191470507,
+        "survival_days": 7,
+        "bankrupt": false
+      }
+    ],
+    [
+      2,
+      {
+        "starting_net_worth": 10000.0,
+        "ending_net_worth": 10020.608795061464,
+        "total_return": 0.002060879506146307,
+        "annualised_return": 0.07693098684828237,
+        "volatility": 0.016314716924427073,
+        "maximum_drawdown": 0.0017986298277319346,
+        "sharpe_like": 4.715434978408855,
+        "sortino_like": 6.79970061870888,
+        "turnover": 35126.05597522039,
+        "trades": 10,
+        "total_fees": 17.56302798761019,
+        "spread_cost": 17.56302798761019,
+        "slippage_cost": 7.025211195044078,
+        "survival_days": 7,
+        "bankrupt": false
+      }
+    ]
+  ],
+  "deaths": 0,
+  "births": 3,
+  "invalid_actions": 0,
+  "dataset_identity": "ecccb703c6ab4dff5ee74000fb266df76b430c5fa70bb065986918af89abb3e4",
+  "observation_schema_identity": "dd1e0b478566c14554288e3226ec1379ec26f75ac5c9680133bebeeb377eb580",
+  "replacement_strategy": "evolutionary_two_parent",
+  "learning_implementation": "ppo",
+  "learning_updates": 6,
+  "evolutionary_births": 0,
+  "active_lineages": 3,
+  "lifecycle": "Completed",
+  "failure_reason": null
+}

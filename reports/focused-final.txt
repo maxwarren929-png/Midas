@@ -1,0 +1,411 @@
+
+=== cargo test --workspace ppo ===
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.27s
+     Running unittests src/bin/diagnostics.rs (target/debug/deps/diagnostics-0377410b5d8c4f7c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/midas_cli-de2598be51be9909)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/midas_core-48feb3c91817616f)
+
+running 3 tests
+test learning::tests::ppo_clipping_handles_both_advantage_signs ... ok
+test learning::tests::ppo_loss_rejects_non_finite_hyperparameters_and_includes_regularizers ... ok
+test brain::tests::ppo_head_learning_changes_actor_weights_regression ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.00s
+
+     Running tests/foundation.rs (target/debug/deps/foundation-f0e34f207c420666)
+
+running 1 test
+test replacement_context_supports_deterministic_read_only_selection ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 47 filtered out; finished in 0.02s
+
+     Running tests/prompt2.rs (target/debug/deps/prompt2-a2b0d5e0a27ecfa0)
+
+running 2 tests
+test prompt2_ppo_updates_full_heads_with_a_frozen_encoder ... ok
+test ppo_learning_and_checkpoint_resume_are_deterministic ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.19s
+
+
+=== cargo test --workspace gae ===
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.27s
+     Running unittests src/bin/diagnostics.rs (target/debug/deps/diagnostics-0377410b5d8c4f7c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/midas_cli-de2598be51be9909)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/midas_core-48feb3c91817616f)
+
+running 1 test
+test learning::tests::gae_matches_terminal_hand_calculation ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+
+     Running tests/foundation.rs (target/debug/deps/foundation-f0e34f207c420666)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 48 filtered out; finished in 0.00s
+
+     Running tests/prompt2.rs (target/debug/deps/prompt2-a2b0d5e0a27ecfa0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+
+=== cargo test --workspace learning ===
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.27s
+     Running unittests src/bin/diagnostics.rs (target/debug/deps/diagnostics-0377410b5d8c4f7c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/midas_cli-de2598be51be9909)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/midas_core-48feb3c91817616f)
+
+running 8 tests
+test learning::tests::masked_failure_reward_remains_in_chronological_returns ... ok
+test learning::tests::gae_matches_terminal_hand_calculation ... ok
+test learning::tests::ppo_loss_rejects_non_finite_hyperparameters_and_includes_regularizers ... ok
+test learning::tests::ppo_clipping_handles_both_advantage_signs ... ok
+test learning::tests::rollout_update_is_bounded_and_commit_clears_it ... ok
+test brain::tests::ppo_head_learning_changes_actor_weights_regression ... ok
+test brain::tests::actor_learning_is_state_dependent_for_two_encoded_states ... ok
+test brain::tests::critic_learning_is_state_dependent_for_two_encoded_states ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.01s
+
+     Running tests/foundation.rs (target/debug/deps/foundation-f0e34f207c420666)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 48 filtered out; finished in 0.00s
+
+     Running tests/prompt2.rs (target/debug/deps/prompt2-a2b0d5e0a27ecfa0)
+
+running 2 tests
+test frozen_evaluation_reuses_trained_checkpoint_without_learning ... ok
+test ppo_learning_and_checkpoint_resume_are_deterministic ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.19s
+
+
+=== cargo test --workspace evolution ===
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.28s
+     Running unittests src/bin/diagnostics.rs (target/debug/deps/diagnostics-0377410b5d8c4f7c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/midas_cli-de2598be51be9909)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/midas_core-48feb3c91817616f)
+
+running 9 tests
+test evolution::tests::distance_is_symmetric_and_zero_for_identical_genomes ... ok
+test evolution::tests::first_completed_life_updates_finite_population_metrics ... ok
+test evolution::tests::crossover_and_disabled_mutation_preserve_validity ... ok
+test evolution::tests::ancestry_registry_records_parent_generation_and_reason ... ok
+test evolution::tests::diversity_metrics_are_finite_and_deterministic ... ok
+test evolution::tests::reset_mutation_covers_weights_and_biases ... ok
+test evolution::tests::seeded_mutation_repeats_exactly ... ok
+test evolution::tests::mating_distance_relaxes_deterministically_when_no_pair_qualifies ... ok
+test evolution::tests::tournament_selection_is_deterministic_under_seed ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 16 filtered out; finished in 0.00s
+
+     Running tests/foundation.rs (target/debug/deps/foundation-f0e34f207c420666)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 48 filtered out; finished in 0.00s
+
+     Running tests/prompt2.rs (target/debug/deps/prompt2-a2b0d5e0a27ecfa0)
+
+running 1 test
+test evolutionary_replacement_selects_two_parents_and_reports_mutation ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.02s
+
+
+=== cargo test --workspace selection ===
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.27s
+     Running unittests src/bin/diagnostics.rs (target/debug/deps/diagnostics-0377410b5d8c4f7c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/midas_cli-de2598be51be9909)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/midas_core-48feb3c91817616f)
+
+running 1 test
+test evolution::tests::tournament_selection_is_deterministic_under_seed ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+
+     Running tests/foundation.rs (target/debug/deps/foundation-f0e34f207c420666)
+
+running 1 test
+test replacement_context_supports_deterministic_read_only_selection ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 47 filtered out; finished in 0.02s
+
+     Running tests/prompt2.rs (target/debug/deps/prompt2-a2b0d5e0a27ecfa0)
+
+running 1 test
+test mating_distance_preserves_configured_selection_pressure ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.03s
+
+
+=== cargo test --workspace crossover ===
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.27s
+     Running unittests src/bin/diagnostics.rs (target/debug/deps/diagnostics-0377410b5d8c4f7c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/midas_cli-de2598be51be9909)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/midas_core-48feb3c91817616f)
+
+running 1 test
+test evolution::tests::crossover_and_disabled_mutation_preserve_validity ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+
+     Running tests/foundation.rs (target/debug/deps/foundation-f0e34f207c420666)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 48 filtered out; finished in 0.00s
+
+     Running tests/prompt2.rs (target/debug/deps/prompt2-a2b0d5e0a27ecfa0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+
+=== cargo test --workspace mutation ===
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.27s
+     Running unittests src/bin/diagnostics.rs (target/debug/deps/diagnostics-0377410b5d8c4f7c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/midas_cli-de2598be51be9909)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/midas_core-48feb3c91817616f)
+
+running 3 tests
+test evolution::tests::reset_mutation_covers_weights_and_biases ... ok
+test evolution::tests::crossover_and_disabled_mutation_preserve_validity ... ok
+test evolution::tests::seeded_mutation_repeats_exactly ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.00s
+
+     Running tests/foundation.rs (target/debug/deps/foundation-f0e34f207c420666)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 48 filtered out; finished in 0.00s
+
+     Running tests/prompt2.rs (target/debug/deps/prompt2-a2b0d5e0a27ecfa0)
+
+running 1 test
+test evolutionary_replacement_selects_two_parents_and_reports_mutation ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.02s
+
+
+=== cargo test --workspace ancestry ===
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.27s
+     Running unittests src/bin/diagnostics.rs (target/debug/deps/diagnostics-0377410b5d8c4f7c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/midas_cli-de2598be51be9909)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/midas_core-48feb3c91817616f)
+
+running 1 test
+test evolution::tests::ancestry_registry_records_parent_generation_and_reason ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+
+     Running tests/foundation.rs (target/debug/deps/foundation-f0e34f207c420666)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 48 filtered out; finished in 0.00s
+
+     Running tests/prompt2.rs (target/debug/deps/prompt2-a2b0d5e0a27ecfa0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+
+=== cargo test --workspace diversity ===
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.27s
+     Running unittests src/bin/diagnostics.rs (target/debug/deps/diagnostics-0377410b5d8c4f7c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/midas_cli-de2598be51be9909)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/midas_core-48feb3c91817616f)
+
+running 1 test
+test evolution::tests::diversity_metrics_are_finite_and_deterministic ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+
+     Running tests/foundation.rs (target/debug/deps/foundation-f0e34f207c420666)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 48 filtered out; finished in 0.00s
+
+     Running tests/prompt2.rs (target/debug/deps/prompt2-a2b0d5e0a27ecfa0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+
+=== cargo test --workspace checkpoint ===
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.27s
+     Running unittests src/bin/diagnostics.rs (target/debug/deps/diagnostics-0377410b5d8c4f7c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/midas_cli-de2598be51be9909)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/midas_core-48feb3c91817616f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 25 filtered out; finished in 0.00s
+
+     Running tests/foundation.rs (target/debug/deps/foundation-f0e34f207c420666)
+
+running 8 tests
+test burn_model_is_deterministic_and_memory_is_checkpointed ... ok
+test checkpoint_v6_is_rejected_as_bias_only_optimizer_layout ... ok
+test checkpoint_rejects_observation_schema_change ... ok
+test stop_experiment_failure_replays_identically_from_last_good_checkpoint ... ok
+test checkpoint_rejects_corporate_action_data_change ... ok
+test checkpoint_rejects_brain_architecture_change ... ok
+test backend_identity_is_configuration_driven_and_checkpoint_checked ... ok
+test checkpoint_domain_history_and_completion_are_deterministic ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 40 filtered out; finished in 0.08s
+
+     Running tests/prompt2.rs (target/debug/deps/prompt2-a2b0d5e0a27ecfa0)
+
+running 3 tests
+test automatic_checkpoint_is_written_from_committed_candidate_state ... ok
+test frozen_evaluation_reuses_trained_checkpoint_without_learning ... ok
+test ppo_learning_and_checkpoint_resume_are_deterministic ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.20s
+
+
+=== cargo test --workspace atomic ===
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.27s
+     Running unittests src/bin/diagnostics.rs (target/debug/deps/diagnostics-0377410b5d8c4f7c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/midas_cli-de2598be51be9909)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/midas_core-48feb3c91817616f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 25 filtered out; finished in 0.00s
+
+     Running tests/foundation.rs (target/debug/deps/foundation-f0e34f207c420666)
+
+running 1 test
+test minimum_trade_filter_stabilizes_and_apply_is_atomic ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 47 filtered out; finished in 0.01s
+
+     Running tests/prompt2.rs (target/debug/deps/prompt2-a2b0d5e0a27ecfa0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s

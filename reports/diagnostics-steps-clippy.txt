@@ -1,0 +1,2 @@
+    Checking midas-cli v0.1.0 (/home/ko/projects/Midas/crates/midas-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.62s

@@ -62,6 +62,30 @@ fn ppo_learning_and_checkpoint_resume_are_deterministic() {
 }
 
 #[test]
+fn frozen_evaluation_reuses_trained_checkpoint_without_learning() {
+    let config = prompt2_config();
+    let data = PolarsDataSource.load(&config).unwrap();
+    let mut training =
+        SimulationEngine::new(config.clone(), data.clone(), DatasetSplit::Training).unwrap();
+    training.run().unwrap();
+    let checkpoint = tempfile::NamedTempFile::new().unwrap();
+    training.save_checkpoint(checkpoint.path()).unwrap();
+
+    let mut evaluation = SimulationEngine::evaluate_checkpoint(
+        config,
+        data,
+        checkpoint.path(),
+        DatasetSplit::Validation,
+    )
+    .unwrap();
+    let report = evaluation.run().unwrap();
+    assert_eq!(report.split, DatasetSplit::Validation);
+    assert_eq!(report.learning_implementation, "no_learning");
+    assert_eq!(report.learning_updates, 0);
+    assert_eq!(report.lifecycle, SimulationLifecycle::Completed);
+}
+
+#[test]
 fn prompt2_ppo_updates_full_heads_with_a_frozen_encoder() {
     let config = prompt2_config();
     let data = PolarsDataSource.load(&config).unwrap();

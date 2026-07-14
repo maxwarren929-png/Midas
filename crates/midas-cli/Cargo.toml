@@ -3,6 +3,7 @@ name = "midas-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+default-run = "midas-cli"
 
 [dependencies]
 anyhow.workspace = true

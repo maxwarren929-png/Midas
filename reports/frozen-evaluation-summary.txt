@@ -1,0 +1,4 @@
+control steps 3 mean_final_nw 10008.659310657897 deaths 0 learning_updates 0 evolutionary_births 0 lifecycle Completed
+ppo steps 3 mean_final_nw 9989.563172260485 deaths 0 learning_updates 0 evolutionary_births 0 lifecycle Completed
+evolution-only steps 3 mean_final_nw 10014.619754518779 deaths 0 learning_updates 0 evolutionary_births 0 lifecycle Completed
+ppo-evolution steps 3 mean_final_nw 10004.967739623822 deaths 0 learning_updates 0 evolutionary_births 0 lifecycle Completed

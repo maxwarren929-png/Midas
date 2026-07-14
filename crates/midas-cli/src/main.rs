@@ -35,12 +35,24 @@ enum Command {
         split: SplitArg,
         #[arg(long)]
         checkpoint: Option<PathBuf>,
+        /// Run at most this many steps before optionally saving a checkpoint.
+        /// Omitting it preserves the normal run-to-completion behavior.
+        #[arg(long)]
+        steps: Option<usize>,
     },
     Resume {
         #[arg(long)]
         config: PathBuf,
         #[arg(long)]
         checkpoint: PathBuf,
+    },
+    Evaluate {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        checkpoint: PathBuf,
+        #[arg(long, value_enum)]
+        split: SplitArg,
     },
     Benchmark {
         #[arg(long)]
@@ -91,11 +103,17 @@ fn main() -> Result<()> {
             config,
             split,
             checkpoint,
+            steps,
         } => {
             let c = Config::load(&config)?;
             let d = PolarsDataSource.load(&c)?;
             let mut engine = SimulationEngine::new(c, d, split.into())?;
-            let report = engine.run()?;
+            let report = if let Some(steps) = steps {
+                engine.run_steps(steps)?;
+                engine.report()
+            } else {
+                engine.run()?
+            };
             if let Some(path) = checkpoint {
                 engine.save_checkpoint(path)?
             }
@@ -106,6 +124,17 @@ fn main() -> Result<()> {
             let d = PolarsDataSource.load(&c)?;
             let mut engine = SimulationEngine::resume(c, d, &checkpoint)
                 .with_context(|| format!("cannot resume {}", checkpoint.display()))?;
+            println!("{}", serde_json::to_string_pretty(&engine.run()?)?);
+        }
+        Command::Evaluate {
+            config,
+            checkpoint,
+            split,
+        } => {
+            let c = Config::load(&config)?;
+            let d = PolarsDataSource.load(&c)?;
+            let mut engine = SimulationEngine::evaluate_checkpoint(c, d, &checkpoint, split.into())
+                .with_context(|| format!("cannot evaluate {}", checkpoint.display()))?;
             println!("{}", serde_json::to_string_pretty(&engine.run()?)?);
         }
         Command::Benchmark { config, split } => {

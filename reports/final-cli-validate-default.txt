@@ -1,0 +1,3 @@
+    Finished `release` profile [optimized] target(s) in 0.26s
+     Running `target/release/midas-cli validate-config --config configs/default.toml`
+valid configuration 867e46adb17d21752f1eb505154e2d556d704839f05e4a6abf9c4400f13b04af

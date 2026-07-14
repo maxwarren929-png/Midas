@@ -1,0 +1,4 @@
+condition,vs_control_mean_net_worth_delta,seeds_beating_control,seeds
+ppo,-79.81734511045616,0,5
+evolution-only,10.255027407917078,3,5
+ppo-evolution,-80.20584483852035,0,5

@@ -1,0 +1,14 @@
+    Finished `release` profile [optimized] target(s) in 0.27s
+     Running `target/release/midas-cli inspect-data --config configs/test.toml`
+{
+  "assets": [
+    "SPY",
+    "AAA",
+    "BBB"
+  ],
+  "rows": 72,
+  "dates": 24,
+  "first_date": "2020-01-02",
+  "last_date": "2020-02-05",
+  "identity": "ecccb703c6ab4dff5ee74000fb266df76b430c5fa70bb065986918af89abb3e4"
+}

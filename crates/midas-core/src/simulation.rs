@@ -9,13 +9,17 @@ use crate::{
         Agent, AgentBuildContext, AgentFactory, AgentSpawnRequest, SpawnMetadata,
         StandardAgentFactory, configured_blueprint,
     },
-    brain::{BrainArchitecture, BrainGenome, ComputeDevice, PolicyContext, PolicySnapshot},
+    brain::{
+        BrainArchitecture, BrainGenome, ComputeDevice, NeuralModelState, PolicyContext,
+        PolicySnapshot,
+    },
     config::{Config, DateRange, DeathHandling, LearningKind, PolicyFailureBehavior},
     evolution::{CompletedLifeSummary, DefaultFitnessFunction, EvolutionState},
     execution::{
         CostExecutionEngine, ExecutionApplier, ExecutionPlanner, ExecutionSnapshot, PlannedTrade,
+        Portfolio,
     },
-    learning::{EpisodeEndContext, LearningUpdate, Transition},
+    learning::{EpisodeEndContext, LearningStrategyState, LearningUpdate, Transition},
     market::{
         BackwardFeaturePipeline, CorporateAction, FeaturePipeline, FeatureRow, MarketDataset,
     },
@@ -1814,6 +1818,121 @@ impl SimulationEngine {
             lifecycle: cp.lifecycle,
         })
     }
+
+    /// Evaluate the lifetime parameters stored in a completed training
+    /// checkpoint on a separate split. Evaluation starts fresh portfolios and
+    /// recurrent state, and disables learning, replacement, and evolution.
+    /// The checkpoint's immutable genomes and trained lifetime model state are
+    /// restored, while optimizer/rollout state is intentionally not resumed.
+    pub fn evaluate_checkpoint(
+        config: Config,
+        data: MarketDataset,
+        path: impl AsRef<Path>,
+        split: DatasetSplit,
+    ) -> Result<Self> {
+        let bytes = fs::read(path)?;
+        let cp: Checkpoint = bincode::deserialize(&bytes).map_err(|_| {
+            MidasError::Checkpoint(format!(
+                "incompatible checkpoint; expected format version {CHECKPOINT_VERSION}"
+            ))
+        })?;
+        if cp.version != CHECKPOINT_VERSION {
+            return Err(MidasError::Checkpoint(format!(
+                "checkpoint version {} is incompatible with {CHECKPOINT_VERSION}",
+                cp.version
+            )));
+        }
+        if cp.dataset_identity != data.identity {
+            return Err(MidasError::Checkpoint("dataset identity mismatch".into()));
+        }
+        if cp.config_hash != config.hash()? {
+            return Err(MidasError::Checkpoint(
+                "evaluation configuration mismatch".into(),
+            ));
+        }
+
+        let mut evaluation_config = config;
+        evaluation_config.learning.implementation = LearningKind::NoLearning;
+        evaluation_config.evolution.enabled = false;
+        evaluation_config.simulation.death_handling = DeathHandling::LeaveVacant;
+        let mut engine = Self::new(evaluation_config, data, split)?;
+        let schema_hash = engine
+            .observation_schema
+            .identity(engine.data.assets.len())?;
+        if cp.observation_schema_hash != schema_hash {
+            return Err(MidasError::Checkpoint("observation schema mismatch".into()));
+        }
+        if cp.architecture != engine.architecture {
+            return Err(MidasError::Checkpoint("brain architecture mismatch".into()));
+        }
+        if cp.backend_identity != engine.compute_device.identity() {
+            return Err(MidasError::Checkpoint(
+                "checkpoint backend is incompatible".into(),
+            ));
+        }
+        let birth_date = engine.features[0].date;
+        let factory = std::mem::replace(
+            &mut engine.factory,
+            Box::new(StandardAgentFactory::default()),
+        );
+        let mut restored = Vec::with_capacity(cp.agents.len());
+        for checkpoint_agent in cp.agents {
+            let agent_id = checkpoint_agent.state.id;
+            let mut state = checkpoint_agent.state;
+            state.birth_date = birth_date;
+            state.age = 0;
+            state.portfolio = Portfolio::new(
+                engine.config.simulation.starting_cash,
+                engine.architecture.asset_count,
+            );
+            state.maximum_net_worth = engine.config.simulation.starting_cash;
+            state.maximum_drawdown = 0.0;
+            state.alive = true;
+            state.total_policy_failures = 0;
+            state.consecutive_policy_failures = 0;
+            let snapshot = reset_evaluation_snapshot(checkpoint_agent.policy)?;
+            let mut agent = factory.restore(
+                state,
+                snapshot,
+                &AgentBuildContext {
+                    agent_id,
+                    birth_date,
+                    config: &engine.config,
+                    architecture: &engine.architecture,
+                    compute_device: &engine.compute_device,
+                },
+            )?;
+            agent.restore_learning(LearningStrategyState::NoLearning)?;
+            restored.push(agent);
+        }
+        engine.factory = factory;
+        engine.agents = restored;
+        engine.metrics = MetricsCollector::default();
+        engine.domain_events.clear();
+        engine.evolution = EvolutionState::new(engine.config.simulation.seed ^ 0x243f6a8885a308d3);
+        engine.next_agent_id = engine
+            .agents
+            .iter()
+            .map(|agent| agent.state.id.0)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let agent_ids = engine
+            .agents
+            .iter()
+            .map(|agent| agent.state.id)
+            .collect::<Vec<_>>();
+        for agent_id in agent_ids {
+            let event = DomainEvent::AgentBorn {
+                agent_id,
+                date: birth_date,
+            };
+            engine.metrics.on_event(&event);
+            engine.domain_events.push(event);
+        }
+        engine.lifecycle = SimulationLifecycle::Initialized;
+        Ok(engine)
+    }
     pub fn report(&self) -> SimulationReport {
         let learning_implementation = match self.config.learning.implementation {
             crate::config::LearningKind::NoLearning => "no_learning",
@@ -1866,6 +1985,41 @@ pub struct SimulationReport {
     pub active_lineages: u64,
     pub lifecycle: SimulationLifecycle,
     pub failure_reason: Option<String>,
+}
+
+fn reset_evaluation_snapshot(snapshot: PolicySnapshot) -> Result<PolicySnapshot> {
+    match snapshot {
+        PolicySnapshot::Neural {
+            genome, state, rng, ..
+        } => {
+            let state = match *state {
+                NeuralModelState::Burn {
+                    parameters,
+                    mut runtime,
+                    optimizer,
+                } => {
+                    runtime.memory.fill(0.0);
+                    runtime.inference_steps = 0;
+                    NeuralModelState::Burn {
+                        parameters,
+                        runtime,
+                        optimizer,
+                    }
+                }
+                NeuralModelState::External { kind, mut state } => {
+                    state.fill(0.0);
+                    NeuralModelState::External { kind, state }
+                }
+            };
+            Ok(PolicySnapshot::Neural {
+                temperature: genome.traits.action_temperature,
+                genome,
+                state: Box::new(state),
+                rng,
+            })
+        }
+        other => Ok(other),
+    }
 }
 
 fn classify_policy_failure(error: &MidasError) -> PolicyFailureCategory {

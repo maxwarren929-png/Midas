@@ -1,0 +1,3 @@
+    Finished `release` profile [optimized] target(s) in 0.27s
+     Running `target/release/midas-cli validate-config --config configs/experiment-calibration.toml`
+valid configuration c41ce0281b3fb6164992d0a519327395cbf2133cb67085cfabf0d18a07cc03df
