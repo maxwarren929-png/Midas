@@ -45,6 +45,15 @@ id_type!(ExperimentId);
 
 pub type Result<T> = std::result::Result<T, MidasError>;
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub enum PolicyFailureCategory {
+    InvalidObservation,
+    InferenceFailure,
+    InvalidOutput,
+    NonFiniteState,
+    SchemaMismatch,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum MidasError {
     #[error("configuration error: {0}")]

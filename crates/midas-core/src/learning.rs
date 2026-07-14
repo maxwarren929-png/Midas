@@ -1,5 +1,5 @@
 use crate::{
-    MidasError, Result,
+    MidasError, PolicyFailureCategory, Result,
     action::ValidatedAllocation,
     brain::{NeuralRuntimeState, PolicyActionSample},
     config::LearningConfig,
@@ -12,34 +12,39 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Transition {
-    pub observation: Observation,
+    pub observation: Option<Observation>,
     pub action: ValidatedAllocation,
     pub action_sample: Option<PolicyActionSample>,
-    pub raw_policy_output: Vec<f32>,
-    pub log_probability: f32,
-    pub temperature: f32,
-    pub value_estimate: f32,
+    pub raw_policy_output: Option<Vec<f32>>,
+    pub log_probability: Option<f32>,
+    pub temperature: Option<f32>,
+    pub value_estimate: Option<f32>,
     pub reward: f32,
-    pub next_value: f32,
+    pub next_value: Option<f32>,
     pub done: bool,
     pub truncated: bool,
-    pub recurrent_state_before: NeuralRuntimeState,
-    pub recurrent_state_after: NeuralRuntimeState,
+    pub recurrent_state_before: Option<NeuralRuntimeState>,
+    pub recurrent_state_after: Option<NeuralRuntimeState>,
     pub date: NaiveDate,
     pub tradable: Vec<bool>,
+    pub invalid_action: bool,
+    pub failure_category: Option<PolicyFailureCategory>,
+    pub actor_eligible: bool,
+    pub critic_eligible: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PpoTrainingSample {
     pub observation: Observation,
-    pub action_index: usize,
-    pub old_log_probability: f32,
-    pub advantage: f32,
-    pub return_value: f32,
-    pub value_estimate: f32,
+    pub action_index: Option<usize>,
+    pub old_log_probability: Option<f32>,
+    pub advantage: Option<f32>,
+    pub return_value: Option<f32>,
+    pub value_estimate: Option<f32>,
     pub recurrent_state: NeuralRuntimeState,
     pub tradable: Vec<bool>,
-    pub temperature: f32,
+    pub temperature: Option<f32>,
+    pub invalid_action: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -163,8 +168,18 @@ impl RolloutBuffer {
             ));
         }
         if !transition.reward.is_finite()
-            || !transition.value_estimate.is_finite()
-            || !transition.next_value.is_finite()
+            || transition
+                .value_estimate
+                .is_some_and(|value| !value.is_finite())
+            || transition
+                .next_value
+                .is_some_and(|value| !value.is_finite())
+            || transition
+                .log_probability
+                .is_some_and(|value| !value.is_finite())
+            || transition
+                .temperature
+                .is_some_and(|value| !value.is_finite())
         {
             return Err(MidasError::Policy(
                 "rollout transition is non-finite".into(),
@@ -253,26 +268,51 @@ impl PpoLearning {
             return Ok(LearningUpdate::None);
         }
         let (advantages, returns) =
-            generalized_advantages(transitions, self.config.gamma, self.config.gae_lambda)?;
+            generalized_advantages_masked(transitions, self.config.gamma, self.config.gae_lambda)?;
         let mut samples = transitions
             .iter()
             .zip(advantages)
             .zip(returns)
             .filter_map(|((transition, advantage), return_value)| {
-                transition
-                    .action_sample
-                    .as_ref()
-                    .map(|sample| PpoTrainingSample {
-                        observation: transition.observation.clone(),
-                        action_index: sample.action_index,
-                        old_log_probability: transition.log_probability,
-                        advantage,
-                        return_value,
-                        value_estimate: transition.value_estimate,
-                        recurrent_state: transition.recurrent_state_before.clone(),
-                        tradable: transition.tradable.clone(),
-                        temperature: transition.temperature,
-                    })
+                let observation = transition.observation.clone()?;
+                let recurrent_state = transition.recurrent_state_before.clone()?;
+                let actor_sample = transition
+                    .actor_eligible
+                    .then_some(())
+                    .and(transition.action_sample.as_ref())
+                    .and_then(|sample| {
+                        transition
+                            .log_probability
+                            .zip(transition.temperature)
+                            .zip(advantage)
+                            .map(|((old_log_probability, temperature), advantage)| {
+                                (
+                                    sample.action_index,
+                                    old_log_probability,
+                                    temperature,
+                                    advantage,
+                                )
+                            })
+                    });
+                let critic_sample = transition
+                    .critic_eligible
+                    .then_some(())
+                    .and(transition.value_estimate.zip(return_value));
+                if actor_sample.is_none() && critic_sample.is_none() {
+                    return None;
+                }
+                Some(PpoTrainingSample {
+                    observation,
+                    action_index: actor_sample.map(|sample| sample.0),
+                    old_log_probability: actor_sample.map(|sample| sample.1),
+                    advantage: actor_sample.map(|sample| sample.3),
+                    return_value: critic_sample.map(|sample| sample.1),
+                    value_estimate: critic_sample.map(|sample| sample.0),
+                    recurrent_state,
+                    tradable: transition.tradable.clone(),
+                    temperature: actor_sample.map(|sample| sample.2),
+                    invalid_action: transition.invalid_action,
+                })
             })
             .collect::<Vec<_>>();
         if samples.is_empty() {
@@ -280,16 +320,26 @@ impl PpoLearning {
             return Ok(LearningUpdate::None);
         }
         if self.config.normalize_advantages {
-            let mean =
-                samples.iter().map(|sample| sample.advantage).sum::<f32>() / samples.len() as f32;
+            let actor_count = samples
+                .iter()
+                .filter(|sample| sample.advantage.is_some())
+                .count();
+            let mean = samples
+                .iter()
+                .filter_map(|sample| sample.advantage)
+                .sum::<f32>()
+                / actor_count.max(1) as f32;
             let variance = samples
                 .iter()
-                .map(|sample| (sample.advantage - mean).powi(2))
+                .filter_map(|sample| sample.advantage)
+                .map(|advantage| (advantage - mean).powi(2))
                 .sum::<f32>()
-                / samples.len() as f32;
+                / actor_count.max(1) as f32;
             let standard_deviation = variance.sqrt().max(1e-8);
             for sample in &mut samples {
-                sample.advantage = (sample.advantage - mean) / standard_deviation;
+                if let Some(advantage) = sample.advantage {
+                    sample.advantage = Some((advantage - mean) / standard_deviation);
+                }
             }
         }
         // Shuffle complete recurrent sequences, never individual timesteps.
@@ -300,17 +350,28 @@ impl PpoLearning {
             let swap = self.rng.gen_range(0..=index);
             order.swap(index, swap);
         }
-        let shuffled = order
-            .into_iter()
-            .flat_map(|chunk| {
-                samples
-                    .iter()
-                    .skip(chunk * sequence)
-                    .take(sequence)
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        let shuffled = if transitions
+            .iter()
+            .any(|transition| !transition.actor_eligible || !transition.critic_eligible)
+        {
+            // Masked environment steps are intentionally absent from model
+            // tensors but remain in the rollout chronology. Keep eligible
+            // samples in source order rather than stitching across a masked
+            // recurrent boundary.
+            samples
+        } else {
+            order
+                .into_iter()
+                .flat_map(|chunk| {
+                    samples
+                        .iter()
+                        .skip(chunk * sequence)
+                        .take(sequence)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
         self.pending_update = true;
         Ok(LearningUpdate::Ppo(PpoTrainingBatch {
             samples: shuffled,
@@ -398,6 +459,30 @@ pub fn generalized_advantages(
     gamma: f32,
     gae_lambda: f32,
 ) -> Result<(Vec<f32>, Vec<f32>)> {
+    let (advantages, returns) = generalized_advantages_masked(transitions, gamma, gae_lambda)?;
+    if advantages.iter().any(Option::is_none) || returns.iter().any(Option::is_none) {
+        return Err(MidasError::Policy(
+            "masked transition requires generalized_advantages_masked".into(),
+        ));
+    }
+    Ok((
+        advantages.into_iter().map(Option::unwrap).collect(),
+        returns.into_iter().map(Option::unwrap).collect(),
+    ))
+}
+
+/// Computes GAE over the complete environment chronology. When every
+/// timestep has a critic estimate, this is the standard bootstrapped GAE.
+/// If a failure timestep has no trustworthy model value, the critic path uses
+/// discounted environment returns across the masked entry instead of inventing
+/// a zero value; masked entries themselves remain ineligible for critic loss.
+pub type MaskedGae = (Vec<Option<f32>>, Vec<Option<f32>>);
+
+pub fn generalized_advantages_masked(
+    transitions: &[Transition],
+    gamma: f32,
+    gae_lambda: f32,
+) -> Result<MaskedGae> {
     if !gamma.is_finite()
         || !gae_lambda.is_finite()
         || !(0.0..=1.0).contains(&gamma)
@@ -405,21 +490,77 @@ pub fn generalized_advantages(
     {
         return Err(MidasError::Config("invalid GAE parameters".into()));
     }
+    let fully_valued = transitions.iter().all(|transition| {
+        transition.critic_eligible
+            && transition.value_estimate.is_some()
+            && transition.next_value.is_some()
+    });
+    if !fully_valued {
+        let mut returns = vec![None; transitions.len()];
+        let mut discounted = 0.0_f32;
+        for index in (0..transitions.len()).rev() {
+            let transition = &transitions[index];
+            if transition.done && !transition.truncated {
+                discounted = transition.reward;
+            } else {
+                discounted = transition.reward + gamma * discounted;
+            }
+            if transition.critic_eligible {
+                let Some(value) = transition.value_estimate else {
+                    continue;
+                };
+                let advantage = discounted - value;
+                if !advantage.is_finite() || !discounted.is_finite() {
+                    return Err(MidasError::Policy(
+                        "masked GAE produced non-finite values".into(),
+                    ));
+                }
+                returns[index] = Some(discounted);
+                // The advantage is stored in the parallel vector below.
+                // Keeping this branch explicit makes masked critic samples
+                // distinguishable from actor-ineligible entries.
+                let _ = advantage;
+            }
+        }
+        let advantages = transitions
+            .iter()
+            .enumerate()
+            .map(|(index, transition)| {
+                transition
+                    .value_estimate
+                    .zip(returns[index])
+                    .map(|(value, target)| target - value)
+            })
+            .collect::<Vec<_>>();
+        return Ok((advantages, returns));
+    }
     let mut advantages = vec![0.0; transitions.len()];
     let mut next_gae = 0.0;
     for index in (0..transitions.len()).rev() {
         let transition = &transitions[index];
         let bootstrap = !transition.done || transition.truncated;
         let mask = if bootstrap { 1.0 } else { 0.0 };
-        let delta =
-            transition.reward + gamma * transition.next_value * mask - transition.value_estimate;
+        let delta = transition.reward
+            + gamma
+                * transition
+                    .next_value
+                    .expect("fully valued transition has next value")
+                * mask
+            - transition
+                .value_estimate
+                .expect("fully valued transition has value");
         next_gae = delta + gamma * gae_lambda * mask * next_gae;
         advantages[index] = next_gae;
     }
     let returns = advantages
         .iter()
         .zip(transitions)
-        .map(|(advantage, transition)| advantage + transition.value_estimate)
+        .map(|(advantage, transition)| {
+            advantage
+                + transition
+                    .value_estimate
+                    .expect("fully valued transition has value")
+        })
         .collect::<Vec<_>>();
     if advantages
         .iter()
@@ -428,7 +569,10 @@ pub fn generalized_advantages(
     {
         return Err(MidasError::Policy("GAE produced non-finite values".into()));
     }
-    Ok((advantages, returns))
+    Ok((
+        advantages.into_iter().map(Some).collect(),
+        returns.into_iter().map(Some).collect(),
+    ))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -504,39 +648,44 @@ mod tests {
                 &ActionValidationContext {
                     asset_count: 1,
                     tradable: &[true],
-                    maximum_asset_allocation: 1.0,
+                    policy_maximum_asset_allocation: Some(1.0),
+                    market_maximum_asset_allocation: None,
                 },
             )
             .unwrap();
         Transition {
-            observation: Observation {
+            observation: Some(Observation {
                 schema_hash: "schema".into(),
                 values: vec![0.0],
-            },
+            }),
             action,
             action_sample: Some(PolicyActionSample {
                 action_index: 0,
                 log_probability: -std::f32::consts::LN_2,
                 entropy: std::f32::consts::LN_2,
             }),
-            raw_policy_output: vec![0.0, 0.0],
-            log_probability: -std::f32::consts::LN_2,
-            temperature: 1.0,
-            value_estimate: value,
+            raw_policy_output: Some(vec![0.0, 0.0]),
+            log_probability: Some(-std::f32::consts::LN_2),
+            temperature: Some(1.0),
+            value_estimate: Some(value),
             reward,
-            next_value,
+            next_value: Some(next_value),
             done,
             truncated: false,
-            recurrent_state_before: NeuralRuntimeState {
+            recurrent_state_before: Some(NeuralRuntimeState {
                 memory: Vec::new(),
                 inference_steps: 0,
-            },
-            recurrent_state_after: NeuralRuntimeState {
+            }),
+            recurrent_state_after: Some(NeuralRuntimeState {
                 memory: Vec::new(),
                 inference_steps: 1,
-            },
+            }),
             date: NaiveDate::from_ymd_opt(2020, 1, 1).unwrap(),
             tradable: vec![true],
+            invalid_action: false,
+            failure_category: None,
+            actor_eligible: true,
+            critic_eligible: true,
         }
     }
 
@@ -550,6 +699,32 @@ mod tests {
         assert!((advantages[1] - 2.0).abs() < 1e-6);
         assert!((advantages[0] - (1.0 + 0.9 * 0.5 + 0.9 * 0.8 * 2.0)).abs() < 1e-6);
         assert_eq!(returns, advantages);
+    }
+
+    #[test]
+    fn masked_failure_reward_remains_in_chronological_returns() {
+        let mut masked = transition(0.0, 0.0, 0.0, false);
+        masked.observation = None;
+        masked.action_sample = None;
+        masked.value_estimate = None;
+        masked.next_value = None;
+        masked.recurrent_state_before = None;
+        masked.recurrent_state_after = None;
+        masked.actor_eligible = false;
+        masked.critic_eligible = false;
+        masked.invalid_action = true;
+        masked.reward = -2.0;
+        let transitions = vec![
+            transition(1.0, 0.0, 0.0, false),
+            masked,
+            transition(3.0, 0.0, 0.0, true),
+        ];
+        let (advantages, returns) = generalized_advantages_masked(&transitions, 0.9, 0.95).unwrap();
+        assert!((advantages[0].unwrap() - 1.63).abs() < 1e-6);
+        assert!(advantages[1].is_none());
+        assert!((returns[0].unwrap() - 1.63).abs() < 1e-6);
+        assert_eq!(returns[1], None);
+        assert_eq!(returns[2], Some(3.0));
     }
 
     #[test]

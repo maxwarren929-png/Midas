@@ -6,8 +6,7 @@ use crate::{
     evolution::{
         CompletedLifeSummary, DefaultGenomeMutator, EvolutionRng, FitnessScore, GenomeMutator,
         GenomeRecord, MutationContext, MutationReport, ParentCandidate, ParentSelector,
-        RankWeightedSelection, SelectedParents, SelectionPopulation, TournamentSelection,
-        crossover, genome_distance,
+        RankWeightedSelection, SelectionPopulation, TournamentSelection, crossover,
     },
     observation::ObservationSchema,
 };
@@ -70,6 +69,7 @@ impl ReplacementStrategy for NonEvolutionaryRandomGenomeReplacement {
             parent_ids: Vec::new(),
             metadata: SpawnMetadata {
                 reason: "non_evolutionary_replacement".into(),
+                ..SpawnMetadata::default()
             },
         })
     }
@@ -95,6 +95,7 @@ impl ReplacementStrategy for EvolutionaryReplacementStrategy {
                 parent_ids: Vec::new(),
                 metadata: SpawnMetadata {
                     reason: "evolution_non_neural_policy".into(),
+                    ..SpawnMetadata::default()
                 },
             });
         }
@@ -143,7 +144,12 @@ impl ReplacementStrategy for EvolutionaryReplacementStrategy {
                 config: selection_config,
             }),
         };
-        let mut parents = match selector.select_parents(&population, &mut selection_rng) {
+        let minimum_distance = c.config.evolution.diversity.minimum_mating_distance as f64;
+        let parents = match selector.select_parents_with_constraints(
+            &population,
+            &crate::evolution::PairConstraints { minimum_distance },
+            &mut selection_rng,
+        ) {
             Ok(parents) => parents,
             Err(error) => {
                 return match c.config.evolution.fallback {
@@ -160,6 +166,7 @@ impl ReplacementStrategy for EvolutionaryReplacementStrategy {
                             parent_ids: vec![best.agent_id],
                             metadata: SpawnMetadata {
                                 reason: "evolution_clone_best_fallback".into(),
+                                ..SpawnMetadata::default()
                             },
                         })
                     }
@@ -173,40 +180,12 @@ impl ReplacementStrategy for EvolutionaryReplacementStrategy {
                         parent_ids: Vec::new(),
                         metadata: SpawnMetadata {
                             reason: "evolution_random_genome_fallback".into(),
+                            ..SpawnMetadata::default()
                         },
                     }),
                 };
             }
         };
-        let minimum_distance = c.config.evolution.diversity.minimum_mating_distance as f64;
-        if minimum_distance > 0.0 {
-            let eligible = population
-                .candidates
-                .iter()
-                .filter(|candidate| {
-                    candidate.age >= c.config.evolution.selection.minimum_age
-                        && candidate.net_worth >= c.config.evolution.selection.minimum_net_worth
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            let mut alternatives = Vec::new();
-            for (first, left) in eligible.iter().enumerate() {
-                for (second, right) in eligible.iter().enumerate() {
-                    if !c.config.evolution.selection.allow_self_parenting && first == second {
-                        continue;
-                    }
-                    if genome_distance(&left.genome, &right.genome, 1.0, 1.0)? >= minimum_distance {
-                        alternatives.push(SelectedParents {
-                            first: left.clone(),
-                            second: right.clone(),
-                        });
-                    }
-                }
-            }
-            if !alternatives.is_empty() {
-                parents = alternatives[selection_rng.choose_index(alternatives.len())?].clone();
-            }
-        }
         let mut fallback_reason = None;
         let mut child = match crossover(
             &parents.first.genome,
@@ -272,7 +251,12 @@ impl ReplacementStrategy for EvolutionaryReplacementStrategy {
             policy_blueprint: PolicyBlueprint::Neural,
             genome: Some(child),
             parent_ids: vec![parents.first.agent_id, parents.second.agent_id],
-            metadata: SpawnMetadata { reason },
+            metadata: SpawnMetadata {
+                reason,
+                diversity_constraint_relaxed: parents.distance_relaxed,
+                requested_mating_distance: minimum_distance,
+                selected_mating_distance: parents.selected_distance,
+            },
         })
     }
     fn name(&self) -> &'static str {

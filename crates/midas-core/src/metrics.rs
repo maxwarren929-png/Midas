@@ -31,6 +31,10 @@ pub struct MetricsCollector {
     pub fitness_assignments: u64,
     pub reproductions: u64,
     pub evolution_fallbacks: u64,
+    pub masked_failure_transitions: u64,
+    pub actor_ineligible_transitions: u64,
+    pub critic_ineligible_transitions: u64,
+    pub invalid_action_penalty_total: f64,
 }
 impl EventSink for MetricsCollector {
     fn on_event(&mut self, event: &DomainEvent) {
@@ -63,6 +67,21 @@ impl EventSink for MetricsCollector {
             DomainEvent::FitnessAssigned { .. } => self.fitness_assignments += 1,
             DomainEvent::ParentsSelected { .. } => self.reproductions += 1,
             DomainEvent::EvolutionFallback { .. } => self.evolution_fallbacks += 1,
+            DomainEvent::LearningTransitionMasked {
+                actor_eligible,
+                critic_eligible,
+                penalty,
+                ..
+            } => {
+                self.masked_failure_transitions += 1;
+                if !actor_eligible {
+                    self.actor_ineligible_transitions += 1;
+                }
+                if !critic_eligible {
+                    self.critic_ineligible_transitions += 1;
+                }
+                self.invalid_action_penalty_total += *penalty as f64;
+            }
             DomainEvent::TradeRejected { .. } => self.rejected_trades += 1,
             DomainEvent::AgentDied {
                 agent_id, cause, ..

@@ -51,7 +51,13 @@ impl ValidatedAllocation {
 pub struct ActionValidationContext<'a> {
     pub asset_count: usize,
     pub tradable: &'a [bool],
-    pub maximum_asset_allocation: f64,
+    /// A cap supplied by the policy or its inherited genome. Benchmarks leave
+    /// this unset because their documented allocations are not neural-policy
+    /// proposals.
+    pub policy_maximum_asset_allocation: Option<f64>,
+    /// An explicit market-wide cap, when an experiment chooses to impose one
+    /// on every policy including benchmarks.
+    pub market_maximum_asset_allocation: Option<f64>,
 }
 
 pub trait ActionValidator: Send + Sync {
@@ -85,13 +91,25 @@ impl ActionValidator for LongOnlyActionValidator {
         proposed: ProposedAllocation,
         context: &ActionValidationContext<'_>,
     ) -> Result<ValidatedAllocation> {
-        if context.tradable.len() != context.asset_count
-            || !context.maximum_asset_allocation.is_finite()
-            || !(0.0..=1.0).contains(&context.maximum_asset_allocation)
-            || context.maximum_asset_allocation == 0.0
-        {
+        if context.tradable.len() != context.asset_count {
             return Err(MidasError::Config(
                 "invalid action-validation context".into(),
+            ));
+        }
+        let cap = match (
+            context.policy_maximum_asset_allocation,
+            context.market_maximum_asset_allocation,
+        ) {
+            (Some(policy), Some(market)) => Some(policy.min(market)),
+            (Some(policy), None) => Some(policy),
+            (None, Some(market)) => Some(market),
+            (None, None) => None,
+        };
+        if cap.is_some_and(|value| {
+            !value.is_finite() || !(0.0..=1.0).contains(&value) || value == 0.0
+        }) {
+            return Err(MidasError::Config(
+                "invalid action-validation allocation cap".into(),
             ));
         }
         if proposed.weights.len() != context.asset_count + 1
@@ -117,48 +135,51 @@ impl ActionValidator for LongOnlyActionValidator {
         for weight in &mut weights {
             *weight /= sum;
         }
-        let max = context.maximum_asset_allocation;
-        loop {
-            let mut excess = 0.0;
-            for weight in weights.iter_mut().skip(1) {
-                if *weight > max {
-                    excess += *weight - max;
-                    *weight = max;
+        if let Some(max) = cap {
+            loop {
+                let mut excess = 0.0;
+                for weight in weights.iter_mut().skip(1) {
+                    if *weight > max {
+                        excess += *weight - max;
+                        *weight = max;
+                    }
                 }
-            }
-            if excess <= 1e-12 {
-                break;
-            }
-            let eligible = (1..weights.len())
-                .filter(|i| context.tradable[*i - 1] && weights[*i] < max - 1e-12)
-                .collect::<Vec<_>>();
-            if eligible.is_empty() {
-                weights[0] += excess;
-                break;
-            }
-            let share = excess / (eligible.len() + 1) as f64;
-            weights[0] += share;
-            for index in eligible {
-                weights[index] += share;
+                if excess <= 1e-12 {
+                    break;
+                }
+                let eligible = (1..weights.len())
+                    .filter(|i| context.tradable[*i - 1] && weights[*i] < max - 1e-12)
+                    .collect::<Vec<_>>();
+                if eligible.is_empty() {
+                    weights[0] += excess;
+                    break;
+                }
+                let share = excess / (eligible.len() + 1) as f64;
+                weights[0] += share;
+                for index in eligible {
+                    weights[index] += share;
+                }
             }
         }
         let sum = weights.iter().sum::<f64>();
         for weight in &mut weights {
             *weight /= sum;
         }
-        let mut rounding_excess = 0.0;
-        for weight in weights.iter_mut().skip(1) {
-            if *weight > max {
-                rounding_excess += *weight - max;
-                *weight = max;
+        if let Some(max) = cap {
+            let mut rounding_excess = 0.0;
+            for weight in weights.iter_mut().skip(1) {
+                if *weight > max {
+                    rounding_excess += *weight - max;
+                    *weight = max;
+                }
             }
+            weights[0] += rounding_excess;
         }
-        weights[0] += rounding_excess;
         if weights
             .iter()
             .any(|weight| !weight.is_finite() || *weight < 0.0)
             || (weights.iter().sum::<f64>() - 1.0).abs() > 1e-9
-            || weights.iter().skip(1).any(|weight| *weight > max)
+            || cap.is_some_and(|max| weights.iter().skip(1).any(|weight| *weight > max))
         {
             return Err(MidasError::Policy(
                 "concentration enforcement failed".into(),

@@ -193,3 +193,76 @@ fn evolutionary_replacement_selects_two_parents_and_reports_mutation() {
     assert_eq!(child.state.total_policy_failures, 0);
     assert_eq!(child.state.consecutive_policy_failures, 0);
 }
+
+#[test]
+fn mating_distance_preserves_configured_selection_pressure() {
+    let mut unrestricted = prompt2_config();
+    unrestricted.evolution.diversity.minimum_mating_distance = 0.0;
+    unrestricted.evolution.selection.tournament_size = 3;
+    unrestricted.simulation.population_size = 4;
+    let data = PolarsDataSource.load(&unrestricted).unwrap();
+    let engine = SimulationEngine::new(unrestricted.clone(), data, DatasetSplit::Training).unwrap();
+    let dead = engine.agents().next().unwrap().clone();
+    let living = engine
+        .agents()
+        .skip(1)
+        .enumerate()
+        .map(|(index, state)| LivingAgentSummary {
+            id: state.id,
+            net_worth: 10_000.0 + (index as f64) * 10.0,
+            age: state.age,
+            policy: PolicyBlueprint::Neural,
+            genome: state.genome.as_ref(),
+            maximum_drawdown: state.maximum_drawdown,
+            birth_date: state.birth_date,
+            parent_ids: state.parent_ids.clone(),
+        })
+        .collect::<Vec<_>>();
+    let schema = engine.observation_schema().clone();
+    let architecture = midas_core::brain::BrainArchitecture::from_config(
+        &unrestricted.brain,
+        schema.identity(unrestricted.market.assets.len()).unwrap(),
+        schema.dimension(unrestricted.market.assets.len()),
+        unrestricted.market.assets.len(),
+    );
+    let device = unrestricted.backend.compute_device().unwrap();
+    let registry = std::collections::BTreeMap::new();
+    let baseline_context = ReplacementContext {
+        dead_agent: &dead,
+        dead_policy: PolicyBlueprint::Neural,
+        living_population: &living,
+        config: &unrestricted,
+        architecture: &architecture,
+        compute_device: &device,
+        observation_schema: &schema,
+        deterministic_seed: 19,
+        completed_lives: &[],
+        genome_registry: &registry,
+    };
+    let mut baseline = EvolutionaryReplacementStrategy::default();
+    let baseline_request = baseline.create_replacement(&baseline_context).unwrap();
+
+    let mut constrained = unrestricted.clone();
+    constrained.evolution.diversity.minimum_mating_distance = 0.0001;
+    let constrained_context = ReplacementContext {
+        dead_agent: &dead,
+        dead_policy: PolicyBlueprint::Neural,
+        living_population: &living,
+        config: &constrained,
+        architecture: &architecture,
+        compute_device: &device,
+        observation_schema: &schema,
+        deterministic_seed: 19,
+        completed_lives: &[],
+        genome_registry: &registry,
+    };
+    let mut constrained_strategy = EvolutionaryReplacementStrategy::default();
+    let constrained_request = constrained_strategy
+        .create_replacement(&constrained_context)
+        .unwrap();
+
+    assert_eq!(
+        baseline_request.parent_ids, constrained_request.parent_ids,
+        "mating distance must filter the second-parent pool without replacing selector pressure"
+    );
+}

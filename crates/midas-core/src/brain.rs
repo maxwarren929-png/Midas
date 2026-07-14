@@ -831,110 +831,139 @@ fn train_burn_heads_inner(
     let mut value_loss = 0.0_f32;
     let mut entropy = 0.0_f32;
     let mut total_loss = 0.0_f32;
+    let mut actor_count = 0usize;
+    let mut critic_count = 0usize;
 
     for sample in &batch.samples {
-        if sample.action_index >= model.architecture.actor_output_size
-            || sample.recurrent_state.memory.len() != model.architecture.memory.size
-        {
+        if sample.recurrent_state.memory.len() != model.architecture.memory.size {
             return Err(MidasError::Policy(
                 "PPO sample does not match neural architecture".into(),
             ));
         }
         let encoded = model.encode_observation(&sample.observation, &sample.recurrent_state)?;
         let output = model.evaluate_representation(&encoded.representation)?;
-        let probabilities = single_asset_capped_categorical_probabilities(
-            &output.logits,
-            &sample.tradable,
-            model.architecture.asset_count,
-            sample.temperature,
-        )?;
-        let selected_probability = probabilities
-            .get(sample.action_index)
-            .copied()
-            .filter(|probability| probability.is_finite() && *probability > 0.0)
-            .ok_or_else(|| {
-                MidasError::Policy("PPO sample selected an unavailable action".into())
+        if let Some(action_index) = sample.action_index {
+            let old_log_probability = sample.old_log_probability.ok_or_else(|| {
+                MidasError::Policy("actor sample is missing its old log probability".into())
             })?;
-        let new_log_probability = selected_probability.ln();
-        let sample_entropy = probabilities
-            .iter()
-            .filter(|probability| **probability > 0.0)
-            .map(|probability| -probability * probability.ln())
-            .sum::<f64>() as f32;
-        let loss = crate::learning::ppo_loss(
-            sample.old_log_probability,
-            new_log_probability as f32,
-            sample.advantage,
-            output.value,
-            sample.return_value,
-            sample_entropy,
-            config.ppo_clip,
-            config.critic_coefficient,
-            config.entropy_coefficient,
-        )?;
-        policy_loss += loss.policy_loss;
-        value_loss += loss.value_loss;
-        entropy += sample_entropy;
-        total_loss += loss.total_loss;
-
-        let ratio = loss.ratio;
-        let unclipped = ratio * sample.advantage;
-        let clipped = ratio.clamp(1.0 - config.ppo_clip, 1.0 + config.ppo_clip) * sample.advantage;
-        let clipped_active = if sample.advantage >= 0.0 {
-            clipped < unclipped
-        } else {
-            clipped > unclipped
-        };
-        let mut actor_output_gradient = vec![0.0_f32; actor_outputs];
-        if !clipped_active {
-            let coefficient = ratio * sample.advantage;
-            for (index, probability) in probabilities.iter().enumerate() {
-                actor_output_gradient[index] += coefficient
-                    * (*probability as f32
-                        - if index == sample.action_index {
-                            1.0
-                        } else {
-                            0.0
-                        })
-                    / sample.temperature;
+            let advantage = sample
+                .advantage
+                .ok_or_else(|| MidasError::Policy("actor sample is missing advantage".into()))?;
+            let temperature = sample
+                .temperature
+                .ok_or_else(|| MidasError::Policy("actor sample is missing temperature".into()))?;
+            if action_index >= model.architecture.actor_output_size {
+                return Err(MidasError::Policy(
+                    "PPO sample action is outside actor output dimensions".into(),
+                ));
             }
-        }
-        // The entropy derivative is the exact derivative of the categorical
-        // entropy with respect to logits; it is added to the actor gradient.
-        if config.entropy_coefficient > 0.0 {
-            for (index, probability) in probabilities.iter().enumerate() {
-                if *probability > 0.0 {
-                    actor_output_gradient[index] += config.entropy_coefficient
-                        * (*probability as f32)
-                        * (probability.ln() as f32 + sample_entropy)
-                        / sample.temperature;
+            let probabilities = single_asset_capped_categorical_probabilities(
+                &output.logits,
+                &sample.tradable,
+                model.architecture.asset_count,
+                temperature,
+            )?;
+            let selected_probability = probabilities
+                .get(action_index)
+                .copied()
+                .filter(|probability| probability.is_finite() && *probability > 0.0)
+                .ok_or_else(|| {
+                    MidasError::Policy("PPO sample selected an unavailable action".into())
+                })?;
+            let new_log_probability = selected_probability.ln();
+            let sample_entropy = probabilities
+                .iter()
+                .filter(|probability| **probability > 0.0)
+                .map(|probability| -probability * probability.ln())
+                .sum::<f64>() as f32;
+            let target_return = sample.return_value.unwrap_or(output.value);
+            let loss = crate::learning::ppo_loss(
+                old_log_probability,
+                new_log_probability as f32,
+                advantage,
+                output.value,
+                target_return,
+                sample_entropy,
+                config.ppo_clip,
+                config.critic_coefficient,
+                config.entropy_coefficient,
+            )?;
+            policy_loss += loss.policy_loss;
+            entropy += sample_entropy;
+            total_loss += loss.policy_loss - config.entropy_coefficient * sample_entropy;
+            actor_count += 1;
+
+            let ratio = loss.ratio;
+            let unclipped = ratio * advantage;
+            let clipped = ratio.clamp(1.0 - config.ppo_clip, 1.0 + config.ppo_clip) * advantage;
+            let clipped_active = if advantage >= 0.0 {
+                clipped < unclipped
+            } else {
+                clipped > unclipped
+            };
+            let mut actor_output_gradient = vec![0.0_f32; actor_outputs];
+            if !clipped_active {
+                let coefficient = ratio * advantage;
+                for (index, probability) in probabilities.iter().enumerate() {
+                    actor_output_gradient[index] += coefficient
+                        * (*probability as f32 - if index == action_index { 1.0 } else { 0.0 })
+                        / temperature;
                 }
             }
+            // The entropy derivative is the exact derivative of the
+            // categorical entropy with respect to logits.
+            if config.entropy_coefficient > 0.0 {
+                for (index, probability) in probabilities.iter().enumerate() {
+                    if *probability > 0.0 {
+                        actor_output_gradient[index] += config.entropy_coefficient
+                            * (*probability as f32)
+                            * (probability.ln() as f32 + sample_entropy)
+                            / temperature;
+                    }
+                }
+            }
+            accumulate_dense_gradient(
+                &encoded.representation,
+                &actor_output_gradient,
+                &mut actor_weight_gradient,
+                &mut actor_bias_gradient,
+            )?;
         }
-        accumulate_dense_gradient(
-            &encoded.representation,
-            &actor_output_gradient,
-            &mut actor_weight_gradient,
-            &mut actor_bias_gradient,
-        )?;
-        let critic_output_gradient =
-            [2.0 * config.critic_coefficient * (output.value - sample.return_value)];
-        accumulate_dense_gradient(
-            &encoded.representation,
-            &critic_output_gradient,
-            &mut critic_weight_gradient,
-            &mut critic_bias_gradient,
-        )?;
+        if let Some(target_return) = sample.return_value {
+            let critic_output_gradient =
+                [2.0 * config.critic_coefficient * (output.value - target_return)];
+            let critic_loss = (output.value - target_return).powi(2);
+            if !critic_loss.is_finite() {
+                return Err(MidasError::Policy("non-finite critic loss".into()));
+            }
+            value_loss += critic_loss;
+            total_loss += config.critic_coefficient * critic_loss;
+            critic_count += 1;
+            accumulate_dense_gradient(
+                &encoded.representation,
+                &critic_output_gradient,
+                &mut critic_weight_gradient,
+                &mut critic_bias_gradient,
+            )?;
+        }
     }
 
-    let count = batch.samples.len() as f32;
+    let actor_divisor = actor_count.max(1) as f32;
+    let critic_divisor = critic_count.max(1) as f32;
     for gradient in actor_weight_gradient
         .iter_mut()
         .chain(actor_bias_gradient.iter_mut())
-        .chain(critic_weight_gradient.iter_mut())
+    {
+        *gradient /= actor_divisor;
+        if !gradient.is_finite() {
+            return Err(MidasError::Policy("non-finite PPO gradient".into()));
+        }
+    }
+    for gradient in critic_weight_gradient
+        .iter_mut()
         .chain(critic_bias_gradient.iter_mut())
     {
-        *gradient /= count;
+        *gradient /= critic_divisor;
         if !gradient.is_finite() {
             return Err(MidasError::Policy("non-finite PPO gradient".into()));
         }
@@ -1039,10 +1068,10 @@ fn train_burn_heads_inner(
     model.optimizer = next_optimizer;
     Ok(crate::learning::TrainingMetrics {
         rollout_size: batch.samples.len(),
-        policy_loss: policy_loss / count,
-        value_loss: value_loss / count,
-        entropy: entropy / count,
-        total_loss: total_loss / count,
+        policy_loss: policy_loss / actor_divisor,
+        value_loss: value_loss / critic_divisor,
+        entropy: entropy / actor_divisor,
+        total_loss: total_loss / (actor_count.max(critic_count).max(1) as f32),
         gradient_norm,
         update_index: model.optimizer.step,
     })
@@ -1223,13 +1252,19 @@ impl Policy for NeuralPolicy {
             self.temperature,
             &mut self.rng,
         )?;
-        let decay = self.genome.traits.temperature_decay;
-        if !decay.is_finite() || decay < 0.0 {
-            return Err(MidasError::Policy(
-                "invalid action-temperature decay".into(),
-            ));
+        // Exploration is part of stochastic acting only. Deterministic
+        // evaluation and critic bootstrap must be side-effect free so merely
+        // asking for a diagnostic action cannot consume the temperature
+        // schedule.
+        if stochastic && evaluation.action_sample.is_some() {
+            let decay = self.genome.traits.temperature_decay;
+            if !decay.is_finite() || decay < 0.0 {
+                return Err(MidasError::Policy(
+                    "invalid action-temperature decay".into(),
+                ));
+            }
+            self.temperature = (self.temperature * decay).max(f32::MIN_POSITIVE);
         }
-        self.temperature = (self.temperature * decay).max(f32::MIN_POSITIVE);
         Ok(evaluation)
     }
     fn apply_learning(
@@ -1595,17 +1630,18 @@ mod tests {
                 schema_hash: "schema".into(),
                 values,
             },
-            action_index,
-            old_log_probability,
-            advantage,
-            return_value,
-            value_estimate: 0.0,
+            action_index: Some(action_index),
+            old_log_probability: Some(old_log_probability),
+            advantage: Some(advantage),
+            return_value: Some(return_value),
+            value_estimate: Some(0.0),
             recurrent_state: NeuralRuntimeState {
                 memory: vec![0.0],
                 inference_steps: 0,
             },
             tradable: vec![true],
-            temperature: 1.0,
+            temperature: Some(1.0),
+            invalid_action: false,
         }
     }
 
@@ -1673,17 +1709,18 @@ mod tests {
                     schema_hash: "schema".into(),
                     values: vec![0.2, -0.1],
                 },
-                action_index: 0,
-                old_log_probability: -std::f32::consts::LN_2,
-                advantage: 1.0,
-                return_value: 1.0,
-                value_estimate: 0.0,
+                action_index: Some(0),
+                old_log_probability: Some(-std::f32::consts::LN_2),
+                advantage: Some(1.0),
+                return_value: Some(1.0),
+                value_estimate: Some(0.0),
                 recurrent_state: NeuralRuntimeState {
                     memory: vec![0.0],
                     inference_steps: 0,
                 },
                 tradable: vec![true],
-                temperature: 1.0,
+                temperature: Some(1.0),
+                invalid_action: false,
             }],
             sequence_length: 1,
         };
@@ -1712,17 +1749,18 @@ mod tests {
                     schema_hash: "schema".into(),
                     values: vec![0.8, -0.3],
                 },
-                action_index: 1,
-                old_log_probability: -0.7,
-                advantage: 1.0,
-                return_value: 0.5,
-                value_estimate: 0.0,
+                action_index: Some(1),
+                old_log_probability: Some(-0.7),
+                advantage: Some(1.0),
+                return_value: Some(0.5),
+                value_estimate: Some(0.0),
                 recurrent_state: NeuralRuntimeState {
                     memory: vec![0.0],
                     inference_steps: 0,
                 },
                 tradable: vec![true],
-                temperature: 1.0,
+                temperature: Some(1.0),
+                invalid_action: false,
             }],
             sequence_length: 1,
         };
@@ -1781,6 +1819,61 @@ mod tests {
             architecture.critic_output_size
         );
         assert_eq!(model.runtime_parameter_builds(), builds_before + 1);
+    }
+
+    #[test]
+    fn deterministic_evaluation_does_not_decay_temperature() {
+        let architecture = architecture();
+        let mut genome =
+            BrainGenome::random(&architecture, &EvolvableTraitsConfig::default(), 52).unwrap();
+        genome.traits.action_temperature = 1.0;
+        genome.traits.temperature_decay = 0.5;
+        let device = ComputeDevice::CpuNdArray {
+            device: "default".into(),
+        };
+        let mut policy = NeuralPolicy::new_with_seed(
+            genome.clone(),
+            BurnNeuralModelFactory
+                .build(&genome, &architecture, &device)
+                .unwrap(),
+            7,
+        );
+        let observation = Observation {
+            schema_hash: "schema".into(),
+            values: vec![0.1, -0.2],
+        };
+        let context = PolicyContext {
+            tradable: &[true],
+            current_allocations: &[1.0, 0.0],
+        };
+        let before = match policy.snapshot().unwrap() {
+            PolicySnapshot::Neural { temperature, .. } => temperature,
+            _ => unreachable!(),
+        };
+        policy
+            .evaluate_action(&observation, &context, false, 1.0)
+            .unwrap();
+        let after_deterministic = match policy.snapshot().unwrap() {
+            PolicySnapshot::Neural { temperature, .. } => temperature,
+            _ => unreachable!(),
+        };
+        assert_eq!(before, after_deterministic);
+        policy
+            .evaluate_action(&observation, &context, true, 1.0)
+            .unwrap();
+        let after_stochastic = match policy.snapshot().unwrap() {
+            PolicySnapshot::Neural { temperature, .. } => temperature,
+            _ => unreachable!(),
+        };
+        assert!((after_stochastic - before * 0.5).abs() < 1e-6);
+        policy
+            .evaluate_action(&observation, &context, false, 1.0)
+            .unwrap();
+        let after_bootstrap = match policy.snapshot().unwrap() {
+            PolicySnapshot::Neural { temperature, .. } => temperature,
+            _ => unreachable!(),
+        };
+        assert_eq!(after_stochastic, after_bootstrap);
     }
 
     #[test]

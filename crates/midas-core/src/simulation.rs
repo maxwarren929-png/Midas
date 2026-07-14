@@ -1,3 +1,4 @@
+pub use crate::PolicyFailureCategory;
 use crate::{
     AgentId, AssetId, MidasError, Result,
     action::{
@@ -31,10 +32,10 @@ use crate::{
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
-// Version 7 adds shape-complete optimizer state for full actor/critic head
-// training. Checkpoint 6 cannot be safely migrated because its momentum
-// vectors contain output biases only.
-pub const CHECKPOINT_VERSION: u32 = 7;
+// Version 8 adds masked chronological rollout entries and benchmark-aware
+// action-validation state. Checkpoint 7 cannot be safely migrated because
+// its transition eligibility and allocation-cap semantics are absent.
+pub const CHECKPOINT_VERSION: u32 = 8;
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum DatasetSplit {
     Training,
@@ -88,6 +89,13 @@ pub enum DomainEvent {
         entropy: f32,
         gradient_norm: f32,
     },
+    LearningTransitionMasked {
+        agent_id: AgentId,
+        date: NaiveDate,
+        actor_eligible: bool,
+        critic_eligible: bool,
+        penalty: f32,
+    },
     FitnessAssigned {
         agent_id: AgentId,
         genome_id: Option<crate::evolution::GenomeId>,
@@ -96,6 +104,11 @@ pub enum DomainEvent {
     ParentsSelected {
         child_agent_id: AgentId,
         parent_agent_ids: Vec<AgentId>,
+    },
+    DiversityConstraintRelaxed {
+        first_parent_agent_id: AgentId,
+        requested_minimum_distance: f64,
+        selected_distance: f64,
     },
     GenomeCrossed {
         child_agent_id: AgentId,
@@ -107,6 +120,8 @@ pub enum DomainEvent {
         bias_changes: u64,
         trait_changes: u64,
         reset_changes: u64,
+        weight_resets: u64,
+        bias_resets: u64,
     },
     EvolutionFallback {
         reason: String,
@@ -157,14 +172,6 @@ pub enum DomainEvent {
     TimelineCompleted {
         date: NaiveDate,
     },
-}
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub enum PolicyFailureCategory {
-    InvalidObservation,
-    InferenceFailure,
-    InvalidOutput,
-    NonFiniteState,
-    SchemaMismatch,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum OperationalEvent {
@@ -244,6 +251,8 @@ enum PolicyDecisionOutcome {
         incident: PolicyFailureIncident,
         fallback: crate::action::ValidatedAllocation,
         observation: Option<crate::observation::Observation>,
+        evaluation: Option<crate::brain::PolicyEvaluation>,
+        runtime_before: Option<crate::brain::NeuralRuntimeState>,
     },
     FatalAgentFailure {
         incident: PolicyFailureIncident,
@@ -338,6 +347,7 @@ impl SimulationEngine {
                 parent_ids: Vec::new(),
                 metadata: SpawnMetadata {
                     reason: "initial_population".into(),
+                    ..SpawnMetadata::default()
                 },
             };
             let mut agent = factory.spawn(
@@ -441,6 +451,17 @@ impl SimulationEngine {
             .find(|agent| agent.state.id == agent_id)
             .ok_or_else(|| MidasError::Policy(format!("agent {agent_id:?} is not present")))?;
         agent.policy.snapshot()
+    }
+    pub fn agent_learning_snapshot(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<crate::learning::LearningStrategyState> {
+        let agent = self
+            .agents
+            .iter()
+            .find(|agent| agent.state.id == agent_id)
+            .ok_or_else(|| MidasError::Policy(format!("agent {agent_id:?} is not present")))?;
+        agent.learning_snapshot()
     }
     pub fn observation_schema(&self) -> &ObservationSchema {
         &self.observation_schema
@@ -692,10 +713,19 @@ impl SimulationEngine {
                 .as_ref()
                 .map(|genome| genome.traits.maximum_allocation as f64)
                 .unwrap_or(self.config.brain.traits.maximum_allocation.initial as f64);
+            let policy_cap = match agent.policy.policy_blueprint() {
+                crate::brain::PolicyBlueprint::Neural | crate::brain::PolicyBlueprint::Random => {
+                    Some(maximum_asset_allocation)
+                }
+                crate::brain::PolicyBlueprint::Cash
+                | crate::brain::PolicyBlueprint::EqualWeight
+                | crate::brain::PolicyBlueprint::BuyAndHold { .. } => None,
+            };
             let action_context = ActionValidationContext {
                 asset_count: self.data.assets.len(),
                 tradable: &tradable,
-                maximum_asset_allocation,
+                policy_maximum_asset_allocation: policy_cap,
+                market_maximum_asset_allocation: None,
             };
             let outcome = self.decide_policy(
                 agent,
@@ -727,14 +757,19 @@ impl SimulationEngine {
                     let next_value = if death.is_none()
                         && self.config.learning.implementation == LearningKind::Ppo
                     {
-                        self.next_value_estimate(agent, t + 1, &next_prices, &next_tradable)?
+                        Some(self.next_value_estimate(
+                            agent,
+                            t + 1,
+                            &next_prices,
+                            &next_tradable,
+                        )?)
                     } else {
-                        0.0
+                        None
                     };
                     self.record_learning(
                         agent,
-                        observation,
-                        evaluation,
+                        Some(observation),
+                        Some(evaluation),
                         validated,
                         reward,
                         next_value,
@@ -742,6 +777,8 @@ impl SimulationEngine {
                         observation_date,
                         &tradable,
                         runtime_before,
+                        false,
+                        None,
                         &mut transaction.events,
                     )?;
                     if let Some(death) = death {
@@ -752,6 +789,8 @@ impl SimulationEngine {
                     incident,
                     fallback,
                     observation,
+                    evaluation,
+                    runtime_before,
                 } => {
                     let failure_event =
                         self.policy_failure_event(agent, observation_date, incident.clone());
@@ -760,7 +799,7 @@ impl SimulationEngine {
                         agent_id: agent.state.id,
                         date: observation_date,
                     });
-                    let (events, death, _reward) = self.advance_agent(
+                    let (events, death, reward) = self.advance_agent(
                         agent,
                         &fallback,
                         observation_date,
@@ -772,7 +811,34 @@ impl SimulationEngine {
                         true,
                     )?;
                     transaction.events.extend(events);
-                    let _ = observation;
+                    let next_value = if death.is_none()
+                        && evaluation.is_some()
+                        && self.config.learning.implementation == LearningKind::Ppo
+                    {
+                        Some(self.next_value_estimate(
+                            agent,
+                            t + 1,
+                            &next_prices,
+                            &next_tradable,
+                        )?)
+                    } else {
+                        None
+                    };
+                    self.record_learning(
+                        agent,
+                        observation,
+                        evaluation,
+                        fallback,
+                        reward,
+                        next_value,
+                        death.is_some(),
+                        observation_date,
+                        &tradable,
+                        runtime_before,
+                        true,
+                        Some(incident.category.clone()),
+                        &mut transaction.events,
+                    )?;
                     if let Some(death) = death {
                         deaths.push(death);
                     }
@@ -857,7 +923,15 @@ impl SimulationEngine {
                     category: PolicyFailureCategory::InvalidObservation,
                     message: error.to_string(),
                 };
-                return self.failure_outcome(agent, incident, action_context, None, None);
+                return self.failure_outcome(
+                    agent,
+                    incident,
+                    action_context,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
             }
         };
         let stochastic = matches!(
@@ -867,6 +941,10 @@ impl SimulationEngine {
             agent.policy.policy_blueprint(),
             crate::brain::PolicyBlueprint::Neural
         );
+        let evaluation_cap = action_context
+            .policy_maximum_asset_allocation
+            .or(action_context.market_maximum_asset_allocation)
+            .unwrap_or(1.0);
         let runtime_before = agent.policy.runtime_state();
         let evaluation = match agent.policy.evaluate_action(
             &observation,
@@ -875,7 +953,7 @@ impl SimulationEngine {
                 current_allocations: allocations,
             },
             stochastic,
-            action_context.maximum_asset_allocation,
+            evaluation_cap,
         ) {
             Ok(evaluation) => evaluation,
             Err(error) => {
@@ -883,7 +961,15 @@ impl SimulationEngine {
                     category: classify_policy_failure(&error),
                     message: error.to_string(),
                 };
-                return self.failure_outcome(agent, incident, action_context, None, None);
+                return self.failure_outcome(
+                    agent,
+                    incident,
+                    action_context,
+                    None,
+                    None,
+                    None,
+                    runtime_before,
+                );
             }
         };
         let validated = match self
@@ -902,6 +988,8 @@ impl SimulationEngine {
                     action_context,
                     None,
                     Some(observation),
+                    Some(evaluation),
+                    runtime_before,
                 );
             }
         };
@@ -919,6 +1007,8 @@ impl SimulationEngine {
                 action_context,
                 Some(validated),
                 Some(observation),
+                Some(evaluation),
+                runtime_before,
             )
         } else {
             agent.state.consecutive_policy_failures = 0;
@@ -931,6 +1021,7 @@ impl SimulationEngine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn failure_outcome(
         &self,
         agent: &mut Agent,
@@ -938,6 +1029,8 @@ impl SimulationEngine {
         action_context: &ActionValidationContext<'_>,
         fallback: Option<ValidatedAllocation>,
         observation: Option<crate::observation::Observation>,
+        evaluation: Option<crate::brain::PolicyEvaluation>,
+        runtime_before: Option<crate::brain::NeuralRuntimeState>,
     ) -> Result<PolicyDecisionOutcome> {
         agent.state.total_policy_failures = agent.state.total_policy_failures.saturating_add(1);
         agent.state.consecutive_policy_failures =
@@ -972,6 +1065,8 @@ impl SimulationEngine {
                     incident,
                     fallback,
                     observation,
+                    evaluation,
+                    runtime_before,
                 })
             }
         }
@@ -1148,42 +1243,69 @@ impl SimulationEngine {
     fn record_learning(
         &self,
         agent: &mut Agent,
-        observation: crate::observation::Observation,
-        evaluation: crate::brain::PolicyEvaluation,
+        observation: Option<crate::observation::Observation>,
+        evaluation: Option<crate::brain::PolicyEvaluation>,
         action: ValidatedAllocation,
         reward: f32,
-        next_value: f32,
+        next_value: Option<f32>,
         done: bool,
         date: NaiveDate,
         tradable: &[bool],
         runtime_before: Option<crate::brain::NeuralRuntimeState>,
+        invalid_action: bool,
+        failure_category: Option<PolicyFailureCategory>,
         events: &mut Vec<DomainEvent>,
     ) -> Result<()> {
-        let before = runtime_before.unwrap_or(crate::brain::NeuralRuntimeState {
-            memory: Vec::new(),
-            inference_steps: 0,
-        });
-        let after = agent
-            .policy
-            .runtime_state()
-            .unwrap_or_else(|| before.clone());
+        let after = agent.policy.runtime_state();
+        let action_sample = evaluation
+            .as_ref()
+            .and_then(|evaluation| evaluation.action_sample.clone());
+        let log_probability = evaluation
+            .as_ref()
+            .and_then(|evaluation| evaluation.log_probability);
+        let temperature = evaluation.as_ref().map(|evaluation| evaluation.temperature);
+        let value_estimate = evaluation
+            .as_ref()
+            .map(|evaluation| evaluation.value_estimate)
+            .filter(|value| value.is_finite());
+        let actor_eligible = !invalid_action
+            && observation.is_some()
+            && runtime_before.is_some()
+            && action_sample.is_some()
+            && log_probability.is_some()
+            && temperature.is_some();
+        let critic_eligible =
+            observation.is_some() && runtime_before.is_some() && value_estimate.is_some();
         let transition = Transition {
             observation,
             action,
-            action_sample: evaluation.action_sample.clone(),
-            raw_policy_output: evaluation.raw_logits,
-            log_probability: evaluation.log_probability.unwrap_or(0.0),
-            temperature: evaluation.temperature,
-            value_estimate: evaluation.value_estimate,
+            action_sample,
+            raw_policy_output: evaluation.map(|evaluation| evaluation.raw_logits),
+            log_probability,
+            temperature,
+            value_estimate,
             reward,
             next_value,
             done,
             truncated: false,
-            recurrent_state_before: before,
+            recurrent_state_before: runtime_before,
             recurrent_state_after: after,
             date,
             tradable: tradable.to_vec(),
+            invalid_action,
+            failure_category,
+            actor_eligible,
+            critic_eligible,
         };
+        if invalid_action {
+            events.push(DomainEvent::LearningTransitionMasked {
+                agent_id: agent.state.id,
+                date,
+                actor_eligible,
+                critic_eligible,
+                penalty: self.config.reward.invalid_action_penalty,
+            });
+        }
         let update = agent.learning.observe_transition(transition)?;
         self.apply_learning_update(agent, update, date, events)?;
         if done {
@@ -1342,7 +1464,11 @@ impl SimulationEngine {
                 };
                 let mutation_report = replacement.mutation_report();
                 let parent_ids = request.parent_ids.clone();
+                let first_parent_id = parent_ids.first().copied().unwrap_or(AgentId(0));
                 let request_reason = request.metadata.reason.clone();
+                let diversity_relaxed = request.metadata.diversity_constraint_relaxed;
+                let requested_mating_distance = request.metadata.requested_mating_distance;
+                let selected_mating_distance = request.metadata.selected_mating_distance;
                 let child_genome = request.genome.clone();
                 transaction.replacement = Some(replacement);
                 let mut agent = self.factory.spawn(
@@ -1408,6 +1534,23 @@ impl SimulationEngine {
                             child_agent_id: new_id,
                             parent_agent_ids: parent_ids,
                         });
+                        if diversity_relaxed {
+                            transaction
+                                .evolution
+                                .metrics
+                                .diversity_constraint_relaxations = transaction
+                                .evolution
+                                .metrics
+                                .diversity_constraint_relaxations
+                                .saturating_add(1);
+                            transaction
+                                .events
+                                .push(DomainEvent::DiversityConstraintRelaxed {
+                                    first_parent_agent_id: first_parent_id,
+                                    requested_minimum_distance: requested_mating_distance,
+                                    selected_distance: selected_mating_distance,
+                                });
+                        }
                     }
                     if request_reason.starts_with("evolution_two_parent:") {
                         transaction.evolution.metrics.crossover_count = transaction
@@ -1431,6 +1574,8 @@ impl SimulationEngine {
                             bias_changes: report.bias_changes,
                             trait_changes: report.trait_changes,
                             reset_changes: report.reset_changes,
+                            weight_resets: report.weight_resets,
+                            bias_resets: report.bias_resets,
                         });
                     } else if request_reason.contains("fallback") {
                         transaction.evolution.metrics.random_fallback_births = transaction
@@ -1559,7 +1704,7 @@ impl SimulationEngine {
         let bytes = fs::read(path)?;
         let cp: Checkpoint = bincode::deserialize(&bytes).map_err(|_| {
             MidasError::Checkpoint(format!(
-                "incompatible checkpoint; expected format version {CHECKPOINT_VERSION}; older files such as format 6 may contain bias-only optimizer state"
+                "incompatible checkpoint; expected format version {CHECKPOINT_VERSION}; older files omit masked rollout eligibility and benchmark allocation semantics"
             ))
         })?;
         if cp.version != CHECKPOINT_VERSION {

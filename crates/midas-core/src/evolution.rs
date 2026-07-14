@@ -81,6 +81,7 @@ pub struct EvolutionMetrics {
     pub crossover_count: u64,
     pub mutation_count: u64,
     pub rejected_parent_pairs: u64,
+    pub diversity_constraint_relaxations: u64,
     pub fitness_values: Vec<f64>,
     pub mean_fitness: f64,
     pub maximum_fitness: f64,
@@ -105,6 +106,7 @@ impl Default for EvolutionMetrics {
             crossover_count: 0,
             mutation_count: 0,
             rejected_parent_pairs: 0,
+            diversity_constraint_relaxations: 0,
             fitness_values: Vec::new(),
             mean_fitness: 0.0,
             maximum_fitness: 0.0,
@@ -326,6 +328,19 @@ pub struct SelectionPopulation {
 pub struct SelectedParents {
     pub first: ParentCandidate,
     pub second: ParentCandidate,
+    pub distance_relaxed: bool,
+    pub selected_distance: f64,
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PairConstraints {
+    pub minimum_distance: f64,
+}
+impl Default for PairConstraints {
+    fn default() -> Self {
+        Self {
+            minimum_distance: 0.0,
+        }
+    }
 }
 pub trait ParentSelector: Send {
     fn select_parents(
@@ -333,6 +348,19 @@ pub trait ParentSelector: Send {
         population: &SelectionPopulation,
         rng: &mut EvolutionRng,
     ) -> Result<SelectedParents>;
+    fn select_parents_with_constraints(
+        &mut self,
+        population: &SelectionPopulation,
+        constraints: &PairConstraints,
+        rng: &mut EvolutionRng,
+    ) -> Result<SelectedParents> {
+        if constraints.minimum_distance > 0.0 {
+            return Err(MidasError::Policy(
+                "parent selector does not support mating-distance constraints".into(),
+            ));
+        }
+        self.select_parents(population, rng)
+    }
     fn name(&self) -> &'static str;
     fn fork(&self) -> Box<dyn ParentSelector>;
 }
@@ -346,9 +374,18 @@ impl ParentSelector for TournamentSelection {
         population: &SelectionPopulation,
         rng: &mut EvolutionRng,
     ) -> Result<SelectedParents> {
+        self.select_parents_with_constraints(population, &PairConstraints::default(), rng)
+    }
+    fn select_parents_with_constraints(
+        &mut self,
+        population: &SelectionPopulation,
+        constraints: &PairConstraints,
+        rng: &mut EvolutionRng,
+    ) -> Result<SelectedParents> {
         eligible_pair(
             population,
             &self.config,
+            constraints.minimum_distance,
             |pool, rng| {
                 let size = self.config.tournament_size.min(pool.len()).max(1);
                 let mut best = rng.choose_index(pool.len())?;
@@ -380,9 +417,18 @@ impl ParentSelector for RankWeightedSelection {
         population: &SelectionPopulation,
         rng: &mut EvolutionRng,
     ) -> Result<SelectedParents> {
+        self.select_parents_with_constraints(population, &PairConstraints::default(), rng)
+    }
+    fn select_parents_with_constraints(
+        &mut self,
+        population: &SelectionPopulation,
+        constraints: &PairConstraints,
+        rng: &mut EvolutionRng,
+    ) -> Result<SelectedParents> {
         eligible_pair(
             population,
             &self.config,
+            constraints.minimum_distance,
             |pool, rng| {
                 let mut order = (0..pool.len()).collect::<Vec<_>>();
                 order.sort_by(|a, b| pool[*b].fitness.0.total_cmp(&pool[*a].fitness.0));
@@ -410,12 +456,18 @@ impl ParentSelector for RankWeightedSelection {
 fn eligible_pair<F>(
     population: &SelectionPopulation,
     config: &EvolutionSelectionConfig,
+    minimum_distance: f64,
     pick: F,
     rng: &mut EvolutionRng,
 ) -> Result<SelectedParents>
 where
     F: Fn(&[ParentCandidate], &mut EvolutionRng) -> Result<usize>,
 {
+    if !minimum_distance.is_finite() || minimum_distance < 0.0 {
+        return Err(MidasError::Config(
+            "minimum mating distance must be finite and non-negative".into(),
+        ));
+    }
     let pool = population
         .candidates
         .iter()
@@ -433,25 +485,41 @@ where
         return Err(MidasError::Policy("no eligible parents".into()));
     }
     let first_index = pick(&pool, rng)?;
-    let second_index = if config.allow_self_parenting {
-        pick(&pool, rng)?
-    } else {
-        let reduced = pool
+    let first = pool[first_index].clone();
+    let mut second_pool = Vec::new();
+    for (index, candidate) in pool.iter().enumerate() {
+        if !config.allow_self_parenting && index == first_index {
+            continue;
+        }
+        let distance = genome_distance(&first.genome, &candidate.genome, 1.0, 1.0)?;
+        if distance + 1e-12 >= minimum_distance {
+            second_pool.push(candidate.clone());
+        }
+    }
+    let mut distance_relaxed = false;
+    if second_pool.is_empty() {
+        let fallback_pool = pool
             .iter()
             .enumerate()
-            .filter(|(index, _)| *index != first_index)
-            .map(|(_, c)| c.clone())
+            .filter(|(index, _)| config.allow_self_parenting || *index != first_index)
+            .map(|(_, candidate)| candidate.clone())
             .collect::<Vec<_>>();
-        let index = pick(&reduced, rng)?;
-        // The reduced vector owns the same candidate values; use it directly.
-        return Ok(SelectedParents {
-            first: pool[first_index].clone(),
-            second: reduced[index].clone(),
-        });
-    };
+        if fallback_pool.is_empty() {
+            return Err(MidasError::Policy(
+                "no eligible second parent after self-parenting constraints".into(),
+            ));
+        }
+        second_pool = fallback_pool;
+        distance_relaxed = minimum_distance > 0.0;
+    }
+    let second_index = pick(&second_pool, rng)?;
+    let second = second_pool[second_index].clone();
+    let selected_distance = genome_distance(&first.genome, &second.genome, 1.0, 1.0)?;
     Ok(SelectedParents {
-        first: pool[first_index].clone(),
-        second: pool[second_index].clone(),
+        first,
+        second,
+        distance_relaxed,
+        selected_distance,
     })
 }
 
@@ -549,6 +617,8 @@ pub struct MutationReport {
     pub bias_changes: u64,
     pub trait_changes: u64,
     pub reset_changes: u64,
+    pub weight_resets: u64,
+    pub bias_resets: u64,
 }
 #[derive(Clone, Debug)]
 pub struct MutationContext<'a> {
@@ -575,14 +645,12 @@ impl GenomeMutator for DefaultGenomeMutator {
     ) -> Result<MutationReport> {
         let mut report = MutationReport::default();
         for layer in all_layers_mut(genome) {
-            if self.config.reset_probability > 0.0
-                && rng.0.gen_bool(self.config.reset_probability as f64)
-            {
-                report.reset_changes +=
-                    layer.bias.iter().filter(|value| **value != 0.0).count() as u64;
-                layer.bias.fill(0.0);
-            }
             for value in &mut layer.weights {
+                if rng.0.gen_bool(self.config.reset_probability as f64) {
+                    report.reset_changes += 1;
+                    *value = 0.0;
+                    report.weight_resets += 1;
+                }
                 if rng.0.gen_bool(self.config.weight_probability as f64) {
                     let before = *value;
                     *value += normal(rng) * self.config.weight_sigma;
@@ -592,6 +660,11 @@ impl GenomeMutator for DefaultGenomeMutator {
                 }
             }
             for value in &mut layer.bias {
+                if rng.0.gen_bool(self.config.reset_probability as f64) {
+                    report.reset_changes += 1;
+                    *value = 0.0;
+                    report.bias_resets += 1;
+                }
                 if rng.0.gen_bool(self.config.bias_probability as f64) {
                     let before = *value;
                     *value += normal(rng) * self.config.bias_sigma;
@@ -883,6 +956,49 @@ mod tests {
     }
 
     #[test]
+    fn mating_distance_relaxes_deterministically_when_no_pair_qualifies() {
+        let genome =
+            BrainGenome::random(&architecture(), &EvolvableTraitsConfig::default(), 44).unwrap();
+        let population = SelectionPopulation {
+            candidates: vec![
+                ParentCandidate {
+                    agent_id: AgentId(1),
+                    genome_id: None,
+                    genome: genome.clone(),
+                    fitness: FitnessScore(10.0),
+                    age: 5,
+                    net_worth: 10.0,
+                },
+                ParentCandidate {
+                    agent_id: AgentId(2),
+                    genome_id: None,
+                    genome,
+                    fitness: FitnessScore(1.0),
+                    age: 5,
+                    net_worth: 10.0,
+                },
+            ],
+        };
+        let mut selector = TournamentSelection {
+            config: EvolutionSelectionConfig {
+                tournament_size: 2,
+                ..EvolutionSelectionConfig::default()
+            },
+        };
+        let result = selector
+            .select_parents_with_constraints(
+                &population,
+                &PairConstraints {
+                    minimum_distance: 0.1,
+                },
+                &mut EvolutionRng::seed(2),
+            )
+            .unwrap();
+        assert!(result.distance_relaxed);
+        assert_eq!(result.selected_distance, 0.0);
+    }
+
+    #[test]
     fn seeded_mutation_repeats_exactly() {
         let base =
             BrainGenome::random(&architecture(), &EvolvableTraitsConfig::default(), 3).unwrap();
@@ -915,6 +1031,43 @@ mod tests {
             )
             .unwrap();
         assert_eq!(left, right);
+    }
+
+    #[test]
+    fn reset_mutation_covers_weights_and_biases() {
+        let mut child =
+            BrainGenome::random(&architecture(), &EvolvableTraitsConfig::default(), 17).unwrap();
+        let mutator = DefaultGenomeMutator {
+            config: EvolutionMutationConfig {
+                weight_probability: 0.0,
+                bias_probability: 0.0,
+                reset_probability: 1.0,
+                trait_probability: 0.0,
+                ..EvolutionMutationConfig::default()
+            },
+        };
+        let mut rng = EvolutionRng::seed(8);
+        let report = mutator
+            .mutate(
+                &mut child,
+                &MutationContext {
+                    traits: &EvolvableTraitsConfig::default(),
+                },
+                &mut rng,
+            )
+            .unwrap();
+        assert!(report.weight_resets > 0);
+        assert!(report.bias_resets > 0);
+        assert_eq!(
+            report.reset_changes,
+            report.weight_resets + report.bias_resets
+        );
+        assert!(
+            all_layers(&child)
+                .iter()
+                .flat_map(|layer| layer.weights.iter().chain(&layer.bias))
+                .all(|value| *value == 0.0)
+        );
     }
 
     #[test]

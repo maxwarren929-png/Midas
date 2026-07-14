@@ -70,7 +70,8 @@ fn validator(
             &ActionValidationContext {
                 asset_count: tradable.len(),
                 tradable,
-                maximum_asset_allocation: max,
+                policy_maximum_asset_allocation: Some(max),
+                market_maximum_asset_allocation: None,
             },
         )
         .unwrap()
@@ -425,7 +426,8 @@ fn random_and_malicious_proposals_cannot_bypass_concentration() {
                 &ActionValidationContext {
                     asset_count: 3,
                     tradable: &[true, true, true],
-                    maximum_asset_allocation: 0.25,
+                    policy_maximum_asset_allocation: Some(0.25),
+                    market_maximum_asset_allocation: None,
                 },
             )
             .unwrap();
@@ -742,6 +744,7 @@ impl ReplacementStrategy for SelectSpecificLiving {
             parent_ids: vec![living.id],
             metadata: SpawnMetadata {
                 reason: "test_deterministic_selection".into(),
+                ..SpawnMetadata::default()
             },
         })
     }
@@ -965,7 +968,7 @@ fn checkpoint_v6_is_rejected_as_bias_only_optimizer_layout() {
     let file = tempfile::NamedTempFile::new().unwrap();
     engine.save_checkpoint(file.path()).unwrap();
     let mut bytes = fs::read(file.path()).unwrap();
-    assert_eq!(bytes.first().copied(), Some(7));
+    assert_eq!(bytes.first().copied(), Some(8));
     bytes[0] = 6;
     fs::write(file.path(), bytes).unwrap();
     let error = match SimulationEngine::resume(c, data, file.path()) {
@@ -1373,6 +1376,51 @@ fn recoverable_policy_failure_has_one_fallback_and_advances_normally() {
     let state = engine.agents().next().unwrap();
     assert_eq!(state.total_policy_failures, 1);
     assert_eq!(state.consecutive_policy_failures, 1);
+}
+
+#[test]
+fn recoverable_invalid_output_creates_penalized_chronological_rollout_entry() {
+    let mut c = config();
+    c.learning.implementation = LearningKind::Ppo;
+    c.learning.rollout_length = 4;
+    c.learning.minibatch_size = 2;
+    c.learning.sequence_length = 2;
+    c.policy_failures.maximum_consecutive = 3;
+    c.policy_failures.maximum_total = 20;
+    c.policy_failures.behavior = PolicyFailureBehavior::Continue;
+    let mut engine = sequenced_engine(
+        c,
+        Vec::new(),
+        SequencedFactory {
+            fail_calls: vec![],
+            invalid_calls: vec![1],
+        },
+    );
+    let agent_id = engine.agents().next().unwrap().id;
+    engine.run_steps(1).unwrap();
+    let midas_core::learning::LearningStrategyState::Ppo { rollout, .. } =
+        engine.agent_learning_snapshot(agent_id).unwrap()
+    else {
+        panic!("expected PPO learning state")
+    };
+    assert_eq!(rollout.len(), 1);
+    let transition = &rollout.transitions()[0];
+    assert!(transition.reward < 0.0);
+    assert!(transition.invalid_action);
+    assert_eq!(transition.action_sample, None);
+    assert!(matches!(
+        transition.failure_category.clone(),
+        Some(midas_core::PolicyFailureCategory::InvalidOutput)
+            | Some(midas_core::PolicyFailureCategory::InferenceFailure)
+            | Some(midas_core::PolicyFailureCategory::NonFiniteState)
+    ));
+    assert!(!transition.actor_eligible);
+    assert!(!transition.critic_eligible);
+    assert!(transition.observation.is_none());
+    assert_eq!(engine.metrics.masked_failure_transitions, 1);
+    assert_eq!(engine.metrics.actor_ineligible_transitions, 1);
+    assert_eq!(engine.metrics.critic_ineligible_transitions, 1);
+    assert!(engine.metrics.invalid_action_penalty_total > 0.0);
 }
 
 #[test]
@@ -1900,6 +1948,57 @@ fn independent_agents_and_buy_hold_behavior_are_preserved() {
     let report = engine.run().unwrap();
     assert!(report.agents[0].1.trades > 0);
     assert!(report.agents[0].1.ending_net_worth > 10_000.0);
+}
+
+#[test]
+fn buy_and_hold_is_fully_invested_even_when_neural_cap_is_half() {
+    let mut c = config();
+    c.brain.policy = PolicyKind::BuyAndHold;
+    c.brain.traits.maximum_allocation.initial = 0.5;
+    c.simulation.population_size = 1;
+    let data = loaded(&c);
+    let valuation_date = data.dates[1];
+    let prices = (0..data.assets.len())
+        .map(|asset| {
+            data.bar(valuation_date, AssetId(asset as u64))
+                .map(|bar| bar.close)
+        })
+        .collect::<Vec<_>>();
+    let mut engine = SimulationEngine::new(c, data, DatasetSplit::Training).unwrap();
+    engine.run_steps(1).unwrap();
+    let state = engine.agents().next().unwrap();
+    let allocations = state.portfolio.allocations(&prices).unwrap();
+    assert!(
+        allocations[1] > 0.9,
+        "buy-and-hold should target full initial exposure, got {allocations:?}"
+    );
+}
+
+#[test]
+fn equal_weight_benchmark_ignores_neural_concentration_cap() {
+    let mut c = config();
+    c.brain.policy = PolicyKind::EqualWeight;
+    c.brain.traits.maximum_allocation.initial = 0.25;
+    c.simulation.population_size = 1;
+    let data = loaded(&c);
+    let valuation_date = data.dates[1];
+    let prices = (0..data.assets.len())
+        .map(|asset| {
+            data.bar(valuation_date, AssetId(asset as u64))
+                .map(|bar| bar.close)
+        })
+        .collect::<Vec<_>>();
+    let mut engine = SimulationEngine::new(c, data, DatasetSplit::Training).unwrap();
+    engine.run_steps(1).unwrap();
+    let allocations = engine
+        .agents()
+        .next()
+        .unwrap()
+        .portfolio
+        .allocations(&prices)
+        .unwrap();
+    assert!(allocations[1..].iter().all(|weight| *weight > 0.30));
+    assert!(allocations[0] < 0.1);
 }
 
 #[test]

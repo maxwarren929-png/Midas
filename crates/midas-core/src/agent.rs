@@ -54,9 +54,15 @@ impl Agent {
         Ok(())
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct SpawnMetadata {
     pub reason: String,
+    #[serde(default)]
+    pub diversity_constraint_relaxed: bool,
+    #[serde(default)]
+    pub requested_mating_distance: f64,
+    #[serde(default)]
+    pub selected_mating_distance: f64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentSpawnRequest {
