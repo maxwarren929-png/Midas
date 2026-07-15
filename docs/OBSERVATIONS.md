@@ -2,6 +2,18 @@
 
 Midas observations are compiled from named read-only sensors. A provider is not a feature pipeline, policy, reward, execution model, or checkpoint participant. It receives an immutable `ObservationContext` at close `t` and publishes finite raw values by name. The registry owns registration, duplicate detection, metadata, and deterministic provider execution; the schema owns every neural-input index.
 
+## Module layout
+
+`crates/midas-core/src/observation.rs` is a compatibility facade: public
+imports remain available through `midas_core::observation::*`. Implementation
+is split into `normalization.rs` (rules and conversion), `schema.rs` (source
+types, configuration compilation, validation, and identity), `contracts.rs`
+(provider contracts and runtime values), `registry.rs` (generic registration),
+and `builder.rs` (scratch-backed vector compilation). Built-in wiring and the
+market, portfolio, agent-state, and rolling providers live under
+`observation/providers/`. Moving these modules did not change Prompt 5/6
+observation names, entry order, schema identities, or checkpoint format.
+
 ## Built-in providers
 
 The default schema registers three providers:

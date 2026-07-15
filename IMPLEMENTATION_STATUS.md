@@ -1,5 +1,18 @@
 # Implementation Status
 
+## Prompt 6.5: conservative observation facade split
+
+The former 2,777-line observation module is now a small
+`midas_core::observation` compatibility facade over focused private modules for
+normalisation, schema compilation/identity, provider contracts, registry,
+builder, and built-in providers. Concrete provider construction moved out of
+the generic registry into the private provider factory. Public observation
+imports, serialized schemas, observation names/order, schema hashes, rolling
+formulas, zero-fill behavior, and checkpoint format 12 are unchanged. Baseline
+and post-refactor CLI validation matched all six default/Prompt 6 schema
+dimensions and hashes. No simulation, PPO, reward, evolution, execution, or
+market-generation behavior changed.
+
 ## Prompt 6: first modular market senses
 
 Prompt 6 adds an opt-in `rolling_market_stats` observation provider without changing PPO, rewards, evolution, execution, the incremental-trade policy, or the Prompt 5 default schema. The provider precomputes immutable, point-in-time raw-close statistics by decision date and publishes named raw scalars through the existing registry/schema boundary.
