@@ -1,5 +1,20 @@
 # Implementation Status
 
+## Prompt 7B.2: private simulation checkpoint module
+
+The staged `midas_core::simulation` split now keeps its checkpoint envelope,
+agent snapshots, state-to-checkpoint construction, bincode file I/O, and
+compatibility validation in the private `simulation/checkpoint.rs` module.
+The public `SimulationEngine` checkpoint, resume, and frozen-evaluation methods
+remain unchanged on the simulation facade, and checkpoint creation timing and
+simulation orchestration remain in `simulation.rs`.
+
+- Checkpoint format remains 12. Serialized struct field order, derives,
+  validation order, compatibility checks, and error text are preserved.
+- Existing `midas_core::simulation::*` imports remain compatible. No simulation
+  ordering, transaction, learning, replacement, evolution, report, or frozen
+  evaluation behavior changed.
+
 ## Prompt 7B.1: simulation types, events, and diagnostics split
 
 The staged `midas_core::simulation` facade split has begun without moving the

@@ -1,5 +1,6 @@
 pub use crate::PolicyFailureCategory;
 
+mod checkpoint;
 mod diagnostics;
 mod events;
 mod types;
@@ -42,32 +43,8 @@ use crate::{
     reward::{RewardBreakdown, RewardContext, RewardFunction, configured_reward},
 };
 use chrono::NaiveDate;
-use serde::{Deserialize, Serialize};
-use std::{fs, path::Path};
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct AgentCheckpoint {
-    state: crate::agent::AgentState,
-    policy: PolicySnapshot,
-    learning: crate::learning::LearningStrategyState,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct Checkpoint {
-    version: u32,
-    config_hash: String,
-    dataset_identity: String,
-    observation_schema_hash: String,
-    architecture: BrainArchitecture,
-    split: DatasetSplit,
-    next_step: usize,
-    next_agent_id: u64,
-    lifecycle: SimulationLifecycle,
-    agents: Vec<AgentCheckpoint>,
-    metrics: MetricsCollector,
-    domain_events: Vec<DomainEvent>,
-    accessed_through: Option<NaiveDate>,
-    backend_identity: String,
-    evolution: EvolutionState,
-}
+use serde::Serialize;
+use std::path::Path;
 
 pub struct SimulationEngine {
     config: Config,
@@ -577,7 +554,14 @@ impl SimulationEngine {
             candidate_metrics.record_neural_allocations(&transaction.allocation_stats);
             let mut candidate_events = self.domain_events.clone();
             candidate_events.extend(transaction.events.clone());
-            let checkpoint = self.checkpoint_from_state(
+            let checkpoint = checkpoint::from_state(
+                &self.config,
+                &self.data,
+                &self.observation_schema,
+                &self.architecture,
+                self.split,
+                &self.features,
+                &self.compute_device,
                 self.next_step + 1,
                 transaction.next_agent_id,
                 &transaction.agents,
@@ -586,7 +570,7 @@ impl SimulationEngine {
                 transaction.evolution.clone(),
                 self.lifecycle.clone(),
             )?;
-            self.write_checkpoint_file(&checkpoint_path, &checkpoint)?;
+            checkpoint::write(&checkpoint_path, &checkpoint)?;
         }
         let StepTransaction {
             agents,
@@ -1915,55 +1899,15 @@ impl SimulationEngine {
         self.domain_events.push(event)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn checkpoint_from_state(
-        &self,
-        next_step: usize,
-        next_agent_id: u64,
-        agents: &[Agent],
-        metrics: MetricsCollector,
-        domain_events: Vec<DomainEvent>,
-        evolution: EvolutionState,
-        lifecycle: SimulationLifecycle,
-    ) -> Result<Checkpoint> {
-        Ok(Checkpoint {
-            version: CHECKPOINT_VERSION,
-            config_hash: self.config.hash()?,
-            dataset_identity: self.data.identity.clone(),
-            observation_schema_hash: self.observation_schema.identity(self.data.assets.len())?,
-            architecture: self.architecture.clone(),
-            split: self.split,
-            next_step,
-            next_agent_id,
-            lifecycle,
-            agents: agents
-                .iter()
-                .map(|agent| {
-                    Ok(AgentCheckpoint {
-                        state: agent.state.clone(),
-                        policy: agent.policy.snapshot()?,
-                        learning: agent.learning_snapshot()?,
-                    })
-                })
-                .collect::<Result<_>>()?,
-            metrics,
-            domain_events,
-            accessed_through: self.features.get(next_step).map(|f| f.date),
-            backend_identity: self.compute_device.identity(),
-            evolution,
-        })
-    }
-
-    fn write_checkpoint_file(&self, path: impl AsRef<Path>, checkpoint: &Checkpoint) -> Result<()> {
-        if let Some(parent) = path.as_ref().parent() {
-            fs::create_dir_all(parent)?
-        }
-        fs::write(path.as_ref(), bincode::serialize(checkpoint)?)?;
-        Ok(())
-    }
-
     pub fn save_checkpoint(&mut self, path: impl AsRef<Path>) -> Result<()> {
-        let checkpoint = self.checkpoint_from_state(
+        let checkpoint = checkpoint::from_state(
+            &self.config,
+            &self.data,
+            &self.observation_schema,
+            &self.architecture,
+            self.split,
+            &self.features,
+            &self.compute_device,
             self.next_step,
             self.next_agent_id,
             &self.agents,
@@ -1972,7 +1916,7 @@ impl SimulationEngine {
             self.evolution.clone(),
             self.lifecycle.clone(),
         )?;
-        self.write_checkpoint_file(path.as_ref(), &checkpoint)?;
+        checkpoint::write(path.as_ref(), &checkpoint)?;
         let date = self
             .features
             .get(self.next_step)
@@ -1999,62 +1943,26 @@ impl SimulationEngine {
         path: impl AsRef<Path>,
         factory: Box<dyn AgentFactory>,
     ) -> Result<Self> {
-        let bytes = fs::read(path)?;
-        let cp: Checkpoint = bincode::deserialize(&bytes).map_err(|error| {
-            MidasError::Checkpoint(format!(
-                "incompatible checkpoint; expected format version {CHECKPOINT_VERSION}; older files use an incompatible neural action-sample layout: {error}"
-            ))
-        })?;
-        if cp.version != CHECKPOINT_VERSION {
-            let detail = if cp.version == 11 {
-                "; checkpoint 11 predates the modular observation registry and cannot be migrated safely"
-            } else if cp.version == 6 {
-                "; checkpoint 6 contains bias-only optimizer state and cannot be migrated safely"
-            } else if cp.version == 8 {
-                "; checkpoint 8 contains single-asset categorical action samples and cannot be migrated safely"
-            } else {
-                ""
-            };
-            return Err(MidasError::Checkpoint(format!(
-                "checkpoint version {} is incompatible with {CHECKPOINT_VERSION}{detail}",
-                cp.version,
-            )));
-        }
-        if cp.dataset_identity != data.identity {
-            return Err(MidasError::Checkpoint("dataset identity mismatch".into()));
-        }
+        let cp = checkpoint::load_for_resume(path)?;
+        checkpoint::validate_dataset(&cp, &data.identity)?;
         data.rebuild_index();
         let pipeline = BackwardFeaturePipeline::from_config(&config);
         let dates = data.split_dates(cp.split.range(&config));
         let features = pipeline.generate(&data, &dates)?;
         let observation_schema = ObservationSchema::from_config(&config);
         let schema_hash = observation_schema.identity(data.assets.len())?;
-        if cp.observation_schema_hash != schema_hash {
-            return Err(MidasError::Checkpoint("observation schema mismatch".into()));
-        }
+        checkpoint::validate_schema(&cp, &schema_hash)?;
         let compute_device = config.backend.compute_device()?;
-        if cp.backend_identity != compute_device.identity() {
-            return Err(MidasError::Checkpoint(
-                "checkpoint backend is incompatible".into(),
-            ));
-        }
-        if cp.config_hash != config.hash()? {
-            return Err(MidasError::Checkpoint("configuration mismatch".into()));
-        }
+        checkpoint::validate_backend(&cp, &compute_device.identity())?;
+        checkpoint::validate_resume_config(&cp, &config.hash()?)?;
         let architecture = BrainArchitecture::from_config(
             &config.brain,
             schema_hash,
             observation_schema.dimension(data.assets.len()),
             data.assets.len(),
         );
-        if cp.architecture != architecture {
-            return Err(MidasError::Checkpoint("brain architecture mismatch".into()));
-        }
-        if features.len() < 2 {
-            return Err(MidasError::Checkpoint(
-                "checkpoint split needs at least two trading dates".into(),
-            ));
-        }
+        checkpoint::validate_architecture(&cp, &architecture)?;
+        checkpoint::validate_feature_count(features.len())?;
         let observation_builder = SchemaObservationBuilder::from_config(
             observation_schema.clone(),
             &config,
@@ -2129,26 +2037,9 @@ impl SimulationEngine {
         path: impl AsRef<Path>,
         split: DatasetSplit,
     ) -> Result<Self> {
-        let bytes = fs::read(path)?;
-        let cp: Checkpoint = bincode::deserialize(&bytes).map_err(|error| {
-            MidasError::Checkpoint(format!(
-                "incompatible checkpoint; expected format version {CHECKPOINT_VERSION}; older files use an incompatible neural action-sample or metrics layout: {error}"
-            ))
-        })?;
-        if cp.version != CHECKPOINT_VERSION {
-            return Err(MidasError::Checkpoint(format!(
-                "checkpoint version {} is incompatible with {CHECKPOINT_VERSION}; observation-registry and neural action distribution layouts are not migrated",
-                cp.version
-            )));
-        }
-        if cp.dataset_identity != data.identity {
-            return Err(MidasError::Checkpoint("dataset identity mismatch".into()));
-        }
-        if cp.config_hash != config.hash()? {
-            return Err(MidasError::Checkpoint(
-                "evaluation configuration mismatch".into(),
-            ));
-        }
+        let cp = checkpoint::load_for_evaluation(path)?;
+        checkpoint::validate_dataset(&cp, &data.identity)?;
+        checkpoint::validate_evaluation_config(&cp, &config.hash()?)?;
 
         let mut evaluation_config = config;
         evaluation_config.learning.implementation = LearningKind::NoLearning;
@@ -2162,17 +2053,9 @@ impl SimulationEngine {
         let schema_hash = engine
             .observation_schema
             .identity(engine.data.assets.len())?;
-        if cp.observation_schema_hash != schema_hash {
-            return Err(MidasError::Checkpoint("observation schema mismatch".into()));
-        }
-        if cp.architecture != engine.architecture {
-            return Err(MidasError::Checkpoint("brain architecture mismatch".into()));
-        }
-        if cp.backend_identity != engine.compute_device.identity() {
-            return Err(MidasError::Checkpoint(
-                "checkpoint backend is incompatible".into(),
-            ));
-        }
+        checkpoint::validate_schema(&cp, &schema_hash)?;
+        checkpoint::validate_architecture(&cp, &engine.architecture)?;
+        checkpoint::validate_backend(&cp, &engine.compute_device.identity())?;
         let birth_date = engine.features[0].date;
         let factory = std::mem::replace(
             &mut engine.factory,

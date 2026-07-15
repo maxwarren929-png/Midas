@@ -76,10 +76,16 @@ Prompt 7B.1 moved only low-risk public contracts behind that facade:
 `SimulationLifecycle`, and `DeathCause`; `simulation/events.rs` contains
 `DomainEvent` and `OperationalEvent`; and `simulation/diagnostics.rs` contains
 `DecisionTrace`, `PpoUpdateTrace`, and `ReportTrace`. Continue importing these
-items through `midas_core::simulation::*`. The engine, transaction, checkpoint,
-learning, replacement, evaluation, and reporting implementations remain in the
-facade during this initial stage. Do not reorder serialized fields or enum
-variants while extending these contracts: checkpoint format remains 12.
+items through `midas_core::simulation::*`.
+
+Prompt 7B.2 moved the private checkpoint envelope, agent snapshots,
+serialization, deserialization, and compatibility checks into
+`simulation/checkpoint.rs`. Public checkpoint, resume, and frozen-evaluation
+methods remain on `SimulationEngine`; checkpoint candidate timing and engine
+orchestration remain in the facade. The checkpoint module is an implementation
+detail and must not become a downstream import path. Do not reorder serialized
+fields or enum variants while extending these contracts: checkpoint format
+remains 12 and existing version-12 bytes remain compatible.
 
 `DomainEvent` is deterministic and checkpointed. `OperationalEvent` records effects such as successful checkpoint writes and is not part of simulation equivalence. `SimulationLifecycle` makes completion idempotent. Checkpoint format 12 records the modular observation-schema identity alongside backend identity, the bounded-impulse-Beta distribution identity, separated neural/runtime/optimizer state, full actor/critic head momentum, unfinished masked rollouts with latent impulse samples, deterministic learning state, evolution registries, life records, IDs, impulse diagnostics, mutation diagnostics, and a persistent failed lifecycle. Format 11 and formats 6 through 10 are rejected because their positional observation, metrics, optimizer/rollout, or action-distribution layouts cannot be migrated safely; format or schema changes require a version bump and explicit rejection of incompatible files. Policy failures emit diagnostics, count per agent, and follow `policy_failures.behavior` after configured consecutive/total limits.
 
