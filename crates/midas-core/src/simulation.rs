@@ -1,4 +1,13 @@
 pub use crate::PolicyFailureCategory;
+
+mod diagnostics;
+mod events;
+mod types;
+
+pub use diagnostics::{DecisionTrace, PpoUpdateTrace, ReportTrace};
+pub use events::{DomainEvent, OperationalEvent};
+pub use types::{CHECKPOINT_VERSION, DatasetSplit, DeathCause, SimulationLifecycle};
+
 use crate::{
     AgentId, AssetId, MidasError, Result,
     action::{
@@ -13,11 +22,10 @@ use crate::{
         BrainArchitecture, BrainGenome, ComputeDevice, NeuralModelState, PolicyContext,
         PolicySnapshot,
     },
-    config::{Config, DateRange, DeathHandling, LearningKind, PolicyFailureBehavior},
+    config::{Config, DeathHandling, LearningKind, PolicyFailureBehavior},
     evolution::{CompletedLifeSummary, DefaultFitnessFunction, EvolutionState},
     execution::{
-        CostExecutionEngine, ExecutionApplier, ExecutionPlanner, ExecutionSnapshot, PlannedTrade,
-        Portfolio,
+        CostExecutionEngine, ExecutionApplier, ExecutionPlanner, ExecutionSnapshot, Portfolio,
     },
     learning::{EpisodeEndContext, LearningStrategyState, LearningUpdate, Transition},
     market::{
@@ -36,228 +44,6 @@ use crate::{
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
-// Version 11 replaces target allocations with persistent incremental trade
-// impulses and persists their diagnostics in the checkpointed metrics state.
-// Older checkpoints contain incompatible action samples or state layouts and
-// cannot be migrated safely.
-/// Format 12 records the modular observation-registry schema identity.
-pub const CHECKPOINT_VERSION: u32 = 12;
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub enum DatasetSplit {
-    Training,
-    Validation,
-    Test,
-}
-impl DatasetSplit {
-    pub fn range<'a>(&self, c: &'a Config) -> &'a DateRange {
-        match self {
-            Self::Training => &c.splits.training,
-            Self::Validation => &c.splits.validation,
-            Self::Test => &c.splits.test,
-        }
-    }
-}
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum SimulationLifecycle {
-    Initialized,
-    Running,
-    Completed,
-    Failed { reason: String },
-}
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub enum DeathCause {
-    Bankruptcy,
-    PolicyFailure,
-}
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub enum DomainEvent {
-    DayStarted {
-        date: NaiveDate,
-        step: usize,
-    },
-    ObservationRevealed {
-        date: NaiveDate,
-    },
-    AgentBorn {
-        agent_id: AgentId,
-        date: NaiveDate,
-    },
-    ActionFallback {
-        agent_id: AgentId,
-        date: NaiveDate,
-    },
-    LearningUpdate {
-        agent_id: AgentId,
-        date: NaiveDate,
-        rollout_size: usize,
-        policy_loss: f32,
-        value_loss: f32,
-        entropy: f32,
-        gradient_norm: f32,
-    },
-    LearningTransitionMasked {
-        agent_id: AgentId,
-        date: NaiveDate,
-        actor_eligible: bool,
-        critic_eligible: bool,
-        penalty: f32,
-    },
-    FitnessAssigned {
-        agent_id: AgentId,
-        genome_id: Option<crate::evolution::GenomeId>,
-        fitness: f64,
-    },
-    ParentsSelected {
-        child_agent_id: AgentId,
-        parent_agent_ids: Vec<AgentId>,
-    },
-    DiversityConstraintRelaxed {
-        first_parent_agent_id: AgentId,
-        requested_minimum_distance: f64,
-        selected_distance: f64,
-    },
-    GenomeCrossed {
-        child_agent_id: AgentId,
-        method: crate::config::CrossoverMethod,
-    },
-    GenomeMutated {
-        child_agent_id: AgentId,
-        weight_changes: u64,
-        bias_changes: u64,
-        trait_changes: u64,
-        reset_changes: u64,
-        weight_resets: u64,
-        bias_resets: u64,
-    },
-    EvolutionFallback {
-        reason: String,
-    },
-    LineageCreated {
-        lineage_id: crate::evolution::LineageId,
-        parent_lineages: Vec<crate::evolution::LineageId>,
-    },
-    PolicyFailure {
-        agent_id: AgentId,
-        date: NaiveDate,
-        policy_kind: crate::brain::PolicyBlueprint,
-        category: PolicyFailureCategory,
-        message: String,
-    },
-    CorporateActionApplied {
-        agent_id: AgentId,
-        date: NaiveDate,
-        action: CorporateAction,
-    },
-    TradeExecuted {
-        agent_id: AgentId,
-        date: NaiveDate,
-        trade: PlannedTrade,
-    },
-    TradeRejected {
-        agent_id: AgentId,
-        date: NaiveDate,
-        asset_id: AssetId,
-    },
-    Valuation {
-        agent_id: AgentId,
-        date: NaiveDate,
-        net_worth: f64,
-        previous: f64,
-        reward: f32,
-    },
-    AgentDied {
-        agent_id: AgentId,
-        birth_date: NaiveDate,
-        death_date: NaiveDate,
-        age: u64,
-        starting_net_worth: f64,
-        final_net_worth: f64,
-        maximum_net_worth: f64,
-        cause: DeathCause,
-    },
-    TimelineCompleted {
-        date: NaiveDate,
-    },
-}
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub enum OperationalEvent {
-    CheckpointSaved { date: NaiveDate, path: String },
-}
-
-/// Report-only per-decision data. It is committed transactionally, but is not
-/// authoritative simulation state and is intentionally excluded from
-/// checkpoints so diagnostics do not alter resume compatibility.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct DecisionTrace {
-    pub observation_date: NaiveDate,
-    pub execution_date: NaiveDate,
-    pub agent_id: AgentId,
-    pub genome_id: Option<crate::evolution::GenomeId>,
-    pub generation_depth: Option<u32>,
-    pub policy: crate::brain::PolicyBlueprint,
-    pub previous_net_worth: f64,
-    pub current_net_worth: f64,
-    pub reward: f32,
-    pub reward_breakdown: RewardBreakdown,
-    pub transaction_cost: f64,
-    pub commission_cost: f64,
-    pub spread_cost: f64,
-    pub slippage_cost: f64,
-    pub turnover: f64,
-    pub trade_count: usize,
-    pub buy_notional: f64,
-    pub sell_notional: f64,
-    pub current_allocations: Vec<f64>,
-    pub action_allocations: Vec<f64>,
-    pub active_asset_indices: Vec<usize>,
-    pub latent_samples: Vec<f32>,
-    pub requested_trade_impulses: Vec<f64>,
-    pub executed_trade_impulses: Vec<f64>,
-    pub trade_scaling_factor: f64,
-    pub requested_buy_notional: f64,
-    pub requested_sell_notional: f64,
-    pub executed_buy_notional: f64,
-    pub executed_sell_notional: f64,
-    pub rejected_notional: f64,
-    pub cash_before: f64,
-    pub cash_after: f64,
-    pub holdings_before: Vec<f64>,
-    pub holdings_after: Vec<f64>,
-    pub order_position_allocations: Vec<f64>,
-    pub cash_allocation: f64,
-    pub maximum_concentration: f64,
-    pub active_positions: usize,
-    pub entropy: f32,
-    pub old_log_probability: Option<f32>,
-    pub value_estimate: Option<f32>,
-    pub temperature: Option<f32>,
-    pub invalid_action: bool,
-    pub failure_category: Option<PolicyFailureCategory>,
-    pub actor_eligible: bool,
-    pub critic_eligible: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct PpoUpdateTrace {
-    pub agent_id: AgentId,
-    pub date: NaiveDate,
-    pub rollout_size: usize,
-    pub policy_loss: f32,
-    pub value_loss: f32,
-    pub entropy: f32,
-    pub gradient_norm: f32,
-    pub approximate_kl: f32,
-    pub clip_fraction: f32,
-    pub actor_delta_norm: f64,
-    pub critic_delta_norm: f64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[allow(clippy::large_enum_variant)]
-pub enum ReportTrace {
-    Decision(DecisionTrace),
-    PpoUpdate(PpoUpdateTrace),
-}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct AgentCheckpoint {
     state: crate::agent::AgentState,

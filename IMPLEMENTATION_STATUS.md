@@ -1,5 +1,22 @@
 # Implementation Status
 
+## Prompt 7B.1: simulation types, events, and diagnostics split
+
+The staged `midas_core::simulation` facade split has begun without moving the
+engine or changing simulation behavior. `simulation/types.rs` now owns the
+checkpoint-version constant, dataset split, lifecycle, and death-cause
+contracts; `simulation/events.rs` owns deterministic domain and operational
+events; and `simulation/diagnostics.rs` owns report-only decision and PPO
+traces. The public `midas_core::simulation::*` imports remain unchanged through
+facade re-exports.
+
+- Checkpoint format remains 12. The checkpoint envelope, serialized field and
+  enum layouts, and all simulation methods remain in `simulation.rs` for this
+  stage.
+- Transaction boundaries, event timing, diagnostics timing, PPO, execution,
+  rewards, evolution, replacement, observations, and configuration behavior
+  are unchanged.
+
 ## Prompt 7A: brain facade split
 
 The former 2,766-line `midas_core::brain` module is now a compatibility
