@@ -30,6 +30,18 @@ Policies implement `propose_action`, snapshot/reset state, and return a `PolicyB
 
 Implement `NeuralModel` and `NeuralModelFactory`. A model owns recurrent state and maps `NeuralInput` to raw actor-head parameters/value. Burn is one adapter and currently supports only CPU `NdArray` `default`. Runtime tensors are cached at model construction/restoration; `runtime_parameter_builds` is available for diagnostics. Stable snapshots use `NeuralModelState`; adding another serialisable implementation requires a distinct state kind and checkpoint tests. The simulation engine must remain free of ML-framework types. The immutable `BrainGenome`, mutable lifetime parameters, recurrent runtime state, and optimizer state are separate concepts. `PolicyEvaluation` carries the sampled impulse action, exact latent log probability, entropy, and value estimate. Burn's trainable adapter uses one encoded-state path and updates complete actor/critic dense output heads through `NeuralModel::train_batch`; hidden and recurrent layers remain frozen. Another framework can use the same boundary.
 
+The public brain facade remains `crates/midas-core/src/brain.rs`; external
+imports must continue to use `midas_core::brain::*`. Add architecture contracts
+in `brain/architecture.rs`, inherited parameters and validation in
+`brain/genome.rs`, checkpointed runtime/policy state in `brain/state.rs`, and
+framework-neutral model traits in `brain/model.rs`. Keep Burn tensors and
+cached runtime conversion inside `brain/burn_runtime.rs`; frozen-encoder PPO
+head-update math belongs in `brain/head_training.rs`. New bounded action
+distributions belong in `brain/impulse_beta.rs` or a sibling module, while
+built-in benchmark policies belong in `brain/benchmarks.rs`. Do not move
+serialized fields, reorder enum variants, or bypass the facade when extending
+these modules: those layouts are checkpoint-sensitive.
+
 ### PPO and rewards
 
 `LearningStrategy` owns bounded `RolloutBuffer` state. `PpoLearning` computes GAE with configured `gamma` and `gae_lambda`, uses forked next-observation critic estimates for continuing neural episodes, normalizes advantages when enabled, preserves recurrent sequence order, and requests a clipped objective update at rollout length or episode end. A successful update is committed only after the model returns finite metrics; failed updates remain inside the step transaction. `RewardFunction` separates environment reward from reproductive fitness; `LogReturn` and `RiskAdjustedReturn` are available.

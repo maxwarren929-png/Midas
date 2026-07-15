@@ -1,5 +1,27 @@
 # Implementation Status
 
+## Prompt 7A: brain facade split
+
+The former 2,766-line `midas_core::brain` module is now a compatibility
+facade over focused private implementation modules. Public imports remain
+unchanged through `midas_core::brain::*`; `brain.rs` only declares private
+children and re-exports the established contracts.
+
+- `brain/architecture.rs`, `genome.rs`, and `state.rs` contain the stable
+  architecture, immutable genome, and checkpointed lifetime/runtime/optimizer
+  state respectively. Their derives, fields, and enum variants are unchanged.
+- `brain/model.rs` contains framework-neutral model/device contracts;
+  `brain/burn_runtime.rs` contains the CPU Burn adapter and its cached tensors;
+  `brain/head_training.rs` contains the existing frozen-encoder PPO head
+  update math.
+- `brain/policy.rs`, `impulse_beta.rs`, and `benchmarks.rs` isolate policy
+  snapshots, bounded impulse-distribution logic, and benchmark policies.
+  This is a mechanical relocation only: sampling, temperature timing, PPO,
+  evolution, execution, observations, and checkpoint semantics are unchanged.
+- Checkpoint format remains 12. Existing v12 checkpoints continue to use the
+  same bincode field and enum layouts; no migration or architecture/schema
+  identity change is introduced.
+
 ## Prompt 6.5: conservative observation facade split
 
 The former 2,777-line observation module is now a small
