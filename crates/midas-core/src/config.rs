@@ -464,9 +464,6 @@ impl RollingMarketStatsConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if !self.enabled {
-            return Ok(());
-        }
         let groups = [
             ("return_windows", &self.return_windows),
             ("volatility_windows", &self.volatility_windows),
@@ -495,6 +492,9 @@ impl RollingMarketStatsConfig {
             return Err(MidasError::Config(
                 "observations.rolling_market_stats.market_summary_window must be positive".into(),
             ));
+        }
+        if !self.enabled {
+            return Ok(());
         }
         if count == 0 {
             return Err(MidasError::Config(

@@ -1,0 +1,186 @@
+{
+  "split": "Validation",
+  "steps": 269,
+  "agents": [
+    [
+      0,
+      {
+        "starting_net_worth": 10000.0,
+        "ending_net_worth": 9986.757244576514,
+        "total_return": -0.0013242755423485963,
+        "annualised_return": -0.0012406372032800483,
+        "volatility": 0.015446322403481283,
+        "maximum_drawdown": 0.022707262214221924,
+        "sharpe_like": -0.08031926117251277,
+        "sortino_like": -0.11283618686483866,
+        "turnover": 3834.4554471629563,
+        "trades": 615,
+        "total_fees": 1.917227723581479,
+        "spread_cost": 1.917227723581479,
+        "slippage_cost": 0.7668910894325912,
+        "survival_days": 269,
+        "bankrupt": false
+      }
+    ],
+    [
+      1,
+      {
+        "starting_net_worth": 10000.0,
+        "ending_net_worth": 10048.914950298677,
+        "total_return": 0.004891495029867743,
+        "annualised_return": 0.0045816600470551805,
+        "volatility": 0.004944308513462222,
+        "maximum_drawdown": 0.006640165105064599,
+        "sharpe_like": 0.9266533499235267,
+        "sortino_like": 1.4471424925143808,
+        "turnover": 1224.6874533320286,
+        "trades": 636,
+        "total_fees": 0.6123437266660143,
+        "spread_cost": 0.6123437266660143,
+        "slippage_cost": 0.2449374906664055,
+        "survival_days": 269,
+        "bankrupt": false
+      }
+    ],
+    [
+      3,
+      {
+        "starting_net_worth": 10000.0,
+        "ending_net_worth": 10248.569309709103,
+        "total_return": 0.02485693097091035,
+        "annualised_return": 0.023267916102331476,
+        "volatility": 0.012794134170583397,
+        "maximum_drawdown": 0.029443090030824237,
+        "sharpe_like": 1.8186393695815437,
+        "sortino_like": 2.7245993888985636,
+        "turnover": 2217.530406006324,
+        "trades": 512,
+        "total_fees": 1.1087652030031614,
+        "spread_cost": 1.1087652030031614,
+        "slippage_cost": 0.4435060812012645,
+        "survival_days": 269,
+        "bankrupt": false
+      }
+    ],
+    [
+      4,
+      {
+        "starting_net_worth": 10000.0,
+        "ending_net_worth": 9881.085340973597,
+        "total_return": -0.01189146590264023,
+        "annualised_return": -0.011144164241766563,
+        "volatility": 0.0025222519186219434,
+        "maximum_drawdown": 0.017566950564179007,
+        "sharpe_like": -4.4183390879747195,
+        "sortino_like": -5.081447736868364,
+        "turnover": 577.241219499621,
+        "trades": 369,
+        "total_fees": 0.28862060974981085,
+        "spread_cost": 0.28862060974981085,
+        "slippage_cost": 0.11544824389992428,
+        "survival_days": 269,
+        "bankrupt": false
+      }
+    ],
+    [
+      5,
+      {
+        "starting_net_worth": 10000.0,
+        "ending_net_worth": 9706.19909779471,
+        "total_return": -0.02938009022052901,
+        "annualised_return": -0.02754917783217037,
+        "volatility": 0.003303017950700678,
+        "maximum_drawdown": 0.02938009022052901,
+        "sharpe_like": -8.34060796621656,
+        "sortino_like": -7.907815783752814,
+        "turnover": 641.665793786852,
+        "trades": 302,
+        "total_fees": 0.3208328968934258,
+        "spread_cost": 0.3208328968934258,
+        "slippage_cost": 0.12833315875737034,
+        "survival_days": 269,
+        "bankrupt": false
+      }
+    ],
+    [
+      8,
+      {
+        "starting_net_worth": 10000.0,
+        "ending_net_worth": 9447.08748747389,
+        "total_return": -0.05529125125261103,
+        "annualised_return": -0.051889329896192105,
+        "volatility": 0.01182961109230876,
+        "maximum_drawdown": 0.06906624584236143,
+        "sharpe_like": -4.386393558612329,
+        "sortino_like": -4.882270369929119,
+        "turnover": 3387.304561726673,
+        "trades": 802,
+        "total_fees": 1.6936522808633359,
+        "spread_cost": 1.6936522808633359,
+        "slippage_cost": 0.677460912345335,
+        "survival_days": 269,
+        "bankrupt": false
+      }
+    ],
+    [
+      9,
+      {
+        "starting_net_worth": 10000.0,
+        "ending_net_worth": 10003.508765090088,
+        "total_return": 0.00035087650900877954,
+        "annualised_return": 0.0003286985132127107,
+        "volatility": 0.009089370156857847,
+        "maximum_drawdown": 0.018706585220167105,
+        "sharpe_like": 0.036162958218255714,
+        "sortino_like": 0.051186911725397244,
+        "turnover": 3169.6648858367053,
+        "trades": 806,
+        "total_fees": 1.584832442918354,
+        "spread_cost": 1.584832442918354,
+        "slippage_cost": 0.633932977167341,
+        "survival_days": 269,
+        "bankrupt": false
+      }
+    ],
+    [
+      10,
+      {
+        "starting_net_worth": 10000.0,
+        "ending_net_worth": 10027.587073795503,
+        "total_return": 0.002758707379550307,
+        "annualised_return": 0.0025841402156008275,
+        "volatility": 0.006548278985911756,
+        "maximum_drawdown": 0.018313687076330964,
+        "sharpe_like": 0.39462891259832633,
+        "sortino_like": 0.5470397830160442,
+        "turnover": 973.5572883506377,
+        "trades": 330,
+        "total_fees": 0.4867786441753196,
+        "spread_cost": 0.4867786441753196,
+        "slippage_cost": 0.19471145767012762,
+        "survival_days": 269,
+        "bankrupt": false
+      }
+    ]
+  ],
+  "deaths": 0,
+  "births": 8,
+  "invalid_actions": 0,
+  "dataset_identity": "638b9286f2c8965e68f8212d97cda6102a99d9337dd83e76b6ed52c6794464aa",
+  "observation_schema_identity": "95af73d3a1e48b89c35af1b1da1eb1b9786fcb414121b003fe2043a4506b091b",
+  "replacement_strategy": "non_evolutionary_random_genome",
+  "learning_implementation": "no_learning",
+  "learning_updates": 0,
+  "evolutionary_births": 0,
+  "neural_action_count": 2152,
+  "neural_multi_asset_action_fraction": 0.8801115241635687,
+  "neural_mean_active_positions": 2.7472118959107807,
+  "neural_mean_concentration": 0.0613541610950403,
+  "neural_mean_cash_allocation": 0.8979525315392658,
+  "neural_mean_abs_trade_impulse": 0.006297460905981771,
+  "neural_small_trade_impulse_fraction": 1.0,
+  "neural_saturated_trade_impulse_fraction": 0.0,
+  "active_lineages": 0,
+  "lifecycle": "Completed",
+  "failure_reason": null
+}

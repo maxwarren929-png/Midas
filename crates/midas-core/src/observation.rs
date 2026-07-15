@@ -2381,6 +2381,12 @@ mod tests {
         let mut duplicate = configured;
         duplicate.observations.rolling_market_stats.return_windows = vec![2, 2];
         assert!(duplicate.validate().is_err());
+        let mut disabled_invalid = default_config;
+        disabled_invalid
+            .observations
+            .rolling_market_stats
+            .return_windows = vec![0];
+        assert!(disabled_invalid.validate().is_err());
     }
 
     #[test]

@@ -1,0 +1,4 @@
+Cash: ending_net_worth=9865.5000
+Random: ending_net_worth=8936.0636
+EqualWeight: ending_net_worth=9746.7361
+BuyAndHold: ending_net_worth=8943.4865
