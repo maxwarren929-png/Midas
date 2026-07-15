@@ -103,6 +103,37 @@ impl FeaturePriceSeries for PointInTimeFeaturePriceSeries<'_> {
 }
 
 impl MarketDataset {
+    #[cfg(test)]
+    pub(crate) fn from_test_bars(assets: Vec<String>, bars: Vec<MarketBar>) -> Self {
+        let mut dates = bars.iter().map(|bar| bar.date).collect::<Vec<_>>();
+        dates.sort_unstable();
+        dates.dedup();
+        let corporate_actions = Vec::new();
+        let identity = blake3::hash(
+            &bincode::serialize(&(
+                assets.as_slice(),
+                bars.as_slice(),
+                corporate_actions.as_slice(),
+            ))
+            .expect("test bars are serializable"),
+        )
+        .to_hex()
+        .to_string();
+        let index = bars
+            .iter()
+            .enumerate()
+            .map(|(index, bar)| ((bar.date, bar.asset_id), index))
+            .collect();
+        Self {
+            assets,
+            bars,
+            dates,
+            identity,
+            corporate_actions,
+            index,
+        }
+    }
+
     pub fn load(config: &Config) -> Result<Self> {
         let frame = match config.data.format {
             DataFormat::Csv => CsvReadOptions::default()

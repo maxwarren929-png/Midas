@@ -10,6 +10,13 @@ The default schema registers three providers:
 - `portfolio`: cash fraction, per-asset allocation, unrealised return, net-worth ratio, drawdown, one-step portfolio return, and turnover ratio when selected by the schema.
 - `agent_state`: normalised age when selected by the schema.
 
+`rolling_market_stats` is an opt-in fourth provider introduced in Prompt 6. It
+precomputes immutable, past-only values from the canonical point-in-time raw
+close series and publishes them by decision date. It has no dependency on PPO,
+execution, evolution, rewards, or mutable simulation state. The default schema
+does not register it, so Prompt 5 inputs and checkpoint identity remain
+unchanged unless it is explicitly enabled.
+
 Every published scalar has a stable name such as `market.return1.asset_0`, `portfolio.cash_fraction`, or `portfolio.unrealized_return.asset_1`. Metadata includes its provider, numeric value type, description, units, scalar or fixed-vector shape, optional source-order hint, suggested normalisation, schema version, and tags. Asset indices deliberately follow the validated runtime asset order, which prevents provider registration order from affecting an input vector.
 
 ## Schema and normalisation
@@ -29,6 +36,55 @@ maximum = 1.0
 
 The compiler expands these into `ObservationSchemaEntry` records containing an explicit index, name, provider, component, and normalisation rule. Supported rules are `none`, `ratio_clipped`, `min_max`, `z_score`, `log`, `signed_log`, `percentage`, and `custom` (finite affine scale and offset). Providers publish raw values; only compilation normalises them. Existing default clipped-ratio semantics are retained exactly.
 
+## Rolling market statistics
+
+Enable the provider explicitly and increment the compact observation schema
+version whenever its entries change:
+
+```toml
+[observation]
+version = 3
+
+[observations]
+schema = "default"
+providers = ["market", "portfolio", "agent_state", "rolling_market_stats"]
+
+[observations.rolling_market_stats]
+enabled = true
+return_windows = [20, 60]
+volatility_windows = [20, 60]
+sma_windows = [60]
+relative_strength_windows = [20, 60]
+market_summary = true
+market_summary_window = 20
+minimum_history = "zero_fill"
+```
+
+The provider emits named raw scalars such as `rolling_return_60.SPY`,
+`rolling_volatility_20.AAA`, `price_to_sma_60.BBB`,
+`relative_strength_20.CCC`, `market_mean_return_20`,
+`market_dispersion_20`, and `market_breadth_20`. Asset symbols and window
+lengths are part of each stable name. Per-name schema normalisation overrides
+continue to apply after publication.
+
+At close `t`, using only bars at or before `t`, the formulas are:
+
+- `rolling_return_w = close_t / close_(t-w) - 1`.
+- `rolling_volatility_w` is the population standard deviation of the most
+  recent `w` simple close-to-close returns.
+- `price_to_sma_w = close_t / mean(close_(t-w+1)..close_t) - 1`.
+- `relative_strength_w` is an asset's rolling return minus the mean rolling
+  return of currently tradable assets.
+- market mean return and volatility are means across currently tradable assets;
+  dispersion is the population standard deviation of their rolling returns;
+  breadth is the fraction with strictly positive rolling return.
+
+Cash is not an asset dimension for these metrics. Untradable assets publish
+zero for asset-scoped rolling values and are excluded from cross-sectional
+summaries. When history is too short, `zero_fill` publishes exactly `0.0`.
+Zero therefore means unavailable lookback after normalisation, not a future
+estimate. No metric reads adjusted closes or bars after `t`.
+
 The schema rejects duplicate names or indices, gaps in index order, provider/source disagreement, missing providers, unreferenced published metadata, non-finite values, shape mismatches, invalid normalisation parameters, and unknown normalisation overrides. Increment `[observation].version` whenever names, dimensions, ordering, providers, or normalisation semantics change.
 
 ## Introspection
@@ -44,6 +100,6 @@ The schema output is the authoritative input map. It is suitable for recording e
 
 ## Compatibility and future providers
 
-The schema hash includes its version, entries, providers, and normalisation rules. It is embedded in `BrainArchitecture` and checkpoint compatibility. Checkpoint format 12 rejects format 11 because that format predates the registry identity; no positional-schema migration is attempted.
+The schema hash includes its version, entries, providers, and normalisation rules. It is embedded in `BrainArchitecture` and checkpoint compatibility. Checkpoint format 12 rejects format 11 because that format predates the registry identity; no positional-schema migration is attempted. Prompt 6 does not change the serialized checkpoint layout: an unchanged default configuration remains v12-compatible, while an enabled rolling provider has a different schema/configuration identity and is rejected on restore against a default-schema checkpoint.
 
 Future indicators, external data, or evolutionary sensor selection must add providers or explicit schema entries through this boundary. They must not append positional fields in `SimulationEngine`, modify PPO input handling, or make a provider mutate simulation state. Future genome-controlled sensor subsets can be represented as a selected schema without changing the policy or learning interfaces.

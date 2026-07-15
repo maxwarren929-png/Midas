@@ -5,14 +5,15 @@
 //! This keeps feature sources independent from policy, learning, and execution.
 
 use crate::{
-    Result,
+    AssetId, Result,
     config::{
         Config, FeatureKind, ObservationFeatureKind, ObservationNormalizationConfig,
-        ObservationNormalizationKind,
+        ObservationNormalizationKind, RollingMarketStatsConfig,
     },
     execution::Portfolio,
-    market::FeatureRow,
+    market::{FeaturePriceSeries, FeatureRow, MarketDataset, PointInTimeFeaturePriceSeries},
 };
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -22,6 +23,7 @@ use std::{
 const MARKET_PROVIDER: &str = "market";
 const PORTFOLIO_PROVIDER: &str = "portfolio";
 const AGENT_STATE_PROVIDER: &str = "agent_state";
+const ROLLING_MARKET_STATS_PROVIDER: &str = "rolling_market_stats";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -144,6 +146,27 @@ pub enum ObservationSource {
     AgentState {
         feature: AgentStateFeatureSpec,
     },
+    RollingMarketStats {
+        metric: RollingMarketMetric,
+        asset_index: Option<usize>,
+        window: usize,
+    },
+}
+
+/// Past-only raw-close market statistics published by
+/// [`RollingMarketStatsProvider`]. Values are normalised by the schema, never
+/// by the provider.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RollingMarketMetric {
+    RollingReturn,
+    RollingVolatility,
+    PriceToSma,
+    RelativeStrength,
+    MarketMeanReturn,
+    MarketMeanVolatility,
+    MarketDispersion,
+    MarketBreadth,
 }
 
 impl ObservationSource {
@@ -152,6 +175,7 @@ impl ObservationSource {
             Self::Market { .. } => MARKET_PROVIDER,
             Self::Portfolio { .. } => PORTFOLIO_PROVIDER,
             Self::AgentState { .. } => AGENT_STATE_PROVIDER,
+            Self::RollingMarketStats { .. } => ROLLING_MARKET_STATS_PROVIDER,
         }
     }
 }
@@ -184,6 +208,7 @@ impl ObservationSchema {
     }
 
     pub fn try_from_config(config: &Config) -> Result<Self> {
+        config.observations.rolling_market_stats.validate()?;
         let mut features = Vec::new();
         for configured in &config.observation.features {
             match configured {
@@ -317,6 +342,14 @@ impl ObservationSchema {
                 }
             }
         }
+        if config.observations.rolling_market_stats.enabled {
+            append_rolling_market_entries(
+                &mut entries,
+                &config.market.assets,
+                &config.observations.rolling_market_stats,
+                &config.observations.normalizations,
+            )?;
+        }
         let schema = Self {
             version: config.observation.version,
             market_schema_version: config.features.schema_version,
@@ -422,6 +455,131 @@ fn push_entry(
         component: 0,
         normalization,
     });
+}
+
+fn append_rolling_market_entries(
+    entries: &mut Vec<ObservationSchemaEntry>,
+    assets: &[String],
+    config: &RollingMarketStatsConfig,
+    overrides: &BTreeMap<String, ObservationNormalizationConfig>,
+) -> Result<()> {
+    let ratio = NormalizationRule::RatioClipped {
+        minimum: -10.0,
+        maximum: 10.0,
+    };
+    let non_negative = NormalizationRule::RatioClipped {
+        minimum: 0.0,
+        maximum: 10.0,
+    };
+    let fraction = NormalizationRule::RatioClipped {
+        minimum: 0.0,
+        maximum: 1.0,
+    };
+    for (asset_index, asset) in assets.iter().enumerate() {
+        for &window in &config.return_windows {
+            push_rolling_entry(
+                entries,
+                format!("rolling_return_{window}.{asset}"),
+                RollingMarketMetric::RollingReturn,
+                Some(asset_index),
+                window,
+                &ratio,
+                overrides,
+            )?;
+        }
+        for &window in &config.volatility_windows {
+            push_rolling_entry(
+                entries,
+                format!("rolling_volatility_{window}.{asset}"),
+                RollingMarketMetric::RollingVolatility,
+                Some(asset_index),
+                window,
+                &non_negative,
+                overrides,
+            )?;
+        }
+        for &window in &config.sma_windows {
+            push_rolling_entry(
+                entries,
+                format!("price_to_sma_{window}.{asset}"),
+                RollingMarketMetric::PriceToSma,
+                Some(asset_index),
+                window,
+                &ratio,
+                overrides,
+            )?;
+        }
+        for &window in &config.relative_strength_windows {
+            push_rolling_entry(
+                entries,
+                format!("relative_strength_{window}.{asset}"),
+                RollingMarketMetric::RelativeStrength,
+                Some(asset_index),
+                window,
+                &ratio,
+                overrides,
+            )?;
+        }
+    }
+    if config.market_summary {
+        let window = config.market_summary_window;
+        for (name, metric, normalization) in [
+            (
+                format!("market_mean_return_{window}"),
+                RollingMarketMetric::MarketMeanReturn,
+                &ratio,
+            ),
+            (
+                format!("market_mean_volatility_{window}"),
+                RollingMarketMetric::MarketMeanVolatility,
+                &non_negative,
+            ),
+            (
+                format!("market_dispersion_{window}"),
+                RollingMarketMetric::MarketDispersion,
+                &non_negative,
+            ),
+            (
+                format!("market_breadth_{window}"),
+                RollingMarketMetric::MarketBreadth,
+                &fraction,
+            ),
+        ] {
+            push_rolling_entry(
+                entries,
+                name,
+                metric,
+                None,
+                window,
+                normalization,
+                overrides,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn push_rolling_entry(
+    entries: &mut Vec<ObservationSchemaEntry>,
+    name: String,
+    metric: RollingMarketMetric,
+    asset_index: Option<usize>,
+    window: usize,
+    default: &NormalizationRule,
+    overrides: &BTreeMap<String, ObservationNormalizationConfig>,
+) -> Result<()> {
+    let normalization = apply_override(default, &name, overrides)?;
+    push_entry(
+        entries,
+        name,
+        ObservationSource::RollingMarketStats {
+            metric,
+            asset_index,
+            window,
+        },
+        normalization,
+    );
+    Ok(())
 }
 
 fn market_name(feature: FeatureKind, asset_index: usize) -> String {
@@ -746,6 +904,8 @@ impl ObservationRegistry {
         schema: &ObservationSchema,
         market_features: &[FeatureKind],
         asset_count: usize,
+        rolling_config: &RollingMarketStatsConfig,
+        market_data: Option<&MarketDataset>,
     ) -> Result<Self> {
         let mut registry = Self::new();
         for provider in &schema.providers {
@@ -763,7 +923,18 @@ impl ObservationRegistry {
                 AGENT_STATE_PROVIDER if used => {
                     registry.register(Box::new(AgentStateObservationProvider::new(schema)?))?
                 }
-                MARKET_PROVIDER | PORTFOLIO_PROVIDER | AGENT_STATE_PROVIDER => {}
+                ROLLING_MARKET_STATS_PROVIDER if used => {
+                    registry.register(Box::new(RollingMarketStatsProvider::new(
+                        schema,
+                        asset_count,
+                        rolling_config,
+                        market_data,
+                    )?))?
+                }
+                MARKET_PROVIDER
+                | PORTFOLIO_PROVIDER
+                | AGENT_STATE_PROVIDER
+                | ROLLING_MARKET_STATS_PROVIDER => {}
                 name => {
                     return Err(crate::MidasError::Config(format!(
                         "configured observation provider {name} is not registered"
@@ -835,12 +1006,51 @@ impl SchemaObservationBuilder {
         market_features: Vec<FeatureKind>,
         asset_count: usize,
     ) -> Result<Self> {
+        Self::from_parts(
+            schema,
+            market_features,
+            asset_count,
+            &RollingMarketStatsConfig::default(),
+            None,
+        )
+    }
+
+    /// Constructs built-in providers from typed configuration.  Market-derived
+    /// sensors are precomputed from immutable raw data, while the default
+    /// Prompt 5 provider set remains allocation-free at construction.
+    pub fn from_config(
+        schema: ObservationSchema,
+        config: &Config,
+        market_data: Option<&MarketDataset>,
+    ) -> Result<Self> {
+        Self::from_parts(
+            schema,
+            config.features.features.clone(),
+            config.market.assets.len(),
+            &config.observations.rolling_market_stats,
+            market_data,
+        )
+    }
+
+    fn from_parts(
+        schema: ObservationSchema,
+        market_features: Vec<FeatureKind>,
+        asset_count: usize,
+        rolling_config: &RollingMarketStatsConfig,
+        market_data: Option<&MarketDataset>,
+    ) -> Result<Self> {
         if market_features.is_empty() {
             return Err(crate::MidasError::Config(
                 "observation market feature list must not be empty".into(),
             ));
         }
-        let registry = ObservationRegistry::built_in(&schema, &market_features, asset_count)?;
+        let registry = ObservationRegistry::built_in(
+            &schema,
+            &market_features,
+            asset_count,
+            rolling_config,
+            market_data,
+        )?;
         Self::with_registry(schema, registry, asset_count)
     }
 
@@ -1202,6 +1412,393 @@ impl ObservationProvider for AgentStateObservationProvider {
     }
 }
 
+#[derive(Clone, Copy)]
+struct RollingOutput {
+    metric: RollingMarketMetric,
+    asset_index: Option<usize>,
+    window: usize,
+}
+
+/// Past-only market statistics calculated once from the canonical feature-price
+/// series. A table is used rather than re-scanning history while agents act so
+/// providers remain read-only and compilation remains inexpensive.
+struct RollingMarketStatsProvider {
+    metadata: Vec<ObservationMetadata>,
+    outputs: Vec<(String, RollingOutput)>,
+    values_by_date: Option<BTreeMap<NaiveDate, Vec<f64>>>,
+}
+
+impl RollingMarketStatsProvider {
+    fn new(
+        schema: &ObservationSchema,
+        asset_count: usize,
+        config: &RollingMarketStatsConfig,
+        market_data: Option<&MarketDataset>,
+    ) -> Result<Self> {
+        if !config.enabled {
+            return Err(crate::MidasError::Config(
+                "rolling_market_stats provider is configured but disabled".into(),
+            ));
+        }
+        let mut outputs = Vec::new();
+        for entry in schema
+            .entries
+            .iter()
+            .filter(|entry| entry.provider == ROLLING_MARKET_STATS_PROVIDER)
+        {
+            let Some(ObservationSource::RollingMarketStats {
+                metric,
+                asset_index,
+                window,
+            }) = entry.source.as_ref()
+            else {
+                return Err(crate::MidasError::Config(format!(
+                    "rolling observation {} has no rolling source",
+                    entry.name
+                )));
+            };
+            if *window == 0 || asset_index.is_some_and(|index| index >= asset_count) {
+                return Err(crate::MidasError::Config(format!(
+                    "rolling observation {} has an invalid source",
+                    entry.name
+                )));
+            }
+            let expects_asset = matches!(
+                metric,
+                RollingMarketMetric::RollingReturn
+                    | RollingMarketMetric::RollingVolatility
+                    | RollingMarketMetric::PriceToSma
+                    | RollingMarketMetric::RelativeStrength
+            );
+            if expects_asset != asset_index.is_some() {
+                return Err(crate::MidasError::Config(format!(
+                    "rolling observation {} has incompatible metric dimensions",
+                    entry.name
+                )));
+            }
+            outputs.push((
+                entry.name.clone(),
+                RollingOutput {
+                    metric: *metric,
+                    asset_index: *asset_index,
+                    window: *window,
+                },
+            ));
+        }
+        let values_by_date = market_data
+            .map(|data| rolling_values_by_date(data, &outputs, asset_count))
+            .transpose()?;
+        Ok(Self {
+            metadata: rolling_metadata_for_entries(schema),
+            outputs,
+            values_by_date,
+        })
+    }
+}
+
+impl ObservationProvider for RollingMarketStatsProvider {
+    fn provider_name(&self) -> &str {
+        ROLLING_MARKET_STATS_PROVIDER
+    }
+
+    fn metadata(&self) -> Vec<ObservationMetadata> {
+        self.metadata.clone()
+    }
+
+    fn observe(
+        &self,
+        context: &ObservationContext<'_>,
+        sink: &mut ObservationSink<'_>,
+    ) -> Result<()> {
+        let values = self
+            .values_by_date
+            .as_ref()
+            .ok_or_else(|| {
+                crate::MidasError::Policy(
+                    "rolling market observations require immutable market data".into(),
+                )
+            })?
+            .get(&context.market.date)
+            .ok_or_else(|| {
+                crate::MidasError::Policy(format!(
+                    "rolling market observations are unavailable for {}",
+                    context.market.date
+                ))
+            })?;
+        if values.len() != self.outputs.len() {
+            return Err(crate::MidasError::Policy(
+                "rolling market observation table has invalid dimensions".into(),
+            ));
+        }
+        for ((name, _), value) in self.outputs.iter().zip(values) {
+            sink.publish_scalar(name, *value)?;
+        }
+        Ok(())
+    }
+}
+
+fn rolling_values_by_date(
+    data: &MarketDataset,
+    outputs: &[(String, RollingOutput)],
+    asset_count: usize,
+) -> Result<BTreeMap<NaiveDate, Vec<f64>>> {
+    if data.assets.len() != asset_count {
+        return Err(crate::MidasError::Data(
+            "rolling market provider asset count does not match market data".into(),
+        ));
+    }
+    let price_series = PointInTimeFeaturePriceSeries::new(data);
+    let mut histories = vec![Vec::new(); asset_count];
+    let mut table = BTreeMap::new();
+    for date in &data.dates {
+        let mut live = vec![false; asset_count];
+        for asset_index in 0..asset_count {
+            let asset = AssetId(asset_index as u64);
+            if let Some(bar) = data.bar(*date, asset) {
+                let price = price_series.price(asset, *date)?.unwrap_or(bar.close);
+                if !price.is_finite() || price <= 0.0 {
+                    return Err(crate::MidasError::Data(format!(
+                        "rolling market provider received invalid price for asset {asset_index} on {date}"
+                    )));
+                }
+                histories[asset_index].push(price);
+                live[asset_index] = bar.tradable;
+            }
+        }
+        let values = outputs
+            .iter()
+            .map(|(_, output)| rolling_value(output, &histories, &live))
+            .collect::<Vec<_>>();
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(crate::MidasError::Data(format!(
+                "rolling market provider produced a non-finite value on {date}"
+            )));
+        }
+        table.insert(*date, values);
+    }
+    Ok(table)
+}
+
+fn rolling_value(output: &RollingOutput, histories: &[Vec<f64>], live: &[bool]) -> f64 {
+    let asset_value = |calculation: fn(&[f64], usize) -> Option<f64>| {
+        let index = output.asset_index.expect("validated asset metric");
+        if live[index] {
+            calculation(&histories[index], output.window).unwrap_or(0.0)
+        } else {
+            0.0
+        }
+    };
+    match output.metric {
+        RollingMarketMetric::RollingReturn => asset_value(rolling_return),
+        RollingMarketMetric::RollingVolatility => asset_value(rolling_volatility),
+        RollingMarketMetric::PriceToSma => asset_value(price_to_sma),
+        RollingMarketMetric::RelativeStrength => {
+            let index = output.asset_index.expect("validated asset metric");
+            if !live[index] {
+                return 0.0;
+            }
+            let Some(value) = rolling_return(&histories[index], output.window) else {
+                return 0.0;
+            };
+            let returns = live
+                .iter()
+                .enumerate()
+                .filter_map(|(asset, is_live)| {
+                    is_live.then(|| rolling_return(&histories[asset], output.window))?
+                })
+                .collect::<Vec<_>>();
+            if returns.is_empty() {
+                0.0
+            } else {
+                value - mean(&returns)
+            }
+        }
+        RollingMarketMetric::MarketMeanReturn => {
+            market_values(histories, live, output.window, rolling_return)
+                .map_or(0.0, |values| mean(&values))
+        }
+        RollingMarketMetric::MarketMeanVolatility => {
+            market_values(histories, live, output.window, rolling_volatility)
+                .map_or(0.0, |values| mean(&values))
+        }
+        RollingMarketMetric::MarketDispersion => {
+            market_values(histories, live, output.window, rolling_return)
+                .map_or(0.0, |values| population_standard_deviation(&values))
+        }
+        RollingMarketMetric::MarketBreadth => {
+            let values = market_values(histories, live, output.window, rolling_return);
+            values.map_or(0.0, |items| {
+                items.iter().filter(|value| **value > 0.0).count() as f64 / items.len() as f64
+            })
+        }
+    }
+}
+
+fn market_values(
+    histories: &[Vec<f64>],
+    live: &[bool],
+    window: usize,
+    calculation: fn(&[f64], usize) -> Option<f64>,
+) -> Option<Vec<f64>> {
+    let values = live
+        .iter()
+        .enumerate()
+        .filter_map(|(asset, is_live)| is_live.then(|| calculation(&histories[asset], window))?)
+        .collect::<Vec<_>>();
+    (!values.is_empty()).then_some(values)
+}
+
+/// Simple close-to-close return from the current close to the close `window`
+/// observed bars earlier. `None` indicates insufficient history, never a
+/// future-data fallback.
+fn rolling_return(history: &[f64], window: usize) -> Option<f64> {
+    if history.len() <= window {
+        return None;
+    }
+    Some(history.last()? / history[history.len() - 1 - window] - 1.0)
+}
+
+/// Population standard deviation of the last `window` simple daily returns.
+fn rolling_volatility(history: &[f64], window: usize) -> Option<f64> {
+    if history.len() <= window {
+        return None;
+    }
+    let start = history.len() - window - 1;
+    let returns = history[start..]
+        .windows(2)
+        .map(|pair| pair[1] / pair[0] - 1.0)
+        .collect::<Vec<_>>();
+    Some(population_standard_deviation(&returns))
+}
+
+fn price_to_sma(history: &[f64], window: usize) -> Option<f64> {
+    if history.len() < window {
+        return None;
+    }
+    let start = history.len() - window;
+    let average = mean(&history[start..]);
+    if average <= 0.0 {
+        return None;
+    }
+    Some(history.last()? / average - 1.0)
+}
+
+fn mean(values: &[f64]) -> f64 {
+    values.iter().sum::<f64>() / values.len() as f64
+}
+
+fn population_standard_deviation(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let average = mean(values);
+    (values
+        .iter()
+        .map(|value| (value - average).powi(2))
+        .sum::<f64>()
+        / values.len() as f64)
+        .sqrt()
+}
+
+fn rolling_metadata_for_entries(schema: &ObservationSchema) -> Vec<ObservationMetadata> {
+    schema
+        .entries
+        .iter()
+        .filter(|entry| entry.provider == ROLLING_MARKET_STATS_PROVIDER)
+        .map(|entry| {
+            let (metric, asset, window) = match entry.source.as_ref() {
+                Some(ObservationSource::RollingMarketStats {
+                    metric,
+                    asset_index,
+                    window,
+                }) => (*metric, *asset_index, *window),
+                _ => unreachable!("rolling provider validated schema source"),
+            };
+            let (description, units, tags) = rolling_metadata(metric, asset, window);
+            ObservationMetadata {
+                name: entry.name.clone(),
+                provider: ROLLING_MARKET_STATS_PROVIDER.into(),
+                description,
+                units,
+                value_type: ObservationValueType::Float64,
+                shape: ObservationShape::Scalar,
+                ordering_hint: Some(entry.index),
+                normalization: entry.normalization.clone(),
+                version: schema.version,
+                tags,
+            }
+        })
+        .collect()
+}
+
+fn rolling_metadata(
+    metric: RollingMarketMetric,
+    asset: Option<usize>,
+    window: usize,
+) -> (String, String, Vec<String>) {
+    let asset_tag = asset.map(|index| format!("asset_{index}"));
+    let (description, units, mut tags) = match metric {
+        RollingMarketMetric::RollingReturn => (
+            format!("close_t / close_(t-{window}) - 1 using point-in-time raw closes"),
+            "fraction".into(),
+            vec!["market".into(), "rolling".into(), "momentum".into()],
+        ),
+        RollingMarketMetric::RollingVolatility => (
+            format!("population standard deviation of {window} past simple daily returns"),
+            "daily_return_stddev".into(),
+            vec!["market".into(), "rolling".into(), "volatility".into()],
+        ),
+        RollingMarketMetric::PriceToSma => (
+            format!("close_t / past_only_sma_{window} - 1"),
+            "fraction".into(),
+            vec!["market".into(), "rolling".into(), "trend".into()],
+        ),
+        RollingMarketMetric::RelativeStrength => (
+            format!(
+                "asset rolling return minus cross-asset mean rolling return over {window} bars"
+            ),
+            "fraction".into(),
+            vec!["market".into(), "rolling".into(), "cross_sectional".into()],
+        ),
+        RollingMarketMetric::MarketMeanReturn => (
+            format!("mean rolling return across tradable assets over {window} bars"),
+            "fraction".into(),
+            vec!["market".into(), "rolling".into(), "summary".into()],
+        ),
+        RollingMarketMetric::MarketMeanVolatility => (
+            format!("mean rolling volatility across tradable assets over {window} bars"),
+            "daily_return_stddev".into(),
+            vec![
+                "market".into(),
+                "rolling".into(),
+                "summary".into(),
+                "volatility".into(),
+            ],
+        ),
+        RollingMarketMetric::MarketDispersion => (
+            format!(
+                "cross-asset population standard deviation of rolling returns over {window} bars"
+            ),
+            "fraction".into(),
+            vec![
+                "market".into(),
+                "rolling".into(),
+                "summary".into(),
+                "cross_sectional".into(),
+            ],
+        ),
+        RollingMarketMetric::MarketBreadth => (
+            format!("fraction of tradable assets with positive rolling return over {window} bars"),
+            "fraction".into(),
+            vec!["market".into(), "rolling".into(), "summary".into()],
+        ),
+    };
+    if let Some(asset_tag) = asset_tag {
+        tags.push(asset_tag);
+    }
+    (description, units, tags)
+}
+
 fn metadata_for_entries(
     schema: &ObservationSchema,
     provider: &str,
@@ -1358,7 +1955,8 @@ pub(crate) fn legacy_default_values(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::market::FeatureRow;
+    use crate::market::{FeatureRow, MarketBar, MarketDataset};
+    use chrono::Duration;
     use std::path::PathBuf;
 
     struct StaticProvider {
@@ -1428,6 +2026,62 @@ mod tests {
         }
     }
 
+    fn rolling_dataset(prices: &[Vec<f64>]) -> MarketDataset {
+        assert!(!prices.is_empty());
+        let asset_count = prices.len();
+        let steps = prices[0].len();
+        assert!(prices.iter().all(|series| series.len() == steps));
+        let start = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        let bars = prices
+            .iter()
+            .enumerate()
+            .flat_map(|(asset_index, series)| {
+                series
+                    .iter()
+                    .enumerate()
+                    .map(move |(step, close)| MarketBar {
+                        date: start + Duration::days(step as i64),
+                        asset_id: AssetId(asset_index as u64),
+                        open: *close,
+                        high: *close,
+                        low: *close,
+                        close: *close,
+                        adjusted_close: *close,
+                        volume: 1_000.0,
+                        tradable: true,
+                    })
+            })
+            .collect();
+        MarketDataset::from_test_bars(
+            (0..asset_count).map(|index| format!("A{index}")).collect(),
+            bars,
+        )
+    }
+
+    fn rolling_config() -> Config {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut config = Config::load(root.join("configs/test.toml")).unwrap();
+        config.observation.version = 3;
+        config
+            .observations
+            .providers
+            .push(ROLLING_MARKET_STATS_PROVIDER.into());
+        config.observations.rolling_market_stats.enabled = true;
+        config.observations.rolling_market_stats.return_windows = vec![2];
+        config.observations.rolling_market_stats.volatility_windows = vec![2];
+        config.observations.rolling_market_stats.sma_windows = vec![2];
+        config
+            .observations
+            .rolling_market_stats
+            .relative_strength_windows = vec![2];
+        config.observations.rolling_market_stats.market_summary = true;
+        config
+            .observations
+            .rolling_market_stats
+            .market_summary_window = 2;
+        config
+    }
+
     #[test]
     fn modular_default_builder_matches_prompt4_positional_vector() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -1470,6 +2124,327 @@ mod tests {
         )
         .unwrap();
         assert_eq!(builder.build(&context).unwrap().values, expected);
+    }
+
+    #[test]
+    fn rolling_market_stats_are_past_only_and_zero_fill_missing_history() {
+        let data = rolling_dataset(&[vec![100.0, 100.0, 110.0], vec![100.0, 100.0, 90.0]]);
+        let outputs = vec![
+            (
+                "rolling_return_2.A0".into(),
+                RollingOutput {
+                    metric: RollingMarketMetric::RollingReturn,
+                    asset_index: Some(0),
+                    window: 2,
+                },
+            ),
+            (
+                "rolling_volatility_2.A0".into(),
+                RollingOutput {
+                    metric: RollingMarketMetric::RollingVolatility,
+                    asset_index: Some(0),
+                    window: 2,
+                },
+            ),
+            (
+                "price_to_sma_2.A0".into(),
+                RollingOutput {
+                    metric: RollingMarketMetric::PriceToSma,
+                    asset_index: Some(0),
+                    window: 2,
+                },
+            ),
+            (
+                "relative_strength_2.A0".into(),
+                RollingOutput {
+                    metric: RollingMarketMetric::RelativeStrength,
+                    asset_index: Some(0),
+                    window: 2,
+                },
+            ),
+            (
+                "market_mean_return_2".into(),
+                RollingOutput {
+                    metric: RollingMarketMetric::MarketMeanReturn,
+                    asset_index: None,
+                    window: 2,
+                },
+            ),
+            (
+                "market_dispersion_2".into(),
+                RollingOutput {
+                    metric: RollingMarketMetric::MarketDispersion,
+                    asset_index: None,
+                    window: 2,
+                },
+            ),
+            (
+                "market_breadth_2".into(),
+                RollingOutput {
+                    metric: RollingMarketMetric::MarketBreadth,
+                    asset_index: None,
+                    window: 2,
+                },
+            ),
+        ];
+        let table = rolling_values_by_date(&data, &outputs, 2).unwrap();
+        let first = table.get(&data.dates[0]).unwrap();
+        assert_eq!(first, &vec![0.0; outputs.len()]);
+        let last = table.get(&data.dates[2]).unwrap();
+        assert!((last[0] - 0.1).abs() < 1e-12);
+        assert!((last[1] - 0.05).abs() < 1e-12);
+        assert!((last[2] - (110.0 / 105.0 - 1.0)).abs() < 1e-12);
+        assert!((last[3] - 0.1).abs() < 1e-12);
+        assert!(last[4].abs() < 1e-12);
+        assert!((last[5] - 0.1).abs() < 1e-12);
+        assert!((last[6] - 0.5).abs() < 1e-12);
+        assert!(last.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn rolling_market_stats_do_not_leak_future_prices() {
+        let baseline = rolling_dataset(&[
+            vec![100.0, 102.0, 104.0, 106.0, 108.0],
+            vec![100.0, 99.0, 98.0, 97.0, 96.0],
+        ]);
+        let outputs = vec![
+            (
+                "return".into(),
+                RollingOutput {
+                    metric: RollingMarketMetric::RollingReturn,
+                    asset_index: Some(0),
+                    window: 2,
+                },
+            ),
+            (
+                "relative".into(),
+                RollingOutput {
+                    metric: RollingMarketMetric::RelativeStrength,
+                    asset_index: Some(0),
+                    window: 2,
+                },
+            ),
+            (
+                "volatility".into(),
+                RollingOutput {
+                    metric: RollingMarketMetric::RollingVolatility,
+                    asset_index: Some(0),
+                    window: 2,
+                },
+            ),
+            (
+                "trend".into(),
+                RollingOutput {
+                    metric: RollingMarketMetric::PriceToSma,
+                    asset_index: Some(0),
+                    window: 2,
+                },
+            ),
+            (
+                "mean_return".into(),
+                RollingOutput {
+                    metric: RollingMarketMetric::MarketMeanReturn,
+                    asset_index: None,
+                    window: 2,
+                },
+            ),
+            (
+                "mean_volatility".into(),
+                RollingOutput {
+                    metric: RollingMarketMetric::MarketMeanVolatility,
+                    asset_index: None,
+                    window: 2,
+                },
+            ),
+            (
+                "dispersion".into(),
+                RollingOutput {
+                    metric: RollingMarketMetric::MarketDispersion,
+                    asset_index: None,
+                    window: 2,
+                },
+            ),
+            (
+                "breadth".into(),
+                RollingOutput {
+                    metric: RollingMarketMetric::MarketBreadth,
+                    asset_index: None,
+                    window: 2,
+                },
+            ),
+        ];
+        let target = baseline.dates[2];
+        let expected = rolling_values_by_date(&baseline, &outputs, 2)
+            .unwrap()
+            .get(&target)
+            .cloned()
+            .unwrap();
+        let mut changed = baseline.clone();
+        for bar in changed.bars.iter_mut().filter(|bar| bar.date > target) {
+            bar.close *= 100.0;
+            bar.adjusted_close = bar.close;
+        }
+        let actual = rolling_values_by_date(&changed, &outputs, 2)
+            .unwrap()
+            .get(&target)
+            .cloned()
+            .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn rolling_market_stats_exclude_untradable_assets_without_non_finite_values() {
+        let mut data = rolling_dataset(&[vec![100.0, 110.0, 121.0], vec![100.0, 90.0, 81.0]]);
+        let final_date = data.dates[2];
+        data.bars
+            .iter_mut()
+            .find(|bar| bar.date == final_date && bar.asset_id == AssetId(1))
+            .unwrap()
+            .tradable = false;
+        let outputs = vec![
+            (
+                "asset_return".into(),
+                RollingOutput {
+                    metric: RollingMarketMetric::RollingReturn,
+                    asset_index: Some(1),
+                    window: 2,
+                },
+            ),
+            (
+                "mean".into(),
+                RollingOutput {
+                    metric: RollingMarketMetric::MarketMeanReturn,
+                    asset_index: None,
+                    window: 2,
+                },
+            ),
+            (
+                "breadth".into(),
+                RollingOutput {
+                    metric: RollingMarketMetric::MarketBreadth,
+                    asset_index: None,
+                    window: 2,
+                },
+            ),
+        ];
+        let values = rolling_values_by_date(&data, &outputs, 2)
+            .unwrap()
+            .get(&final_date)
+            .cloned()
+            .unwrap();
+        assert_eq!(values[0], 0.0);
+        assert!((values[1] - 0.21).abs() < 1e-12);
+        assert_eq!(values[2], 1.0);
+        assert!(values.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn rolling_provider_is_opt_in_and_schema_identity_is_dimensioned() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let default_config = Config::load(root.join("configs/test.toml")).unwrap();
+        let default_schema = ObservationSchema::try_from_config(&default_config).unwrap();
+        let configured = rolling_config();
+        configured.validate().unwrap();
+        let schema = ObservationSchema::try_from_config(&configured).unwrap();
+        let assets = configured.market.assets.len();
+        let expected_added = assets * 4 + 4;
+        assert_eq!(
+            schema.dimension(assets),
+            default_schema.dimension(assets) + expected_added
+        );
+        assert_ne!(
+            schema.identity(assets).unwrap(),
+            default_schema.identity(assets).unwrap()
+        );
+        assert!(
+            schema
+                .entries
+                .iter()
+                .any(|entry| entry.name == "rolling_return_2.SPY")
+        );
+        assert!(
+            schema
+                .entries
+                .iter()
+                .any(|entry| entry.name == "market_breadth_2")
+        );
+        let serialized = serde_json::to_value(&default_config).unwrap();
+        assert!(
+            serialized["observations"]
+                .get("rolling_market_stats")
+                .is_none()
+        );
+
+        let mut invalid = configured.clone();
+        invalid.observations.rolling_market_stats.return_windows = vec![0];
+        assert!(invalid.validate().is_err());
+        let mut duplicate = configured;
+        duplicate.observations.rolling_market_stats.return_windows = vec![2, 2];
+        assert!(duplicate.validate().is_err());
+    }
+
+    #[test]
+    fn rolling_provider_compiles_schema_order_and_exposes_metadata() {
+        let mut config = rolling_config();
+        config.observations.normalizations.insert(
+            "rolling_return_2.SPY".into(),
+            ObservationNormalizationConfig {
+                kind: ObservationNormalizationKind::Percentage,
+                minimum: None,
+                maximum: None,
+                mean: None,
+                standard_deviation: None,
+                scale: Some(100.0),
+                offset: None,
+            },
+        );
+        let schema = ObservationSchema::try_from_config(&config).unwrap();
+        let data = rolling_dataset(&[
+            vec![100.0, 100.0, 110.0],
+            vec![100.0, 100.0, 90.0],
+            vec![100.0, 100.0, 100.0],
+        ]);
+        let builder =
+            SchemaObservationBuilder::from_config(schema.clone(), &config, Some(&data)).unwrap();
+        let market = FeatureRow {
+            date: data.dates[2],
+            values: vec![0.0; config.market.assets.len() * config.features.features.len()],
+            tradable: vec![true; config.market.assets.len()],
+        };
+        let portfolio = Portfolio::new(100.0, config.market.assets.len());
+        let prices = vec![Some(100.0); config.market.assets.len()];
+        let observation = builder
+            .build(&ObservationContext {
+                market: &market,
+                portfolio: &portfolio,
+                prices: &prices,
+                starting_net_worth: 100.0,
+                maximum_net_worth: 100.0,
+                age: 0,
+                episode_steps: 1,
+            })
+            .unwrap();
+        assert_eq!(
+            observation.values.len(),
+            schema.dimension(config.market.assets.len())
+        );
+        let index = schema
+            .entries
+            .iter()
+            .find(|entry| entry.name == "rolling_return_2.SPY")
+            .unwrap()
+            .index;
+        assert!((observation.values[index] - 10.0).abs() < 1e-6);
+        let metadata = builder
+            .registry()
+            .metadata_by_name("rolling_return_2.SPY")
+            .unwrap();
+        assert_eq!(metadata.provider, ROLLING_MARKET_STATS_PROVIDER);
+        assert!(metadata.tags.iter().any(|tag| tag == "momentum"));
+        assert_eq!(
+            metadata.normalization,
+            NormalizationRule::Percentage { scale: 100.0 }
+        );
     }
 
     #[test]

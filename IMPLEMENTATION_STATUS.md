@@ -1,5 +1,16 @@
 # Implementation Status
 
+## Prompt 6: first modular market senses
+
+Prompt 6 adds an opt-in `rolling_market_stats` observation provider without changing PPO, rewards, evolution, execution, the incremental-trade policy, or the Prompt 5 default schema. The provider precomputes immutable, point-in-time raw-close statistics by decision date and publishes named raw scalars through the existing registry/schema boundary.
+
+- Supported per-asset metrics are rolling simple returns (`5`, `20`, `60`, and `120` bars by default), population volatility of simple daily returns, price-to-SMA distance, and cross-sectional relative strength. Market summaries provide mean return, mean volatility, dispersion, and breadth across currently tradable assets. The configured schema controls selected windows and all normalisation; no scaling is hidden in the provider.
+- `zero_fill` is the implemented missing-history contract. Insufficient history and unavailable asset-specific values produce finite `0.0`; unavailable assets are excluded from cross-sectional summaries. Every calculation uses bars at or before close `t` and the split-safe `PointInTimeFeaturePriceSeries`; dividends and provider-adjusted prices are not folded into these inputs.
+- Default configuration serialisation omits the disabled provider settings, retaining the Prompt 5 v12 default configuration/schema identity. Enabling senses changes the explicit schema hash and architecture input dimension; default and rolling checkpoints therefore reject each other cleanly. The serialized checkpoint layout remains format 12.
+- `configs/prompt6/` contains frozen Prompt 3B/P4-derived default, momentum, volatility/trend, combined, and combined-plus-evolution schema conditions. `experiments/prompt6/generate_configs.sh` regenerates them mechanically from the frozen seed-41 bases.
+
+Rolling-provider unit and integration coverage now verifies default-vector preservation, formulas, deterministic zero fill, unavailable-asset handling, normalisation ownership, schema dimension/hash changes, future-price leakage, metadata, configuration validation, and default-versus-rolling checkpoint rejection. Controlled multi-seed provider ablation results are recorded in `reports/PROMPT6_MARKET_SENSES_EXPERIMENT.md`; they should be interpreted as research instrumentation, not market-performance evidence.
+
 ## Prompt 5: modular observation architecture
 
 Prompt 5 replaces the positional observation-builder implementation with a versioned registry of read-only sensor providers while preserving Prompt 4's default vector values and trading behaviour.

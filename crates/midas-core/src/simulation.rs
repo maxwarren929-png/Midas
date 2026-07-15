@@ -467,10 +467,10 @@ impl SimulationEngine {
         let features = pipeline.generate(&data, &dates)?;
         let observation_schema = ObservationSchema::from_config(&config);
         let schema_hash = observation_schema.identity(data.assets.len())?;
-        let observation_builder = SchemaObservationBuilder::new(
+        let observation_builder = SchemaObservationBuilder::from_config(
             observation_schema.clone(),
-            config.features.features.clone(),
-            data.assets.len(),
+            &config,
+            Some(&data),
         )?;
         let architecture = BrainArchitecture::from_config(
             &config.brain,
@@ -2269,10 +2269,10 @@ impl SimulationEngine {
                 "checkpoint split needs at least two trading dates".into(),
             ));
         }
-        let observation_builder = SchemaObservationBuilder::new(
+        let observation_builder = SchemaObservationBuilder::from_config(
             observation_schema.clone(),
-            config.features.features.clone(),
-            data.assets.len(),
+            &config,
+            Some(&data),
         )?;
         let birth = features[0].date;
         let agents = cp

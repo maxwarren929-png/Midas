@@ -248,11 +248,9 @@ fn observation_builder(
     let config = Config::load(path)?;
     let asset_count = config.market.assets.len();
     let schema = ObservationSchema::from_config(&config);
-    let builder = SchemaObservationBuilder::new(
-        schema.clone(),
-        config.features.features.clone(),
-        asset_count,
-    )?;
+    // Introspection needs only provider metadata; market-derived providers
+    // receive immutable data when a simulation constructs its builder.
+    let builder = SchemaObservationBuilder::from_config(schema.clone(), &config, None)?;
     Ok((asset_count, schema, builder))
 }
 

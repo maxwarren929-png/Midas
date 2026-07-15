@@ -360,6 +360,11 @@ pub struct ObservationRegistryConfig {
     pub providers: Vec<String>,
     #[serde(default)]
     pub normalizations: BTreeMap<String, ObservationNormalizationConfig>,
+    /// Optional past-only market sensors.  This field is omitted from the
+    /// configuration hash while disabled so unchanged Prompt 5 configurations
+    /// remain compatible with their v12 checkpoints.
+    #[serde(default, skip_serializing_if = "RollingMarketStatsConfig::is_default")]
+    pub rolling_market_stats: RollingMarketStatsConfig,
 }
 
 fn default_observation_schema_name() -> String {
@@ -376,7 +381,127 @@ impl Default for ObservationRegistryConfig {
             schema: default_observation_schema_name(),
             providers: default_observation_providers(),
             normalizations: BTreeMap::new(),
+            rolling_market_stats: RollingMarketStatsConfig::default(),
         }
+    }
+}
+
+/// How a rolling sensor represents an unavailable lookback. Prompt 6 supports
+/// zero fill only: it is deterministic, finite, and does not consume future
+/// bars. Future schemas may add validity-mask observations explicitly.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RollingMissingHistory {
+    #[default]
+    ZeroFill,
+}
+
+/// Opt-in configuration for the `rolling_market_stats` observation provider.
+/// Providers emit raw values; all scaling remains schema-owned.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RollingMarketStatsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_rolling_return_windows")]
+    pub return_windows: Vec<usize>,
+    #[serde(default = "default_rolling_volatility_windows")]
+    pub volatility_windows: Vec<usize>,
+    #[serde(default = "default_rolling_sma_windows")]
+    pub sma_windows: Vec<usize>,
+    #[serde(default = "default_rolling_relative_strength_windows")]
+    pub relative_strength_windows: Vec<usize>,
+    #[serde(default = "default_rolling_market_summary")]
+    pub market_summary: bool,
+    #[serde(default = "default_rolling_market_summary_window")]
+    pub market_summary_window: usize,
+    #[serde(default)]
+    pub minimum_history: RollingMissingHistory,
+}
+
+fn default_rolling_return_windows() -> Vec<usize> {
+    vec![5, 20, 60, 120]
+}
+
+fn default_rolling_volatility_windows() -> Vec<usize> {
+    vec![20, 60]
+}
+
+fn default_rolling_sma_windows() -> Vec<usize> {
+    vec![20, 60]
+}
+
+fn default_rolling_relative_strength_windows() -> Vec<usize> {
+    vec![20, 60]
+}
+
+fn default_rolling_market_summary() -> bool {
+    true
+}
+
+fn default_rolling_market_summary_window() -> usize {
+    20
+}
+
+impl Default for RollingMarketStatsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            return_windows: default_rolling_return_windows(),
+            volatility_windows: default_rolling_volatility_windows(),
+            sma_windows: default_rolling_sma_windows(),
+            relative_strength_windows: default_rolling_relative_strength_windows(),
+            market_summary: default_rolling_market_summary(),
+            market_summary_window: default_rolling_market_summary_window(),
+            minimum_history: RollingMissingHistory::ZeroFill,
+        }
+    }
+}
+
+impl RollingMarketStatsConfig {
+    pub fn is_default(config: &Self) -> bool {
+        config == &Self::default()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let groups = [
+            ("return_windows", &self.return_windows),
+            ("volatility_windows", &self.volatility_windows),
+            ("sma_windows", &self.sma_windows),
+            ("relative_strength_windows", &self.relative_strength_windows),
+        ];
+        let mut count = usize::from(self.market_summary);
+        for (name, windows) in groups {
+            if windows.contains(&0) {
+                return Err(MidasError::Config(format!(
+                    "observations.rolling_market_stats.{name} must contain positive windows"
+                )));
+            }
+            let unique = windows
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>();
+            if unique.len() != windows.len() {
+                return Err(MidasError::Config(format!(
+                    "observations.rolling_market_stats.{name} must not contain duplicate windows"
+                )));
+            }
+            count += windows.len();
+        }
+        if self.market_summary_window == 0 {
+            return Err(MidasError::Config(
+                "observations.rolling_market_stats.market_summary_window must be positive".into(),
+            ));
+        }
+        if count == 0 {
+            return Err(MidasError::Config(
+                "rolling_market_stats must enable at least one metric".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -996,6 +1121,7 @@ impl Config {
         for normalization in self.observations.normalizations.values() {
             normalization.validate()?;
         }
+        self.observations.rolling_market_stats.validate()?;
         let observation_schema = crate::observation::ObservationSchema::try_from_config(self)?;
         let used_observation_providers = observation_schema
             .entries

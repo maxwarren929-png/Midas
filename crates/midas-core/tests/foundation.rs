@@ -1010,6 +1010,47 @@ fn checkpoint_rejects_observation_schema_change() {
 }
 
 #[test]
+fn checkpoint_rejects_opt_in_rolling_observation_schema() {
+    let c = config();
+    let data = loaded(&c);
+    let mut engine =
+        SimulationEngine::new(c.clone(), data.clone(), DatasetSplit::Training).unwrap();
+    engine.run_steps(1).unwrap();
+    let file = tempfile::NamedTempFile::new().unwrap();
+    engine.save_checkpoint(file.path()).unwrap();
+
+    let mut changed = c;
+    changed.observation.version += 1;
+    changed
+        .observations
+        .providers
+        .push("rolling_market_stats".into());
+    changed.observations.rolling_market_stats.enabled = true;
+    changed.observations.rolling_market_stats.return_windows = vec![5];
+    changed
+        .observations
+        .rolling_market_stats
+        .volatility_windows
+        .clear();
+    changed
+        .observations
+        .rolling_market_stats
+        .sma_windows
+        .clear();
+    changed
+        .observations
+        .rolling_market_stats
+        .relative_strength_windows
+        .clear();
+    changed.observations.rolling_market_stats.market_summary = false;
+    let error = match SimulationEngine::resume(changed, data, file.path()) {
+        Ok(_) => panic!("rolling observation schema mismatch accepted"),
+        Err(e) => e,
+    };
+    assert!(error.to_string().contains("observation schema"));
+}
+
+#[test]
 fn checkpoint_rejects_brain_architecture_change() {
     let c = config();
     let data = loaded(&c);
