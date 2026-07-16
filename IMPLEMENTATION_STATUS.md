@@ -1,5 +1,24 @@
 # Implementation Status
 
+## Prompt 8A.0: configuration regression snapshots
+
+A permanent configuration-compatibility suite now records the exact compact
+JSON bytes and BLAKE3 hashes for the default, test, Prompt 6 combined-PPO, and
+Prompt 6 combined-PPO/evolution configurations. It also locks root field and
+`BTreeMap` order, `Option` encoding, default expansion, required sections,
+validation-error precedence and text, and the special omitted-versus-enabled
+`rolling_market_stats` representation.
+
+- A CLI manifest records the exact validation stdout and hash for every shipped
+  TOML under `configs/`; the integration test also requires empty stderr and an
+  exact match between the manifest and the files on disk.
+- The suite resumes and evaluates a tracked version-12 checkpoint, compares
+  exact report JSON, proves explicit re-saving is byte-identical, and verifies
+  that the source checkpoint is never modified.
+- These tests are the compatibility boundary for the planned Prompt 8
+  configuration architecture work. No production configuration, simulation,
+  serialization, hash, CLI, or checkpoint behavior changed.
+
 ## Prompt 7B.7: final modular simulation facade
 
 The staged simulation refactor is complete. `simulation.rs` is now a thin

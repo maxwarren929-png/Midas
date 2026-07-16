@@ -1,5 +1,32 @@
 # Extending Midas
 
+## Configuration compatibility
+
+Configuration architecture changes must preserve the compact
+`serde_json::to_vec(Config)` bytes used by `Config::hash`, including struct
+field order, `BTreeMap` ordering, defaults, `Option` encoding, serde names, and
+the default `rolling_market_stats` omission. The regression snapshots under
+`crates/midas-core/tests/fixtures/config/` and the shipped-config hash manifest
+under `crates/midas-cli/tests/fixtures/` are fixed compatibility inputs, not
+auto-updating golden files. Update them only for an intentional configuration
+format or behavior change.
+
+Run `cargo test -p midas-core --test config_regression` for serialization,
+validation, rolling, and version-12 checkpoint/report compatibility. The CLI
+integration test validates every TOML under `configs/`, requires exact stdout
+and empty stderr, and fails when a config is added without a recorded hash. To
+exercise one release build rather than Cargo's test binary, build once and run:
+
+```bash
+cargo build --release -p midas-cli
+MIDAS_CONFIG_REGRESSION_BIN=target/release/midas-cli \
+  cargo test -p midas-cli --test config_regression
+```
+
+These tests exist so configuration modules can be moved mechanically without
+silently changing hashes, defaults, validation precedence, checkpoint
+acceptance, CLI output, or deterministic reports.
+
 ## Market data and corporate actions
 
 Implement `MarketDataSource` and construct `MarketDataset` through validated constructors. Provider-adjusted history is not accepted as point-in-time data. Raw opens/closes are used for execution and valuation. `FeaturePriceSeries` may apply only split ratios known on or before the requested date; cash dividends remain explicit cash events. New corporate actions belong in the canonical `CorporateAction` enum and need an explicit timeline rule, portfolio accounting test, and future-safety test. The current timeline applies events at the start of the next-open execution date, before planning; same-day splits are ordered before dividends.
