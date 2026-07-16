@@ -116,6 +116,17 @@ and trace timing, transaction semantics, deterministic replay, public
 replacement, checkpoint/evaluation, and reporting implementation remains in
 `simulation.rs` for later staged splits.
 
+Prompt 7B.6 moved bootstrap evaluation, transition and rollout recording,
+eligibility/masking, episode completion, PPO update application, learning
+events, and PPO traces into private `simulation/learning_bridge.rs`. Completed
+life and fitness handling, replacement invocation, reproduction, genome and
+lineage bookkeeping, and evolution events now live in private
+`simulation/death_replacement.rs`. Generic learning, evolution, and
+replacement algorithms remain in their original modules. PPO, death,
+replacement, RNG, event, and trace ordering are unchanged, as are the public
+API, deterministic replay, and checkpoint format 12. Checkpoint/evaluation and
+reporting remain in `simulation.rs` for Prompt 7B.7.
+
 `DomainEvent` is deterministic and checkpointed. `OperationalEvent` records effects such as successful checkpoint writes and is not part of simulation equivalence. `SimulationLifecycle` makes completion idempotent. Checkpoint format 12 records the modular observation-schema identity alongside backend identity, the bounded-impulse-Beta distribution identity, separated neural/runtime/optimizer state, full actor/critic head momentum, unfinished masked rollouts with latent impulse samples, deterministic learning state, evolution registries, life records, IDs, impulse diagnostics, mutation diagnostics, and a persistent failed lifecycle. Format 11 and formats 6 through 10 are rejected because their positional observation, metrics, optimizer/rollout, or action-distribution layouts cannot be migrated safely; format or schema changes require a version bump and explicit rejection of incompatible files. Policy failures emit diagnostics, count per agent, and follow `policy_failures.behavior` after configured consecutive/total limits.
 
 Every simulation step is a transaction. The engine forks mutable policy/neural state, buffers domain events, and commits agents, replacement state, counters, metrics, and `next_step` only after the complete close-to-next-open path succeeds. A `StopExperiment` limit discards that transaction and enters `SimulationLifecycle::Failed { reason }`; it does not apply corporate actions, trades, costs, valuation, aging, or automatic checkpoint writes. Repeated calls after failure return the stored reason without mutation. The failure event is diagnostic metadata; the checkpoint boundary remains the previous committed step. Completed runs are likewise idempotent.

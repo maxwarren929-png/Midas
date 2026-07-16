@@ -1,5 +1,22 @@
 # Implementation Status
 
+## Prompt 7B.6: simulation learning and death/replacement split
+
+The simulation-to-learning integration now lives in private
+`simulation/learning_bridge.rs`, including bootstrap value estimation,
+transition recording, eligibility and masking, episode completion, PPO update
+application, learning events, and PPO traces. Private
+`simulation/death_replacement.rs` now owns completed-life and fitness handling,
+replacement invocation, reproduction, genome/lineage bookkeeping, and related
+evolution events.
+
+- Generic learning, evolution, and replacement algorithms remain in their
+  existing modules; these child modules contain only simulation integration.
+- PPO timing and contents, death/replacement ordering, RNG and event/trace
+  ordering, deterministic replay, public APIs, and checkpoint format 12 are
+  unchanged. Checkpoint/resume, frozen evaluation, and report construction
+  remain in `simulation.rs` for Prompt 7B.7.
+
 ## Prompt 7B.5: simulation decision and economic advance split
 
 The daily policy-decision pipeline now lives in private
