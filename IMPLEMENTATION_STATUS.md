@@ -1,5 +1,20 @@
 # Implementation Status
 
+## Prompt 7B.5: simulation decision and economic advance split
+
+The daily policy-decision pipeline now lives in private
+`simulation/decision.rs`, including observation and policy evaluation, action
+validation, policy-failure handling, fallback behavior, daily agent dispatch,
+and committed decision-trace construction. Private `simulation/advance.rs` now
+owns the unchanged economic advancement path: corporate actions, execution,
+valuation, survival costs, drawdown, rewards, and trade summaries.
+
+- The close-to-next-open order, event and trace timing, transaction boundary,
+  reward and execution semantics, and deterministic replay are unchanged.
+- Learning/PPO integration, death and replacement handling, checkpoint and
+  evaluation methods, and report construction remain in `simulation.rs`.
+  Public APIs and checkpoint format 12 are unchanged.
+
 ## Prompt 7B.4: simulation runner and transaction split
 
 The simulation lifecycle runner now lives in private `simulation/runner.rs`,
