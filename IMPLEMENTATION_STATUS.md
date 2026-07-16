@@ -1,5 +1,20 @@
 # Implementation Status
 
+## Prompt 8A.2: high-coupling configuration facade split
+
+Stage 2 of the mechanical configuration modularization is complete. Brain,
+observation, evolution, replacement, and date/split DTOs, defaults, and local
+helpers now live in private child modules under `config/`. Together with Stage
+1, every domain configuration DTO is now owned by a child module while
+`config.rs` preserves all established public re-exports.
+
+- Root `Config` field order, loading, compact-JSON hashing, and the complete
+  ordered validation body remain in `config.rs`.
+- Configuration serialization and hashes, rolling-default omission, validation
+  precedence and text, public `midas_core::config::*` imports, and checkpoint
+  format 12 are unchanged. Dependency-direction cleanup between configuration,
+  brain, and observation has intentionally not been performed yet.
+
 ## Prompt 8A.1: low-risk configuration facade split
 
 Stage 1 of the configuration modularization is complete. Backend, checkpoint,

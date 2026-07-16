@@ -36,6 +36,16 @@ higher-coupling brain, observation, evolution, and replacement configuration,
 remain in `config.rs`. This movement does not change serialized configuration,
 hashes, validation behavior, or checkpoint format 12.
 
+The second mechanical split moves the remaining brain, observation, evolution,
+replacement, and date/split DTOs into private domain modules. All configuration
+DTOs are therefore modular, while `config.rs` still owns root deserialization,
+loading, compact-JSON hashing, and the unchanged ordered cross-domain
+validation flow. Facade re-exports preserve `midas_core::config::*`; dependency
+direction between configuration, brain, and observation remains unchanged for
+the later dedicated cleanup. Serialization, hashes, validation precedence and
+text, rolling-default omission, and checkpoint format 12 remain compatibility
+constraints.
+
 ## Market data and corporate actions
 
 Implement `MarketDataSource` and construct `MarketDataset` through validated constructors. Provider-adjusted history is not accepted as point-in-time data. Raw opens/closes are used for execution and valuation. `FeaturePriceSeries` may apply only split ratios known on or before the requested date; cash dividends remain explicit cash events. New corporate actions belong in the canonical `CorporateAction` enum and need an explicit timeline rule, portfolio accounting test, and future-safety test. The current timeline applies events at the start of the next-open execution date, before planning; same-day splits are ordered before dividends.
