@@ -4,12 +4,16 @@ mod checkpoint;
 mod diagnostics;
 mod engine;
 mod events;
+mod runner;
+mod transaction;
 mod types;
 
 pub use diagnostics::{DecisionTrace, PpoUpdateTrace, ReportTrace};
 pub use engine::SimulationEngine;
 pub use events::{DomainEvent, OperationalEvent};
 pub use types::{CHECKPOINT_VERSION, DatasetSplit, DeathCause, SimulationLifecycle};
+
+use transaction::{StepAbort, StepTransaction};
 
 use crate::{
     AgentId, AssetId, MidasError, Result,
@@ -26,7 +30,7 @@ use crate::{
     market::{
         BackwardFeaturePipeline, CorporateAction, FeaturePipeline, FeatureRow, MarketDataset,
     },
-    metrics::{AllocationStats, EventSink, MetricsCollector},
+    metrics::{EventSink, MetricsCollector},
     observation::{ObservationContext, ObservationSchema, SchemaObservationBuilder},
     replacement::{
         LivingAgentSummary, NonEvolutionaryRandomGenomeReplacement, ReplacementContext,
@@ -38,15 +42,6 @@ use chrono::NaiveDate;
 use serde::Serialize;
 use std::path::Path;
 
-struct StepTransaction {
-    agents: Vec<Agent>,
-    next_agent_id: u64,
-    events: Vec<DomainEvent>,
-    replacement: Option<Box<dyn ReplacementStrategy>>,
-    evolution: EvolutionState,
-    allocation_stats: AllocationStats,
-    traces: Vec<ReportTrace>,
-}
 struct TradeSummary {
     transaction_cost: f64,
     commission_cost: f64,
@@ -144,247 +139,7 @@ fn dense_parameter_delta(
         .sum::<f64>()
         .sqrt()
 }
-enum StepAbort {
-    Error(MidasError),
-    FatalExperiment { event: DomainEvent, reason: String },
-}
-impl From<MidasError> for StepAbort {
-    fn from(error: MidasError) -> Self {
-        Self::Error(error)
-    }
-}
 impl SimulationEngine {
-    fn lifecycle_error(reason: &str) -> MidasError {
-        if let Some(message) = reason.strip_prefix("configuration error: ") {
-            MidasError::Config(message.into())
-        } else if let Some(message) = reason.strip_prefix("market data error: ") {
-            MidasError::Data(message.into())
-        } else if let Some(message) = reason.strip_prefix("accounting invariant failed: ") {
-            MidasError::Accounting(message.into())
-        } else if let Some(message) = reason.strip_prefix("policy error: ") {
-            MidasError::Policy(message.into())
-        } else if let Some(message) = reason.strip_prefix("checkpoint error: ") {
-            MidasError::Checkpoint(message.into())
-        } else {
-            MidasError::Policy(reason.into())
-        }
-    }
-
-    pub fn run(&mut self) -> Result<SimulationReport> {
-        match &self.lifecycle {
-            SimulationLifecycle::Completed => return Ok(self.report()),
-            SimulationLifecycle::Failed { reason } => {
-                return Err(Self::lifecycle_error(reason));
-            }
-            SimulationLifecycle::Initialized | SimulationLifecycle::Running => {}
-        }
-        self.lifecycle = SimulationLifecycle::Running;
-        while self.next_step + 1 < self.features.len() {
-            self.step()?;
-        }
-        if let Err(error) = self.flush_learning() {
-            self.lifecycle = SimulationLifecycle::Failed {
-                reason: error.to_string(),
-            };
-            return Err(error);
-        }
-        self.lifecycle = SimulationLifecycle::Completed;
-        let date = self.features.last().expect("validated features").date;
-        self.emit(DomainEvent::TimelineCompleted { date });
-        Ok(self.report())
-    }
-    pub fn run_steps(&mut self, count: usize) -> Result<()> {
-        match &self.lifecycle {
-            SimulationLifecycle::Completed => return Ok(()),
-            SimulationLifecycle::Failed { reason } => {
-                return Err(Self::lifecycle_error(reason));
-            }
-            SimulationLifecycle::Initialized | SimulationLifecycle::Running => {}
-        }
-        self.lifecycle = SimulationLifecycle::Running;
-        for _ in 0..count {
-            if self.next_step + 1 >= self.features.len() {
-                break;
-            }
-            self.step()?;
-        }
-        Ok(())
-    }
-    fn step(&mut self) -> Result<()> {
-        let agents = match self.fork_agents() {
-            Ok(agents) => agents,
-            Err(error) => {
-                let reason = error.to_string();
-                self.lifecycle = SimulationLifecycle::Failed {
-                    reason: reason.clone(),
-                };
-                return Err(error);
-            }
-        };
-        let transaction = StepTransaction {
-            agents,
-            next_agent_id: self.next_agent_id,
-            events: Vec::new(),
-            replacement: None,
-            evolution: self.evolution.clone(),
-            allocation_stats: AllocationStats::default(),
-            traces: Vec::new(),
-        };
-        let mut transaction = transaction;
-        match self.execute_step(&mut transaction) {
-            Ok(()) => match self.commit_step(transaction) {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    self.lifecycle = SimulationLifecycle::Failed {
-                        reason: error.to_string(),
-                    };
-                    Err(error)
-                }
-            },
-            Err(StepAbort::Error(error)) => {
-                let reason = error.to_string();
-                self.lifecycle = SimulationLifecycle::Failed {
-                    reason: reason.clone(),
-                };
-                Err(error)
-            }
-            Err(StepAbort::FatalExperiment { event, reason }) => {
-                self.emit(event);
-                self.lifecycle = SimulationLifecycle::Failed {
-                    reason: reason.clone(),
-                };
-                Err(MidasError::Policy(reason))
-            }
-        }
-    }
-
-    fn flush_learning(&mut self) -> Result<()> {
-        let mut agents = self.fork_agents()?;
-        let mut events = Vec::new();
-        let mut traces = Vec::new();
-        let date = self.features.last().expect("validated features").date;
-        for agent in &mut agents {
-            if agent.state.alive {
-                self.finish_learning_episode(
-                    agent,
-                    date,
-                    agent.state.portfolio.net_worth,
-                    true,
-                    &mut events,
-                    &mut traces,
-                )?;
-            }
-        }
-        self.agents = agents;
-        for event in events {
-            self.emit(event);
-        }
-        self.report_traces.extend(traces);
-        Ok(())
-    }
-
-    fn fork_agents(&self) -> Result<Vec<Agent>> {
-        self.agents
-            .iter()
-            .map(|agent| match agent.fork() {
-                Ok(forked) => Ok(forked),
-                Err(fork_error) => {
-                    let snapshot = agent.policy.snapshot().map_err(|restore_error| {
-                        MidasError::Policy(format!(
-                            "transactional policy fork failed: {fork_error}; snapshot failed: {restore_error}"
-                        ))
-                    })?;
-                    let learning = agent.learning_snapshot()?;
-                    let mut restored = self.factory
-                        .restore(
-                            agent.state.clone(),
-                            snapshot,
-                            &AgentBuildContext {
-                                agent_id: agent.state.id,
-                                birth_date: agent.state.birth_date,
-                                config: &self.config,
-                                architecture: &self.architecture,
-                                compute_device: &self.compute_device,
-                            },
-                        )
-                        .map_err(|restore_error| {
-                            MidasError::Policy(format!(
-                                "transactional policy fork failed: {fork_error}; restore failed: {restore_error}"
-                            ))
-                        })?;
-                    restored.restore_learning(learning)?;
-                    Ok(restored)
-                }
-            })
-            .collect()
-    }
-
-    fn commit_step(&mut self, transaction: StepTransaction) -> Result<()> {
-        let checkpoint_due = self.config.checkpoint.every_steps > 0
-            && (self.next_step + 1).is_multiple_of(self.config.checkpoint.every_steps);
-        let checkpoint_path = self.config.checkpoint.path.clone();
-        if checkpoint_due {
-            let mut candidate_metrics = self.metrics.clone();
-            for event in &transaction.events {
-                candidate_metrics.on_event(event);
-            }
-            candidate_metrics.record_neural_allocations(&transaction.allocation_stats);
-            let mut candidate_events = self.domain_events.clone();
-            candidate_events.extend(transaction.events.clone());
-            let checkpoint = checkpoint::from_state(
-                &self.config,
-                &self.data,
-                &self.observation_schema,
-                &self.architecture,
-                self.split,
-                &self.features,
-                &self.compute_device,
-                self.next_step + 1,
-                transaction.next_agent_id,
-                &transaction.agents,
-                candidate_metrics,
-                candidate_events,
-                transaction.evolution.clone(),
-                self.lifecycle.clone(),
-            )?;
-            checkpoint::write(&checkpoint_path, &checkpoint)?;
-        }
-        let StepTransaction {
-            agents,
-            next_agent_id,
-            events,
-            replacement,
-            evolution,
-            allocation_stats,
-            traces,
-        } = transaction;
-        self.agents = agents;
-        self.next_agent_id = next_agent_id;
-        self.evolution = evolution;
-        self.metrics.record_neural_allocations(&allocation_stats);
-        self.report_traces.extend(traces);
-        if let Some(replacement) = replacement {
-            self.replacement = replacement;
-        }
-        for event in events {
-            self.emit(event);
-        }
-        self.next_step += 1;
-        if checkpoint_due {
-            let date = self
-                .features
-                .get(self.next_step)
-                .map(|f| f.date)
-                .unwrap_or_else(|| self.features.last().expect("features").date);
-            self.operational_events
-                .push(OperationalEvent::CheckpointSaved {
-                    date,
-                    path: checkpoint_path,
-                });
-        }
-        Ok(())
-    }
-
     fn execute_step(
         &mut self,
         transaction: &mut StepTransaction,

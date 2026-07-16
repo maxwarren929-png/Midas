@@ -1,5 +1,21 @@
 # Implementation Status
 
+## Prompt 7B.4: simulation runner and transaction split
+
+The simulation lifecycle runner now lives in private `simulation/runner.rs`,
+including `run`, `run_steps`, step dispatch, failure transitions, and final
+learning flush. Private `simulation/transaction.rs` now owns the step
+transaction buffer, abort type, agent-state fork, authoritative commit, and
+rollback-by-discard boundary.
+
+- Automatic checkpoints are still built and written from the completed
+  transaction candidate before authoritative state mutation; agent, evolution,
+  metrics, events, traces, and `next_step` then commit in the original order,
+  followed by the operational checkpoint event.
+- Daily policy decisions, economic advancement, learning, death, replacement,
+  checkpoint public methods, frozen evaluation, and reporting remain in
+  `simulation.rs`. Public APIs and checkpoint format 12 are unchanged.
+
 ## Prompt 7B.3: simulation engine shell split
 
 The stable `SimulationEngine` state, founder-population construction, public

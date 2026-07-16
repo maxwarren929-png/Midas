@@ -96,6 +96,16 @@ step orchestration, transactions, checkpoint and evaluation methods, learning,
 replacement lifecycle, and report construction remain in `simulation.rs`.
 This shell split does not change checkpoint format 12 or any simulation order.
 
+Prompt 7B.4 moved lifecycle and loop control into private
+`simulation/runner.rs`, and moved the step transaction buffer, agent fork,
+abort state, commit, and rollback-by-discard boundary into private
+`simulation/transaction.rs`. Automatic checkpoint candidates are still written
+before authoritative mutation; transaction state then commits in the original
+order, `next_step` advances, and only then is the operational checkpoint event
+appended. Daily decision and economic logic remains in `simulation.rs`.
+`SimulationEngine::run` and `run_steps` remain available through the existing
+facade, and checkpoint format remains 12.
+
 `DomainEvent` is deterministic and checkpointed. `OperationalEvent` records effects such as successful checkpoint writes and is not part of simulation equivalence. `SimulationLifecycle` makes completion idempotent. Checkpoint format 12 records the modular observation-schema identity alongside backend identity, the bounded-impulse-Beta distribution identity, separated neural/runtime/optimizer state, full actor/critic head momentum, unfinished masked rollouts with latent impulse samples, deterministic learning state, evolution registries, life records, IDs, impulse diagnostics, mutation diagnostics, and a persistent failed lifecycle. Format 11 and formats 6 through 10 are rejected because their positional observation, metrics, optimizer/rollout, or action-distribution layouts cannot be migrated safely; format or schema changes require a version bump and explicit rejection of incompatible files. Policy failures emit diagnostics, count per agent, and follow `policy_failures.behavior` after configured consecutive/total limits.
 
 Every simulation step is a transaction. The engine forks mutable policy/neural state, buffers domain events, and commits agents, replacement state, counters, metrics, and `next_step` only after the complete close-to-next-open path succeeds. A `StopExperiment` limit discards that transaction and enters `SimulationLifecycle::Failed { reason }`; it does not apply corporate actions, trades, costs, valuation, aging, or automatic checkpoint writes. Repeated calls after failure return the stored reason without mutation. The failure event is diagnostic metadata; the checkpoint boundary remains the previous committed step. Completed runs are likewise idempotent.
