@@ -3,6 +3,25 @@ use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs, path::Path};
 
+mod backend;
+mod checkpoint;
+mod execution;
+mod learning;
+mod market;
+mod reward;
+mod simulation;
+
+pub use backend::{BackendConfig, BackendKind};
+pub use checkpoint::CheckpointConfig;
+pub use execution::ExecutionConfig;
+pub use learning::{LearningConfig, LearningKind};
+pub use market::{
+    CorporateActionConfig, CorporateActionMode, DataConfig, DataFormat, FeatureConfig, FeatureKind,
+    MarketConfig,
+};
+pub use reward::{RewardConfig, RewardKind};
+pub use simulation::{DeathHandling, PolicyFailureBehavior, PolicyFailureConfig, SimulationConfig};
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -34,31 +53,6 @@ pub struct Config {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct MarketConfig {
-    pub assets: Vec<String>,
-    pub benchmark_asset: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DataConfig {
-    pub path: String,
-    #[serde(default)]
-    pub format: DataFormat,
-    #[serde(default)]
-    pub corporate_actions_path: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DataFormat {
-    #[default]
-    Csv,
-    Parquet,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct DateRange {
     pub start: NaiveDate,
     pub end: NaiveDate,
@@ -70,53 +64,6 @@ pub struct SplitConfig {
     pub training: DateRange,
     pub validation: DateRange,
     pub test: DateRange,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SimulationConfig {
-    pub population_size: usize,
-    pub starting_cash: f64,
-    pub bankruptcy_threshold: f64,
-    pub daily_survival_cost: f64,
-    pub minimum_trade_value: f64,
-    pub seed: u64,
-    #[serde(default)]
-    pub forced_liquidation: bool,
-    #[serde(default)]
-    pub death_handling: DeathHandling,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExecutionConfig {
-    pub commission_fixed: f64,
-    pub commission_rate: f64,
-    pub spread_rate: f64,
-    pub slippage_rate: f64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FeatureConfig {
-    pub schema_version: u32,
-    pub features: Vec<FeatureKind>,
-    pub clip: f64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FeatureKind {
-    Return1,
-    Return5,
-    Return20,
-    PriceToMa20,
-    PriceToMa50,
-    Volatility20,
-    VolumeChange,
-    VolumeToMa20,
-    DistanceHigh20,
-    Tradable,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -236,15 +183,6 @@ impl Default for TradingConfig {
             maximum_trade_fraction: default_maximum_trade_fraction(),
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DeathHandling {
-    #[default]
-    Replace,
-    LeaveVacant,
-    EndAgentOnly,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -582,143 +520,6 @@ impl ObservationNormalizationConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CorporateActionMode {
-    #[default]
-    Reject,
-    ExplicitEvents,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CorporateActionConfig {
-    pub mode: CorporateActionMode,
-    pub discontinuity_threshold: f64,
-    pub adjusted_price_tolerance: f64,
-}
-
-impl Default for CorporateActionConfig {
-    fn default() -> Self {
-        Self {
-            mode: CorporateActionMode::Reject,
-            discontinuity_threshold: 0.35,
-            adjusted_price_tolerance: 1e-6,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PolicyFailureBehavior {
-    Continue,
-    #[default]
-    KillAgent,
-    StopExperiment,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PolicyFailureConfig {
-    pub maximum_consecutive: u32,
-    pub maximum_total: u32,
-    pub behavior: PolicyFailureBehavior,
-}
-impl Default for PolicyFailureConfig {
-    fn default() -> Self {
-        Self {
-            maximum_consecutive: 3,
-            maximum_total: 20,
-            behavior: PolicyFailureBehavior::KillAgent,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct LearningConfig {
-    pub implementation: LearningKind,
-    pub learning_rate: f32,
-    pub gamma: f32,
-    pub gae_lambda: f32,
-    pub ppo_clip: f32,
-    pub critic_coefficient: f32,
-    pub entropy_coefficient: f32,
-    pub gradient_clip: f32,
-    pub rollout_length: usize,
-    #[serde(default = "default_minibatch_size")]
-    pub minibatch_size: usize,
-    #[serde(default = "default_sequence_length")]
-    pub sequence_length: usize,
-    #[serde(default = "default_true")]
-    pub normalize_advantages: bool,
-    pub optimisation_epochs: usize,
-}
-
-fn default_minibatch_size() -> usize {
-    32
-}
-fn default_sequence_length() -> usize {
-    16
-}
-fn default_true() -> bool {
-    true
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LearningKind {
-    NoLearning,
-    Ppo,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RewardConfig {
-    #[serde(default)]
-    pub kind: RewardKind,
-    #[serde(default)]
-    pub drawdown_penalty_weight: f32,
-    #[serde(default)]
-    pub turnover_penalty_weight: f32,
-    #[serde(default)]
-    pub invalid_action_penalty: f32,
-    #[serde(default = "default_bankruptcy_penalty")]
-    pub bankruptcy_penalty: f32,
-    #[serde(default = "default_reward_clip_min")]
-    pub clip_min: f32,
-    #[serde(default = "default_reward_clip_max")]
-    pub clip_max: f32,
-}
-fn default_bankruptcy_penalty() -> f32 {
-    1.0
-}
-fn default_reward_clip_min() -> f32 {
-    -5.0
-}
-fn default_reward_clip_max() -> f32 {
-    5.0
-}
-impl Default for RewardConfig {
-    fn default() -> Self {
-        Self {
-            kind: RewardKind::LogReturn,
-            drawdown_penalty_weight: 0.0,
-            turnover_penalty_weight: 0.0,
-            invalid_action_penalty: 0.05,
-            bankruptcy_penalty: 1.0,
-            clip_min: -5.0,
-            clip_max: 5.0,
-        }
-    }
-}
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RewardKind {
-    #[default]
-    LogReturn,
-    RiskAdjustedReturn,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvolutionConfig {
@@ -925,37 +726,6 @@ impl Default for EvolutionFitnessConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct BackendConfig {
-    pub kind: BackendKind,
-    pub device: String,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BackendKind {
-    #[serde(alias = "cpu")]
-    Cpu,
-}
-
-impl BackendConfig {
-    pub fn compute_device(&self) -> Result<crate::brain::ComputeDevice> {
-        if self.device.trim().is_empty() {
-            return Err(MidasError::Config(
-                "backend.device must not be empty".into(),
-            ));
-        }
-        let device = match self.kind {
-            BackendKind::Cpu => crate::brain::ComputeDevice::CpuNdArray {
-                device: self.device.clone(),
-            },
-        };
-        device.validate()?;
-        Ok(device)
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ReplacementConfig {
     pub strategy: ReplacementKind,
 }
@@ -964,21 +734,6 @@ pub struct ReplacementConfig {
 #[serde(rename_all = "snake_case")]
 pub enum ReplacementKind {
     NonEvolutionaryRandomGenome,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CheckpointConfig {
-    pub path: String,
-    pub every_steps: usize,
-}
-impl Default for CheckpointConfig {
-    fn default() -> Self {
-        Self {
-            path: "checkpoints/latest.bin".into(),
-            every_steps: 0,
-        }
-    }
 }
 
 impl Config {

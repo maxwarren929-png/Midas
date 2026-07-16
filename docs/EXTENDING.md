@@ -27,6 +27,15 @@ These tests exist so configuration modules can be moved mechanically without
 silently changing hashes, defaults, validation precedence, checkpoint
 acceptance, CLI output, or deterministic reports.
 
+The first mechanical split keeps `config.rs` as the public compatibility
+facade. Private modules under `config/` own backend, checkpoint, execution,
+learning, market, reward, and simulation DTOs and their unchanged defaults and
+local helpers; the facade re-exports every established public type. Root
+loading, hashing, validation, and cross-domain coordination, plus the
+higher-coupling brain, observation, evolution, and replacement configuration,
+remain in `config.rs`. This movement does not change serialized configuration,
+hashes, validation behavior, or checkpoint format 12.
+
 ## Market data and corporate actions
 
 Implement `MarketDataSource` and construct `MarketDataset` through validated constructors. Provider-adjusted history is not accepted as point-in-time data. Raw opens/closes are used for execution and valuation. `FeaturePriceSeries` may apply only split ratios known on or before the requested date; cash dividends remain explicit cash events. New corporate actions belong in the canonical `CorporateAction` enum and need an explicit timeline rule, portfolio accounting test, and future-safety test. The current timeline applies events at the start of the next-open execution date, before planning; same-day splits are ordered before dividends.

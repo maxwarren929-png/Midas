@@ -1,5 +1,20 @@
 # Implementation Status
 
+## Prompt 8A.1: low-risk configuration facade split
+
+Stage 1 of the configuration modularization is complete. Backend, checkpoint,
+execution, learning, market, reward, and simulation configuration DTOs,
+defaults, and local helpers now live in private child modules under `config/`.
+`config.rs` publicly re-exports the established types, so existing
+`midas_core::config::*` imports remain valid.
+
+- Root `Config` loading, hashing, validation, and cross-domain coordination are
+  unchanged and remain in `config.rs`.
+- Brain, observation, evolution, replacement, date, and split configuration
+  remain in the facade for the later high-coupling stage. Serialization,
+  defaults, validation behavior, configuration hashes, and checkpoint format 12
+  are unchanged.
+
 ## Prompt 8A.0: configuration regression snapshots
 
 A permanent configuration-compatibility suite now records the exact compact
