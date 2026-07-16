@@ -1,5 +1,21 @@
 # Implementation Status
 
+## Prompt 7B.3: simulation engine shell split
+
+The stable `SimulationEngine` state, founder-population construction, public
+inspection methods, event-sink and replacement hooks, event emission, and
+read-only valuation-price lookup now live in the private
+`simulation/engine.rs` module. The compatibility facade still re-exports the
+type as `midas_core::simulation::SimulationEngine`, including its existing
+public metrics and event/trace fields.
+
+- The run loop, daily-step orchestration, transactions, learning, replacement,
+  checkpoint public methods, frozen evaluation, and report construction remain
+  in `simulation.rs` for later staged splits.
+- Checkpoint format remains 12. Founder seeds and ordering, schema and
+  architecture identities, event timing, checkpoint bytes, deterministic
+  replay, and all public method signatures are unchanged.
+
 ## Prompt 7B.2: private simulation checkpoint module
 
 The staged `midas_core::simulation` split now keeps its checkpoint envelope,
