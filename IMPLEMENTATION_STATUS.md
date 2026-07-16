@@ -1,5 +1,21 @@
 # Implementation Status
 
+## Prompt 7B.7: final modular simulation facade
+
+The staged simulation refactor is complete. `simulation.rs` is now a thin
+compatibility facade that declares private implementation modules and
+re-exports the established public engine, report, event, trace, lifecycle, and
+checkpoint-version contracts.
+
+- Frozen checkpoint evaluation and evaluation-only reset/setup now live in
+  private `simulation/evaluation.rs`. Report construction and the unchanged
+  serialized `SimulationReport` contract now live in private
+  `simulation/report.rs`.
+- Public checkpoint save/resume methods now sit with the existing private
+  checkpoint envelope and compatibility helpers in `simulation/checkpoint.rs`.
+  Public APIs, report bytes, deterministic replay, and checkpoint format 12
+  remain unchanged.
+
 ## Prompt 7B.6: simulation learning and death/replacement split
 
 The simulation-to-learning integration now lives in private
