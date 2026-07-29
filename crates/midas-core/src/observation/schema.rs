@@ -1,14 +1,17 @@
 use crate::{
     Result,
     config::{
-        Config, FeatureKind, ObservationFeatureKind, ObservationNormalizationConfig,
+        FeatureKind, ObservationFeatureKind, ObservationNormalizationConfig,
         RollingMarketStatsConfig,
     },
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::normalization::{NormalizationRule, apply_override};
+use super::{
+    normalization::{NormalizationRule, apply_override},
+    options::ObservationSchemaOptions,
+};
 
 pub(crate) const MARKET_PROVIDER: &str = "market";
 pub(crate) const PORTFOLIO_PROVIDER: &str = "portfolio";
@@ -116,22 +119,22 @@ pub struct ObservationSchema {
 }
 
 impl ObservationSchema {
-    pub fn from_config(config: &Config) -> Self {
-        Self::try_from_config(config).expect("configuration was validated before schema creation")
+    pub(crate) fn from_options(options: ObservationSchemaOptions<'_>) -> Self {
+        Self::try_from_options(options).expect("configuration was validated before schema creation")
     }
 
-    pub fn try_from_config(config: &Config) -> Result<Self> {
-        config.observations.rolling_market_stats.validate()?;
+    pub(crate) fn try_from_options(options: ObservationSchemaOptions<'_>) -> Result<Self> {
+        options.rolling_market_stats.validate()?;
         let mut features = Vec::new();
-        for configured in &config.observation.features {
+        for configured in options.observation_features {
             match configured {
                 ObservationFeatureKind::Market => {
-                    for feature in &config.features.features {
+                    for feature in options.market_features {
                         features.push(ObservationFeatureSpec::Market {
                             feature: *feature,
                             normalization: NormalizationRule::RatioClipped {
-                                minimum: -config.features.clip,
-                                maximum: config.features.clip,
+                                minimum: -options.market_clip,
+                                maximum: options.market_clip,
                             },
                         });
                     }
@@ -183,7 +186,7 @@ impl ObservationSchema {
                     feature,
                     normalization,
                 } => {
-                    for asset_index in 0..config.market.assets.len() {
+                    for asset_index in 0..options.assets.len() {
                         push_entry(
                             &mut entries,
                             market_name(*feature, asset_index),
@@ -194,7 +197,7 @@ impl ObservationSchema {
                             apply_override(
                                 normalization,
                                 &market_name(*feature, asset_index),
-                                &config.observations.normalizations,
+                                options.normalizations,
                             )?,
                         );
                     }
@@ -205,7 +208,7 @@ impl ObservationSchema {
                 } => match feature {
                     PortfolioFeatureSpec::AssetAllocation
                     | PortfolioFeatureSpec::UnrealizedReturn => {
-                        for asset_index in 0..config.market.assets.len() {
+                        for asset_index in 0..options.assets.len() {
                             let name = portfolio_asset_name(feature, asset_index);
                             push_entry(
                                 &mut entries,
@@ -214,11 +217,7 @@ impl ObservationSchema {
                                     feature: feature.clone(),
                                     asset_index: Some(asset_index),
                                 },
-                                apply_override(
-                                    normalization,
-                                    &name,
-                                    &config.observations.normalizations,
-                                )?,
+                                apply_override(normalization, &name, options.normalizations)?,
                             );
                         }
                     }
@@ -231,11 +230,7 @@ impl ObservationSchema {
                                 feature: feature.clone(),
                                 asset_index: None,
                             },
-                            apply_override(
-                                normalization,
-                                &name,
-                                &config.observations.normalizations,
-                            )?,
+                            apply_override(normalization, &name, options.normalizations)?,
                         );
                     }
                 },
@@ -250,28 +245,28 @@ impl ObservationSchema {
                         ObservationSource::AgentState {
                             feature: feature.clone(),
                         },
-                        apply_override(normalization, &name, &config.observations.normalizations)?,
+                        apply_override(normalization, &name, options.normalizations)?,
                     );
                 }
             }
         }
-        if config.observations.rolling_market_stats.enabled {
+        if options.rolling_market_stats.enabled {
             append_rolling_market_entries(
                 &mut entries,
-                &config.market.assets,
-                &config.observations.rolling_market_stats,
-                &config.observations.normalizations,
+                options.assets,
+                options.rolling_market_stats,
+                options.normalizations,
             )?;
         }
         let schema = Self {
-            version: config.observation.version,
-            market_schema_version: config.features.schema_version,
+            version: options.observation_version,
+            market_schema_version: options.market_schema_version,
             features,
             entries,
-            providers: config.observations.providers.clone(),
+            providers: options.providers.to_vec(),
         };
-        schema.validate(config.market.assets.len())?;
-        for name in config.observations.normalizations.keys() {
+        schema.validate(options.assets.len())?;
+        for name in options.normalizations.keys() {
             if !schema.entries.iter().any(|entry| &entry.name == name) {
                 return Err(crate::MidasError::Config(format!(
                     "observation normalization references unknown observation {name}"

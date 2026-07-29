@@ -72,11 +72,12 @@ impl SimulationEngine {
             ));
         }
         let features = pipeline.generate(&data, &dates)?;
-        let observation_schema = ObservationSchema::from_config(&config);
+        let observation_schema =
+            ObservationSchema::from_options(config.observation_schema_options());
         let schema_hash = observation_schema.identity(data.assets.len())?;
-        let observation_builder = SchemaObservationBuilder::from_config(
+        let observation_builder = SchemaObservationBuilder::from_options(
             observation_schema.clone(),
-            &config,
+            config.observation_builder_options(),
             Some(&data),
         )?;
         let architecture = BrainArchitecture::from_config(

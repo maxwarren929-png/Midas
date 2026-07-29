@@ -1,6 +1,6 @@
 use crate::{
     Result,
-    config::{Config, FeatureKind, RollingMarketStatsConfig},
+    config::{FeatureKind, RollingMarketStatsConfig},
     market::MarketDataset,
 };
 use std::{collections::BTreeMap, sync::Mutex};
@@ -8,6 +8,7 @@ use std::{collections::BTreeMap, sync::Mutex};
 use super::{
     contracts::{Observation, ObservationContext, ObservationMetadata, ObservationSink},
     normalization::{NormalizationRule, normalize},
+    options::ObservationBuilderOptions,
     providers::built_in_registry,
     registry::ObservationRegistry,
     schema::ObservationSchema,
@@ -78,19 +79,16 @@ impl SchemaObservationBuilder {
         )
     }
 
-    /// Constructs built-in providers from typed configuration. Market-derived
-    /// sensors are precomputed from immutable raw data, while the default
-    /// Prompt 5 provider set remains allocation-free at construction.
-    pub fn from_config(
+    pub(crate) fn from_options(
         schema: ObservationSchema,
-        config: &Config,
+        options: ObservationBuilderOptions<'_>,
         market_data: Option<&MarketDataset>,
     ) -> Result<Self> {
         Self::from_parts(
             schema,
-            config.features.features.clone(),
-            config.market.assets.len(),
-            &config.observations.rolling_market_stats,
+            options.market_features.to_vec(),
+            options.asset_count,
+            options.rolling_market_stats,
             market_data,
         )
     }

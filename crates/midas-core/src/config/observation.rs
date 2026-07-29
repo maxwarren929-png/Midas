@@ -1,6 +1,34 @@
-use crate::{MidasError, Result};
+use super::Config;
+use crate::{
+    MidasError, Result,
+    observation::{ObservationBuilderOptions, ObservationSchemaOptions},
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+impl Config {
+    pub(crate) fn observation_schema_options(&self) -> ObservationSchemaOptions<'_> {
+        ObservationSchemaOptions {
+            assets: &self.market.assets,
+            market_schema_version: self.features.schema_version,
+            market_features: &self.features.features,
+            market_clip: self.features.clip,
+            observation_version: self.observation.version,
+            observation_features: &self.observation.features,
+            providers: &self.observations.providers,
+            normalizations: &self.observations.normalizations,
+            rolling_market_stats: &self.observations.rolling_market_stats,
+        }
+    }
+
+    pub(crate) fn observation_builder_options(&self) -> ObservationBuilderOptions<'_> {
+        ObservationBuilderOptions {
+            market_features: &self.features.features,
+            asset_count: self.market.assets.len(),
+            rolling_market_stats: &self.observations.rolling_market_stats,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

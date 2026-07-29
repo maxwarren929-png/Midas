@@ -60,6 +60,15 @@ provider cross-checks stay there, and backend/device validation remains last.
 Adding validation to a domain must preserve this coordinator order because the
 first complete error message is an observable compatibility contract.
 
+Observation compilation uses private `ObservationSchemaOptions` and
+`ObservationBuilderOptions` views rather than passing root `Config` through the
+schema and builder implementations. Configuration owns construction of those
+views. Keep public `from_config` entry points as compatibility adapters unless
+an intentional API-breaking change removes them. New observation inputs should
+be added to the narrow view only when schema compilation or provider
+construction actually requires them; do not reintroduce root-configuration
+access into `observation/schema.rs` or `observation/builder.rs`.
+
 ## Market data and corporate actions
 
 Implement `MarketDataSource` and construct `MarketDataset` through validated constructors. Provider-adjusted history is not accepted as point-in-time data. Raw opens/closes are used for execution and valuation. `FeaturePriceSeries` may apply only split ratios known on or before the requested date; cash dividends remain explicit cash events. New corporate actions belong in the canonical `CorporateAction` enum and need an explicit timeline rule, portfolio accounting test, and future-safety test. The current timeline applies events at the start of the next-open execution date, before planning; same-day splits are ordered before dividends.

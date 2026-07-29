@@ -1,5 +1,22 @@
 # Implementation Status
 
+## Prompt 8C.1: observation configuration contract narrowing
+
+Observation schema compilation and built-in provider construction now consume
+private observation-owned option views containing only their required fields.
+Configuration owns conversion from root `Config`; simulation construction,
+checkpoint resume, and configuration validation use the narrow contracts.
+
+- Public `ObservationSchema::{from_config, try_from_config}` and
+  `SchemaObservationBuilder::from_config` remain compatible through an isolated
+  private adapter module.
+- Core schema and builder implementations no longer import or accept root
+  `Config`. They still consume stable leaf configuration DTOs; broader DTO
+  ownership and backend/brain construction cleanup remain later work.
+- Schema identities, provider and entry ordering, normalization behavior,
+  configuration hashes, public APIs, deterministic replay, and checkpoint
+  format 12 are unchanged.
+
 ## Prompt 8B.2: domain configuration validation decomposition
 
 Private domain-local validation now lives beside its configuration DTOs for

@@ -48,7 +48,9 @@ fn validate_economic_values(
 }
 
 fn validate_observation_schema(config: &Config) -> Result<()> {
-    let observation_schema = crate::observation::ObservationSchema::try_from_config(config)?;
+    let observation_schema = crate::observation::ObservationSchema::try_from_options(
+        config.observation_schema_options(),
+    )?;
     let used_observation_providers = observation_schema
         .entries
         .iter()

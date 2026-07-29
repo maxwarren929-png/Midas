@@ -260,7 +260,8 @@ impl SimulationEngine {
         let pipeline = BackwardFeaturePipeline::from_config(&config);
         let dates = data.split_dates(cp.split.range(&config));
         let features = pipeline.generate(&data, &dates)?;
-        let observation_schema = ObservationSchema::from_config(&config);
+        let observation_schema =
+            ObservationSchema::from_options(config.observation_schema_options());
         let schema_hash = observation_schema.identity(data.assets.len())?;
         validate_schema(&cp, &schema_hash)?;
         let compute_device = config.backend.compute_device()?;
@@ -274,9 +275,9 @@ impl SimulationEngine {
         );
         validate_architecture(&cp, &architecture)?;
         validate_feature_count(features.len())?;
-        let observation_builder = SchemaObservationBuilder::from_config(
+        let observation_builder = SchemaObservationBuilder::from_options(
             observation_schema.clone(),
-            &config,
+            config.observation_builder_options(),
             Some(&data),
         )?;
         let birth = features[0].date;

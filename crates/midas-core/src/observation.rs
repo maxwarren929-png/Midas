@@ -7,8 +7,10 @@
 //! modules.
 
 mod builder;
+mod config_compat;
 mod contracts;
 mod normalization;
+mod options;
 mod providers;
 mod registry;
 mod schema;
@@ -19,6 +21,7 @@ pub use contracts::{
     ObservationSink, ObservationValueType,
 };
 pub use normalization::NormalizationRule;
+pub(crate) use options::{ObservationBuilderOptions, ObservationSchemaOptions};
 pub use registry::ObservationRegistry;
 pub use schema::{
     AgentStateFeatureSpec, ObservationFeatureSpec, ObservationSchema, ObservationSchemaEntry,
