@@ -46,6 +46,13 @@ the later dedicated cleanup. Serialization, hashes, validation precedence and
 text, rolling-default omission, and checkpoint format 12 remain compatibility
 constraints.
 
+The first validation stage moves the complete ordered `Config::validate`
+implementation into private `config/validation.rs` without decomposing it.
+Keep validation order explicit: observation schema compilation remains at its
+existing point in the sequence and backend/device validation remains last.
+Domain-local validation delegation and configuration dependency reversal are
+separate later changes; neither is part of this mechanical extraction.
+
 ## Market data and corporate actions
 
 Implement `MarketDataSource` and construct `MarketDataset` through validated constructors. Provider-adjusted history is not accepted as point-in-time data. Raw opens/closes are used for execution and valuation. `FeaturePriceSeries` may apply only split ratios known on or before the requested date; cash dividends remain explicit cash events. New corporate actions belong in the canonical `CorporateAction` enum and need an explicit timeline rule, portfolio accounting test, and future-safety test. The current timeline applies events at the start of the next-open execution date, before planning; same-day splits are ordered before dividends.

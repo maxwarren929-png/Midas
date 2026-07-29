@@ -1,5 +1,19 @@
 # Implementation Status
 
+## Prompt 8B.1: ordered configuration validation extraction
+
+The complete ordered `Config::validate` implementation now lives in private
+`config/validation.rs`. This is a module-boundary extraction only: the method
+signature, validation sequence, observation-schema construction position,
+backend-last check, first-error precedence, and error text are unchanged.
+
+- `config.rs` remains the public compatibility facade and still owns root
+  `Config`, loading, and compact-JSON hashing.
+- Validation has not been delegated into domain modules, and dependency
+  direction between configuration, brain, and observation remains unchanged.
+  Serialization, configuration hashes, deterministic behavior, and checkpoint
+  format 12 remain unchanged.
+
 ## Prompt 8A.2: high-coupling configuration facade split
 
 Stage 2 of the mechanical configuration modularization is complete. Brain,
