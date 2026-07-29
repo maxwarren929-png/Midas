@@ -1,13 +1,75 @@
 use crate::{
     AgentId, MidasError, Result,
-    agent::AgentBuildContext,
+    agent::{AgentBuildContext, AgentSpawnRequest},
+    brain::PolicyBlueprint,
     config::DeathHandling,
     evolution::{CompletedLifeSummary, DefaultFitnessFunction},
-    replacement::{LivingAgentSummary, ReplacementContext},
+    replacement::{EvolutionReplacementOutcome, LivingAgentSummary, ReplacementContext},
 };
 use chrono::NaiveDate;
 
 use super::{DomainEvent, SimulationEngine, transaction::StepTransaction};
+
+fn validate_replacement_request(
+    request: &AgentSpawnRequest,
+    living: &[LivingAgentSummary<'_>],
+) -> Result<()> {
+    match (&request.policy_blueprint, &request.genome) {
+        (PolicyBlueprint::Neural, None) => {
+            return Err(MidasError::Policy(
+                "neural replacement requires a genome".into(),
+            ));
+        }
+        (PolicyBlueprint::Neural, Some(_)) | (_, None) => {}
+        (_, Some(_)) => {
+            return Err(MidasError::Policy(
+                "non-neural replacement must not carry a genome".into(),
+            ));
+        }
+    }
+    for parent_id in &request.parent_ids {
+        let parent = living
+            .iter()
+            .find(|candidate| candidate.id == *parent_id)
+            .ok_or_else(|| {
+                MidasError::Policy(format!(
+                    "replacement parent {parent_id} is not in the living population"
+                ))
+            })?;
+        if request.genome.is_some() && parent.genome.is_none() {
+            return Err(MidasError::Policy(format!(
+                "replacement parent {parent_id} has no genome"
+            )));
+        }
+    }
+    for (name, value) in [
+        (
+            "requested mating distance",
+            request.metadata.requested_mating_distance,
+        ),
+        (
+            "selected mating distance",
+            request.metadata.selected_mating_distance,
+        ),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(MidasError::Policy(format!(
+                "replacement {name} must be finite and non-negative"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn inherited_lineage(
+    parent_lineages: &[crate::evolution::LineageId],
+) -> Option<crate::evolution::LineageId> {
+    let first = parent_lineages.first().copied()?;
+    parent_lineages
+        .iter()
+        .all(|lineage| *lineage == first)
+        .then_some(first)
+}
 
 impl SimulationEngine {
     pub(super) fn handle_death_in_transaction(
@@ -76,7 +138,7 @@ impl SimulationEngine {
                     Some(replacement) => replacement,
                     None => self.replacement.fork()?,
                 };
-                let request = {
+                let (request, evolution_report) = {
                     let living = transaction
                         .agents
                         .iter()
@@ -92,7 +154,7 @@ impl SimulationEngine {
                             parent_ids: a.state.parent_ids.clone(),
                         })
                         .collect::<Vec<_>>();
-                    replacement.create_replacement(&ReplacementContext {
+                    let request = replacement.create_replacement(&ReplacementContext {
                         dead_agent: &dead_state,
                         dead_policy,
                         living_population: &living,
@@ -105,9 +167,10 @@ impl SimulationEngine {
                             ^ new_id.0.wrapping_mul(0x9e3779b97f4a7c15),
                         completed_lives: &transaction.evolution.completed_lives,
                         genome_registry: &transaction.evolution.genome_registry,
-                    })?
+                    })?;
+                    validate_replacement_request(&request, &living)?;
+                    (request, replacement.evolution_report())
                 };
-                let mutation_report = replacement.mutation_report();
                 let parent_ids = request.parent_ids.clone();
                 let first_parent_id = parent_ids.first().copied().unwrap_or(AgentId(0));
                 let request_reason = request.metadata.reason.clone();
@@ -129,14 +192,23 @@ impl SimulationEngine {
                 if let Some(genome) = child_genome.as_ref() {
                     let parent_genome_ids = parent_ids
                         .iter()
-                        .filter_map(|parent_id| {
-                            transaction
+                        .map(|parent_id| {
+                            let parent = transaction
                                 .agents
                                 .iter()
                                 .find(|candidate| candidate.state.id == *parent_id)
-                                .and_then(|candidate| candidate.state.genome_id)
+                                .ok_or_else(|| {
+                                    MidasError::Policy(format!(
+                                        "replacement parent {parent_id} disappeared before ancestry allocation"
+                                    ))
+                                })?;
+                            parent.state.genome_id.ok_or_else(|| {
+                                MidasError::Policy(format!(
+                                    "replacement parent {parent_id} has no genome identity"
+                                ))
+                            })
                         })
-                        .collect::<Vec<_>>();
+                        .collect::<Result<Vec<_>>>()?;
                     let parent_lineages = parent_genome_ids
                         .iter()
                         .filter_map(|parent_id| {
@@ -144,13 +216,7 @@ impl SimulationEngine {
                         })
                         .map(|record| record.lineage_id)
                         .collect::<Vec<_>>();
-                    let shared_lineage = if parent_lineages.len() >= 2
-                        && parent_lineages.windows(2).all(|pair| pair[0] == pair[1])
-                    {
-                        parent_lineages.first().copied()
-                    } else {
-                        None
-                    };
+                    let shared_lineage = inherited_lineage(&parent_lineages);
                     let (genome_id, lineage_id) =
                         transaction.evolution.allocate_genome_with_reason(
                             genome,
@@ -197,40 +263,52 @@ impl SimulationEngine {
                                 });
                         }
                     }
-                    if request_reason.starts_with("evolution_two_parent:") {
-                        transaction.evolution.metrics.crossover_count = transaction
-                            .evolution
-                            .metrics
-                            .crossover_count
-                            .saturating_add(1);
-                        transaction.evolution.metrics.mutation_count = transaction
-                            .evolution
-                            .metrics
-                            .mutation_count
-                            .saturating_add(1);
-                        transaction.events.push(DomainEvent::GenomeCrossed {
-                            child_agent_id: new_id,
-                            method: self.config.evolution.crossover.method,
-                        });
-                        let report = mutation_report.unwrap_or_default();
-                        transaction.events.push(DomainEvent::GenomeMutated {
-                            child_agent_id: new_id,
-                            weight_changes: report.weight_changes,
-                            bias_changes: report.bias_changes,
-                            trait_changes: report.trait_changes,
-                            reset_changes: report.reset_changes,
-                            weight_resets: report.weight_resets,
-                            bias_resets: report.bias_resets,
-                        });
-                    } else if request_reason.contains("fallback") {
-                        transaction.evolution.metrics.random_fallback_births = transaction
-                            .evolution
-                            .metrics
-                            .random_fallback_births
-                            .saturating_add(1);
-                        transaction.events.push(DomainEvent::EvolutionFallback {
-                            reason: request_reason,
-                        });
+                    if let Some(report) = evolution_report {
+                        if report.crossover {
+                            transaction.evolution.metrics.crossover_count = transaction
+                                .evolution
+                                .metrics
+                                .crossover_count
+                                .saturating_add(1);
+                            transaction.events.push(DomainEvent::GenomeCrossed {
+                                child_agent_id: new_id,
+                                method: self.config.evolution.crossover.method,
+                            });
+                        }
+                        if let Some(mutation) = report.mutation {
+                            transaction.evolution.metrics.mutation_count = transaction
+                                .evolution
+                                .metrics
+                                .mutation_count
+                                .saturating_add(1);
+                            transaction.events.push(DomainEvent::GenomeMutated {
+                                child_agent_id: new_id,
+                                weight_changes: mutation.weight_changes,
+                                bias_changes: mutation.bias_changes,
+                                trait_changes: mutation.trait_changes,
+                                reset_changes: mutation.reset_changes,
+                                weight_resets: mutation.weight_resets,
+                                bias_resets: mutation.bias_resets,
+                            });
+                        }
+                        match report.outcome {
+                            EvolutionReplacementOutcome::Reproduction => {}
+                            EvolutionReplacementOutcome::CloneFallback => {
+                                transaction.events.push(DomainEvent::EvolutionFallback {
+                                    reason: request_reason,
+                                });
+                            }
+                            EvolutionReplacementOutcome::RandomFallback => {
+                                transaction.evolution.metrics.random_fallback_births = transaction
+                                    .evolution
+                                    .metrics
+                                    .random_fallback_births
+                                    .saturating_add(1);
+                                transaction.events.push(DomainEvent::EvolutionFallback {
+                                    reason: request_reason,
+                                });
+                            }
+                        }
                     }
                 }
                 transaction.agents[slot] = agent;
@@ -248,5 +326,43 @@ impl SimulationEngine {
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{inherited_lineage, validate_replacement_request};
+    use crate::{
+        AgentId,
+        agent::{AgentSpawnRequest, SpawnMetadata},
+        brain::PolicyBlueprint,
+        evolution::LineageId,
+    };
+
+    #[test]
+    fn one_parent_clone_inherits_its_lineage() {
+        assert_eq!(inherited_lineage(&[LineageId(7)]), Some(LineageId(7)));
+        assert_eq!(
+            inherited_lineage(&[LineageId(7), LineageId(7)]),
+            Some(LineageId(7))
+        );
+        assert_eq!(inherited_lineage(&[LineageId(7), LineageId(8)]), None);
+        assert_eq!(inherited_lineage(&[]), None);
+    }
+
+    #[test]
+    fn replacement_request_rejects_unknown_parents() {
+        let request = AgentSpawnRequest {
+            policy_blueprint: PolicyBlueprint::Cash,
+            genome: None,
+            parent_ids: vec![AgentId(42)],
+            metadata: SpawnMetadata::default(),
+        };
+        assert_eq!(
+            validate_replacement_request(&request, &[])
+                .unwrap_err()
+                .to_string(),
+            "policy error: replacement parent 42 is not in the living population"
+        );
     }
 }

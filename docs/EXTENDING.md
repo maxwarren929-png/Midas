@@ -137,6 +137,16 @@ The action distribution is `BoundedImpulseBeta`: the actor emits two raw values 
 
 Both initial population and death replacement use `AgentFactory::spawn`. A replacement strategy receives `ReplacementContext` with dead state and blueprint, living summaries, configuration, architecture, observation schema, and deterministic seed material. It returns `AgentSpawnRequest`; it must not construct a policy. Strategies with mutable selection/RNG state should implement `ReplacementStrategy::fork`; the simulation swaps the fork only when the containing step commits. `EvolutionaryReplacementStrategy` uses tournament or rank-weighted selection, configurable eligibility, deterministic crossover and bounded mutation, and explicit random/clone/abort fallbacks. Benchmark blueprints remain non-learning and non-evolutionary unless configuration explicitly chooses otherwise.
 
+Evolutionary strategies should expose `EvolutionReplacementReport` from
+`ReplacementStrategy::evolution_report`; the free-form spawn reason is
+diagnostic text, not an accounting protocol. Reproduction, clone fallback, and
+random fallback have distinct typed outcomes. Random fallback has no parents
+and starts a new lineage; clone fallback retains one eligible parent and its
+lineage. The simulation validates policy/genome consistency, parent membership
+and genome identity, and mating-distance metadata before spawning. Invalid
+requests abort the step transaction without committing IDs, events, strategy
+state, or ancestry.
+
 ### Evolution and ancestry
 
 `GenomeId`, `LineageId`, and `AgentId` are distinct. `EvolutionState` stores flat `GenomeRecord` ancestry, completed-life fitness summaries, deterministic evolutionary RNG state, and population metrics. Default `GenomeOnly` inheritance crosses birth genomes only; lifetime-trained weights, optimizer state, recurrent memory, and rollouts are reset at birth. Genetic distance is symmetric and supports fitness sharing and minimum mating distance. The mating distance filters the second-parent pool while retaining tournament/rank-weighted selection pressure. If no qualifying pair exists, the same configured selector chooses a constrained fallback and emits `DiversityConstraintRelaxed`; it is never replaced by an unlabelled uniform pair draw. Reset mutation independently samples every weight and bias and resets selected values to zero, reporting weight and bias counts separately.

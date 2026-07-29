@@ -34,6 +34,21 @@ pub struct ReplacementContext<'a> {
     pub completed_lives: &'a [CompletedLifeSummary],
     pub genome_registry: &'a std::collections::BTreeMap<crate::evolution::GenomeId, GenomeRecord>,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EvolutionReplacementOutcome {
+    Reproduction,
+    CloneFallback,
+    RandomFallback,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EvolutionReplacementReport {
+    pub outcome: EvolutionReplacementOutcome,
+    pub crossover: bool,
+    pub mutation: Option<MutationReport>,
+}
+
 pub trait ReplacementStrategy: Send {
     fn create_replacement(&mut self, context: &ReplacementContext<'_>)
     -> Result<AgentSpawnRequest>;
@@ -41,6 +56,12 @@ pub trait ReplacementStrategy: Send {
     /// Returns the mutation report produced by the most recent request, when
     /// the strategy has evolutionary mutation diagnostics to expose.
     fn mutation_report(&self) -> Option<MutationReport> {
+        None
+    }
+    /// Returns structured evolutionary diagnostics for the most recent
+    /// replacement request. Implementations that do not perform evolution may
+    /// retain the default.
+    fn evolution_report(&self) -> Option<EvolutionReplacementReport> {
         None
     }
     /// Clone strategy state for a transactional simulation step. Stateful
@@ -83,11 +104,11 @@ impl ReplacementStrategy for NonEvolutionaryRandomGenomeReplacement {
 
 #[derive(Clone, Default)]
 pub struct EvolutionaryReplacementStrategy {
-    last_mutation_report: Option<MutationReport>,
+    last_report: Option<EvolutionReplacementReport>,
 }
 impl ReplacementStrategy for EvolutionaryReplacementStrategy {
     fn create_replacement(&mut self, c: &ReplacementContext<'_>) -> Result<AgentSpawnRequest> {
-        self.last_mutation_report = None;
+        self.last_report = None;
         if c.dead_policy != PolicyBlueprint::Neural {
             return Ok(AgentSpawnRequest {
                 policy_blueprint: c.dead_policy.clone(),
@@ -138,10 +159,10 @@ impl ReplacementStrategy for EvolutionaryReplacementStrategy {
         let selection_config = c.config.evolution.selection.clone();
         let mut selector: Box<dyn ParentSelector> = match selection_config.method {
             crate::config::SelectionMethod::Tournament => Box::new(TournamentSelection {
-                config: selection_config,
+                config: selection_config.clone(),
             }),
             crate::config::SelectionMethod::RankWeighted => Box::new(RankWeightedSelection {
-                config: selection_config,
+                config: selection_config.clone(),
             }),
         };
         let minimum_distance = c.config.evolution.diversity.minimum_mating_distance as f64;
@@ -152,41 +173,59 @@ impl ReplacementStrategy for EvolutionaryReplacementStrategy {
         ) {
             Ok(parents) => parents,
             Err(error) => {
-                return match c.config.evolution.fallback {
+                let (request, outcome) = match c.config.evolution.fallback {
                     crate::config::EvolutionFallback::AbortExperiment => Err(error),
                     crate::config::EvolutionFallback::CloneBestEligible => {
                         let best = population
                             .candidates
                             .iter()
+                            .filter(|candidate| {
+                                candidate.age >= selection_config.minimum_age
+                                    && candidate.net_worth >= selection_config.minimum_net_worth
+                            })
                             .max_by(|a, b| a.fitness.0.total_cmp(&b.fitness.0))
                             .ok_or(error)?;
-                        Ok(AgentSpawnRequest {
+                        Ok((
+                            AgentSpawnRequest {
+                                policy_blueprint: PolicyBlueprint::Neural,
+                                genome: Some(best.genome.clone()),
+                                parent_ids: vec![best.agent_id],
+                                metadata: SpawnMetadata {
+                                    reason: "evolution_clone_best_fallback".into(),
+                                    ..SpawnMetadata::default()
+                                },
+                            },
+                            EvolutionReplacementOutcome::CloneFallback,
+                        ))
+                    }
+                    crate::config::EvolutionFallback::RandomGenome => Ok((
+                        AgentSpawnRequest {
                             policy_blueprint: PolicyBlueprint::Neural,
-                            genome: Some(best.genome.clone()),
-                            parent_ids: vec![best.agent_id],
+                            genome: Some(BrainGenome::random(
+                                c.architecture,
+                                &c.config.brain.traits,
+                                c.deterministic_seed,
+                            )?),
+                            parent_ids: Vec::new(),
                             metadata: SpawnMetadata {
-                                reason: "evolution_clone_best_fallback".into(),
+                                reason: "evolution_random_genome_fallback".into(),
                                 ..SpawnMetadata::default()
                             },
-                        })
-                    }
-                    crate::config::EvolutionFallback::RandomGenome => Ok(AgentSpawnRequest {
-                        policy_blueprint: PolicyBlueprint::Neural,
-                        genome: Some(BrainGenome::random(
-                            c.architecture,
-                            &c.config.brain.traits,
-                            c.deterministic_seed,
-                        )?),
-                        parent_ids: Vec::new(),
-                        metadata: SpawnMetadata {
-                            reason: "evolution_random_genome_fallback".into(),
-                            ..SpawnMetadata::default()
                         },
-                    }),
-                };
+                        EvolutionReplacementOutcome::RandomFallback,
+                    )),
+                }?;
+                self.last_report = Some(EvolutionReplacementReport {
+                    outcome,
+                    crossover: false,
+                    mutation: None,
+                });
+                return Ok(request);
             }
         };
         let mut fallback_reason = None;
+        let mut fallback_outcome = None;
+        let mut crossover_applied = true;
         let mut child = match crossover(
             &parents.first.genome,
             &parents.second.genome,
@@ -198,10 +237,14 @@ impl ReplacementStrategy for EvolutionaryReplacementStrategy {
                 crate::config::EvolutionFallback::AbortExperiment => return Err(error),
                 crate::config::EvolutionFallback::CloneBestEligible => {
                     fallback_reason = Some(format!("crossover_failed:{error}"));
+                    fallback_outcome = Some(EvolutionReplacementOutcome::CloneFallback);
+                    crossover_applied = false;
                     parents.first.genome.clone()
                 }
                 crate::config::EvolutionFallback::RandomGenome => {
                     fallback_reason = Some(format!("crossover_failed:{error}"));
+                    fallback_outcome = Some(EvolutionReplacementOutcome::RandomFallback);
+                    crossover_applied = false;
                     BrainGenome::random(
                         c.architecture,
                         &c.config.brain.traits,
@@ -220,16 +263,20 @@ impl ReplacementStrategy for EvolutionaryReplacementStrategy {
             },
             &mut mutation_rng,
         ) {
-            Ok(report) => report,
+            Ok(report) => Some(report),
             Err(error) => {
                 match c.config.evolution.fallback {
                     crate::config::EvolutionFallback::AbortExperiment => return Err(error),
                     crate::config::EvolutionFallback::CloneBestEligible => {
                         fallback_reason = Some(format!("mutation_failed:{error}"));
+                        fallback_outcome = Some(EvolutionReplacementOutcome::CloneFallback);
+                        crossover_applied = false;
                         child = parents.first.genome.clone()
                     }
                     crate::config::EvolutionFallback::RandomGenome => {
                         fallback_reason = Some(format!("mutation_failed:{error}"));
+                        fallback_outcome = Some(EvolutionReplacementOutcome::RandomFallback);
+                        crossover_applied = false;
                         child = BrainGenome::random(
                             c.architecture,
                             &c.config.brain.traits,
@@ -237,10 +284,15 @@ impl ReplacementStrategy for EvolutionaryReplacementStrategy {
                         )?
                     }
                 }
-                MutationReport::default()
+                None
             }
         };
-        self.last_mutation_report = Some(mutation_report);
+        let outcome = fallback_outcome.unwrap_or(EvolutionReplacementOutcome::Reproduction);
+        self.last_report = Some(EvolutionReplacementReport {
+            outcome,
+            crossover: crossover_applied,
+            mutation: mutation_report,
+        });
         let reason = fallback_reason.unwrap_or_else(|| {
             format!(
                 "evolution_two_parent:{}+{}",
@@ -250,7 +302,13 @@ impl ReplacementStrategy for EvolutionaryReplacementStrategy {
         Ok(AgentSpawnRequest {
             policy_blueprint: PolicyBlueprint::Neural,
             genome: Some(child),
-            parent_ids: vec![parents.first.agent_id, parents.second.agent_id],
+            parent_ids: match outcome {
+                EvolutionReplacementOutcome::Reproduction => {
+                    vec![parents.first.agent_id, parents.second.agent_id]
+                }
+                EvolutionReplacementOutcome::CloneFallback => vec![parents.first.agent_id],
+                EvolutionReplacementOutcome::RandomFallback => Vec::new(),
+            },
             metadata: SpawnMetadata {
                 reason,
                 diversity_constraint_relaxed: parents.distance_relaxed,
@@ -263,7 +321,12 @@ impl ReplacementStrategy for EvolutionaryReplacementStrategy {
         "evolutionary_two_parent"
     }
     fn mutation_report(&self) -> Option<MutationReport> {
-        self.last_mutation_report.clone()
+        self.last_report
+            .as_ref()
+            .and_then(|report| report.mutation.clone())
+    }
+    fn evolution_report(&self) -> Option<EvolutionReplacementReport> {
+        self.last_report.clone()
     }
     fn fork(&self) -> Result<Box<dyn ReplacementStrategy>> {
         Ok(Box::new(self.clone()))

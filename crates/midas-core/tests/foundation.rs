@@ -13,8 +13,8 @@ use midas_core::{
         NeuralModel, NeuralModelFactory, NeuralModelState, NeuralOutput, PolicyBlueprint,
     },
     config::{
-        Config, CorporateActionConfig, CorporateActionMode, DeathHandling, LearningKind,
-        ObservationFeatureKind, PolicyFailureBehavior, PolicyKind,
+        Config, CorporateActionConfig, CorporateActionMode, DeathHandling, EvolutionFallback,
+        LearningKind, ObservationFeatureKind, PolicyFailureBehavior, PolicyKind,
     },
     execution::{
         CostExecutionEngine, ExecutionApplier, ExecutionPlanner, ExecutionSnapshot, Portfolio,
@@ -843,6 +843,29 @@ fn replacements_preserve_every_policy_blueprint() {
         assert_eq!(engine.metrics.births, 2);
     }
 }
+
+#[test]
+fn random_evolution_fallback_emits_event_and_only_random_metric() {
+    let mut c = bankrupt_config(PolicyKind::BurnActorCritic, DeathHandling::Replace);
+    c.evolution.enabled = true;
+    c.evolution.fallback = EvolutionFallback::RandomGenome;
+    let data = loaded(&c);
+    let mut engine = SimulationEngine::new(c, data, DatasetSplit::Training).unwrap();
+
+    engine.run_steps(1).unwrap();
+
+    let evolution = engine.evolution_state();
+    assert_eq!(evolution.metrics.random_fallback_births, 1);
+    assert_eq!(evolution.metrics.crossover_count, 0);
+    assert_eq!(evolution.metrics.mutation_count, 0);
+    assert_eq!(evolution.metrics.reproduction_count, 0);
+    assert!(engine.domain_events.iter().any(|event| matches!(
+        event,
+        DomainEvent::EvolutionFallback { reason }
+            if reason == "evolution_random_genome_fallback"
+    )));
+}
+
 #[test]
 fn configured_no_replacement_is_respected() {
     for handling in [DeathHandling::LeaveVacant, DeathHandling::EndAgentOnly] {

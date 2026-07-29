@@ -4,8 +4,8 @@ use midas_core::{
     config::Config,
     market::{MarketDataSource, PolarsDataSource},
     replacement::{
-        EvolutionaryReplacementStrategy, LivingAgentSummary, ReplacementContext,
-        ReplacementStrategy,
+        EvolutionReplacementOutcome, EvolutionaryReplacementStrategy, LivingAgentSummary,
+        ReplacementContext, ReplacementStrategy,
     },
     simulation::{DatasetSplit, SimulationEngine, SimulationLifecycle},
 };
@@ -273,6 +273,145 @@ fn evolutionary_replacement_selects_two_parents_and_reports_mutation() {
     assert_eq!(child.policy.policy_blueprint(), PolicyBlueprint::Neural);
     assert_eq!(child.state.total_policy_failures, 0);
     assert_eq!(child.state.consecutive_policy_failures, 0);
+}
+
+#[test]
+fn evolutionary_fallbacks_report_typed_outcomes_and_correct_parentage() {
+    let mut config = prompt2_config();
+    let data = PolarsDataSource.load(&config).unwrap();
+    let engine = SimulationEngine::new(config.clone(), data, DatasetSplit::Training).unwrap();
+    let states = engine.agents().collect::<Vec<_>>();
+    let dead = states[0].clone();
+    let architecture = midas_core::brain::BrainArchitecture::from_config(
+        &config.brain,
+        engine
+            .observation_schema()
+            .identity(config.market.assets.len())
+            .unwrap(),
+        engine
+            .observation_schema()
+            .dimension(config.market.assets.len()),
+        config.market.assets.len(),
+    );
+    let device = config.backend.compute_device().unwrap();
+    let schema = engine.observation_schema().clone();
+    let registry = std::collections::BTreeMap::new();
+
+    config.evolution.fallback = midas_core::config::EvolutionFallback::CloneBestEligible;
+    let one_living = vec![LivingAgentSummary {
+        id: states[1].id,
+        net_worth: states[1].portfolio.net_worth,
+        age: states[1].age,
+        policy: PolicyBlueprint::Neural,
+        genome: states[1].genome.as_ref(),
+        maximum_drawdown: states[1].maximum_drawdown,
+        birth_date: states[1].birth_date,
+        parent_ids: states[1].parent_ids.clone(),
+    }];
+    let mut clone_strategy = EvolutionaryReplacementStrategy::default();
+    let clone_request = clone_strategy
+        .create_replacement(&ReplacementContext {
+            dead_agent: &dead,
+            dead_policy: PolicyBlueprint::Neural,
+            living_population: &one_living,
+            config: &config,
+            architecture: &architecture,
+            compute_device: &device,
+            observation_schema: &schema,
+            deterministic_seed: 23,
+            completed_lives: &[],
+            genome_registry: &registry,
+        })
+        .unwrap();
+    assert_eq!(clone_request.parent_ids, vec![states[1].id]);
+    let clone_report = clone_strategy.evolution_report().unwrap();
+    assert_eq!(
+        clone_report.outcome,
+        EvolutionReplacementOutcome::CloneFallback
+    );
+    assert!(!clone_report.crossover);
+    assert!(clone_report.mutation.is_none());
+
+    config.evolution.selection.minimum_age = 1;
+    let mut ineligible_clone_strategy = EvolutionaryReplacementStrategy::default();
+    assert_eq!(
+        ineligible_clone_strategy
+            .create_replacement(&ReplacementContext {
+                dead_agent: &dead,
+                dead_policy: PolicyBlueprint::Neural,
+                living_population: &one_living,
+                config: &config,
+                architecture: &architecture,
+                compute_device: &device,
+                observation_schema: &schema,
+                deterministic_seed: 23,
+                completed_lives: &[],
+                genome_registry: &registry,
+            })
+            .unwrap_err()
+            .to_string(),
+        "policy error: fewer than two eligible parents"
+    );
+
+    config.evolution.selection.minimum_age = 0;
+    config.evolution.fallback = midas_core::config::EvolutionFallback::RandomGenome;
+    config.evolution.mutation.weight_probability = 0.0;
+    config.evolution.mutation.bias_probability = 0.0;
+    config.evolution.mutation.reset_probability = 0.0;
+    config.evolution.mutation.trait_probability = 0.0;
+    config.brain.traits.learning_rate.minimum = 0.5;
+    config.brain.traits.learning_rate.maximum = 1.0;
+    let two_living = vec![
+        LivingAgentSummary {
+            id: states[1].id,
+            net_worth: states[1].portfolio.net_worth,
+            age: states[1].age,
+            policy: PolicyBlueprint::Neural,
+            genome: states[1].genome.as_ref(),
+            maximum_drawdown: states[1].maximum_drawdown,
+            birth_date: states[1].birth_date,
+            parent_ids: states[1].parent_ids.clone(),
+        },
+        LivingAgentSummary {
+            id: states[2].id,
+            net_worth: states[2].portfolio.net_worth,
+            age: states[2].age,
+            policy: PolicyBlueprint::Neural,
+            genome: states[2].genome.as_ref(),
+            maximum_drawdown: states[2].maximum_drawdown,
+            birth_date: states[2].birth_date,
+            parent_ids: states[2].parent_ids.clone(),
+        },
+    ];
+    let mut random_strategy = EvolutionaryReplacementStrategy::default();
+    let random_request = random_strategy
+        .create_replacement(&ReplacementContext {
+            dead_agent: &dead,
+            dead_policy: PolicyBlueprint::Neural,
+            living_population: &two_living,
+            config: &config,
+            architecture: &architecture,
+            compute_device: &device,
+            observation_schema: &schema,
+            deterministic_seed: 23,
+            completed_lives: &[],
+            genome_registry: &registry,
+        })
+        .unwrap();
+    assert!(random_request.parent_ids.is_empty());
+    assert!(
+        random_request
+            .metadata
+            .reason
+            .starts_with("mutation_failed:")
+    );
+    let random_report = random_strategy.evolution_report().unwrap();
+    assert_eq!(
+        random_report.outcome,
+        EvolutionReplacementOutcome::RandomFallback
+    );
+    assert!(!random_report.crossover);
+    assert!(random_report.mutation.is_none());
 }
 
 #[test]

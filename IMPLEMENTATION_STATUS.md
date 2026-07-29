@@ -1,5 +1,26 @@
 # Implementation Status
 
+## Prompt 9A: replacement correctness contracts
+
+Replacement strategies now expose an additive typed evolutionary report for
+reproduction, clone fallback, and random fallback outcomes. Simulation
+accounting consumes that report instead of inferring crossover, mutation, and
+fallback semantics from free-form spawn-reason text.
+
+- Random fallbacks carry no parent ancestry and increment only the random
+  fallback metric. Clone fallbacks retain one eligible parent and inherit that
+  parent's lineage. Clone-best fallback respects configured age and net-worth
+  eligibility.
+- Replacement requests are validated before agent construction and ancestry
+  allocation. Unknown parents, incompatible policy/genome combinations,
+  missing parent genomes or identities, and invalid mating-distance metadata
+  fail transactionally.
+- Existing strategy implementations remain source-compatible because the new
+  report method has a default. Checkpoint format remains 12. Same-step parent
+  eligibility, reproductive-fitness selection, active-lineage semantics,
+  replacement-context narrowing, and custom strategy checkpoint state remain
+  separate later stages.
+
 ## Prompt 8C.2: backend device construction ownership
 
 Compute-device construction and validation now belong to the brain domain.
