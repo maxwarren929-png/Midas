@@ -1,3 +1,4 @@
+use crate::{MidasError, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -46,4 +47,33 @@ pub enum RewardKind {
     #[default]
     LogReturn,
     RiskAdjustedReturn,
+}
+
+impl RewardConfig {
+    pub(super) fn validate(&self) -> Result<()> {
+        let bad = |message: &str| Err(MidasError::Config(message.into()));
+        for (name, value) in [
+            (
+                "reward.drawdown_penalty_weight",
+                self.drawdown_penalty_weight,
+            ),
+            (
+                "reward.turnover_penalty_weight",
+                self.turnover_penalty_weight,
+            ),
+            ("reward.invalid_action_penalty", self.invalid_action_penalty),
+            ("reward.bankruptcy_penalty", self.bankruptcy_penalty),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return bad(&format!("{name} must be finite and non-negative"));
+            }
+        }
+        if !self.clip_min.is_finite() || !self.clip_max.is_finite() {
+            return bad("reward clip bounds must be finite");
+        }
+        if self.clip_min >= self.clip_max {
+            return bad("reward.clip_min must be less than clip_max");
+        }
+        Ok(())
+    }
 }

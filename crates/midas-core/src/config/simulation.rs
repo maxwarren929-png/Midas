@@ -1,3 +1,4 @@
+use crate::{MidasError, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -13,6 +14,26 @@ pub struct SimulationConfig {
     pub forced_liquidation: bool,
     #[serde(default)]
     pub death_handling: DeathHandling,
+}
+
+impl SimulationConfig {
+    pub(super) fn validate_population(&self) -> Result<()> {
+        if self.population_size == 0 {
+            return Err(MidasError::Config(
+                "population_size must be positive".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_cash_threshold(&self) -> Result<()> {
+        if self.starting_cash <= self.bankruptcy_threshold {
+            return Err(MidasError::Config(
+                "starting_cash must exceed bankruptcy_threshold".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -46,5 +67,16 @@ impl Default for PolicyFailureConfig {
             maximum_total: 20,
             behavior: PolicyFailureBehavior::KillAgent,
         }
+    }
+}
+
+impl PolicyFailureConfig {
+    pub(super) fn validate(&self) -> Result<()> {
+        if self.maximum_consecutive == 0 || self.maximum_total == 0 {
+            return Err(MidasError::Config(
+                "policy failure limits must be positive".into(),
+            ));
+        }
+        Ok(())
     }
 }

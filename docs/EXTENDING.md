@@ -53,6 +53,13 @@ existing point in the sequence and backend/device validation remains last.
 Domain-local validation delegation and configuration dependency reversal are
 separate later changes; neither is part of this mechanical extraction.
 
+Domain configuration validators now sit beside their DTOs and are private to
+the `config` facade. `config/validation.rs` remains the authoritative ordering
+coordinator: mixed simulation/execution economics and observation schema and
+provider cross-checks stay there, and backend/device validation remains last.
+Adding validation to a domain must preserve this coordinator order because the
+first complete error message is an observable compatibility contract.
+
 ## Market data and corporate actions
 
 Implement `MarketDataSource` and construct `MarketDataset` through validated constructors. Provider-adjusted history is not accepted as point-in-time data. Raw opens/closes are used for execution and valuation. `FeaturePriceSeries` may apply only split ratios known on or before the requested date; cash dividends remain explicit cash events. New corporate actions belong in the canonical `CorporateAction` enum and need an explicit timeline rule, portfolio accounting test, and future-safety test. The current timeline applies events at the start of the next-open execution date, before planning; same-day splits are ordered before dividends.

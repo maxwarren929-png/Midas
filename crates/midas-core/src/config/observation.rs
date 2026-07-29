@@ -42,6 +42,17 @@ impl Default for ObservationConfig {
     }
 }
 
+impl ObservationConfig {
+    pub(super) fn validate(&self) -> Result<()> {
+        if self.version == 0 || self.features.is_empty() {
+            return Err(MidasError::Config(
+                "observation schema version and features must be non-empty".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Registry selection and per-name normalisation overrides.  The singular
 /// `observation` table remains the backwards-compatible compact schema source;
 /// this table controls which sensor providers are registered.
@@ -77,6 +88,35 @@ impl Default for ObservationRegistryConfig {
             normalizations: BTreeMap::new(),
             rolling_market_stats: RollingMarketStatsConfig::default(),
         }
+    }
+}
+
+impl ObservationRegistryConfig {
+    pub(super) fn validate(&self) -> Result<()> {
+        let bad = |message: &str| Err(MidasError::Config(message.into()));
+        if self.schema.trim().is_empty() || self.providers.is_empty() {
+            return bad("observation registry schema and providers must be non-empty");
+        }
+        if self.schema != "default" {
+            return bad(
+                "only the built-in observation schema named default is currently supported",
+            );
+        }
+        let mut observation_providers = self.providers.clone();
+        observation_providers.sort();
+        observation_providers.dedup();
+        if observation_providers.len() != self.providers.len()
+            || observation_providers
+                .iter()
+                .any(|provider| provider.trim().is_empty())
+        {
+            return bad("observation registry providers must be unique non-empty names");
+        }
+        for normalization in self.normalizations.values() {
+            normalization.validate()?;
+        }
+        self.rolling_market_stats.validate()?;
+        Ok(())
     }
 }
 

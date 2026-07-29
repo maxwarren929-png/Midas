@@ -25,6 +25,62 @@ fn default_policy() -> PolicyKind {
     PolicyKind::BurnActorCritic
 }
 
+impl BrainConfig {
+    pub(super) fn validate(&self) -> Result<()> {
+        let bad = |message: &str| Err(MidasError::Config(message.into()));
+        if self.architecture_version == 0
+            || self.hidden_layers.is_empty()
+            || self.hidden_layers.contains(&0)
+            || self.memory_size == 0
+        {
+            return bad("brain architecture dimensions must be positive");
+        }
+        if !matches!(
+            self.action_distribution.kind,
+            ActionDistributionKind::BoundedImpulseBeta
+        ) || !self.action_distribution.minimum_shape.is_finite()
+            || !self.action_distribution.maximum_shape.is_finite()
+            || !self.action_distribution.latent_epsilon.is_finite()
+            || self.action_distribution.minimum_shape <= 0.0
+            || self.action_distribution.maximum_shape <= self.action_distribution.minimum_shape
+            || !(0.0..0.5).contains(&self.action_distribution.latent_epsilon)
+            || self.action_distribution.latent_epsilon == 0.0
+        {
+            return bad("bounded impulse Beta action distribution parameters are invalid");
+        }
+        if !self.trading.maximum_trade_fraction.is_finite()
+            || self.trading.maximum_trade_fraction <= 0.0
+            || self.trading.maximum_trade_fraction > 1.0
+        {
+            return bad("brain.trading.maximum_trade_fraction must be in (0, 1]");
+        }
+        for (name, value) in [
+            ("learning_rate", &self.traits.learning_rate),
+            ("entropy_coefficient", &self.traits.entropy_coefficient),
+            ("action_temperature", &self.traits.action_temperature),
+            ("temperature_decay", &self.traits.temperature_decay),
+            ("drawdown_sensitivity", &self.traits.drawdown_sensitivity),
+            ("turnover_sensitivity", &self.traits.turnover_sensitivity),
+            ("maximum_allocation", &self.traits.maximum_allocation),
+        ] {
+            value.validate(name)?;
+        }
+        if self.traits.maximum_allocation.minimum <= 0.0
+            || self.traits.maximum_allocation.maximum > 1.0
+        {
+            return bad("maximum allocation trait bounds must be within (0, 1]");
+        }
+        if self.traits.learning_rate.minimum <= 0.0
+            || self.traits.action_temperature.minimum <= 0.0
+            || self.traits.temperature_decay.minimum < 0.0
+            || self.traits.temperature_decay.maximum > 1.0
+        {
+            return bad("learning and action-temperature trait bounds are invalid");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Activation {

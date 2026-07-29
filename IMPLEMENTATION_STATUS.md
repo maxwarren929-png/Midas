@@ -1,5 +1,21 @@
 # Implementation Status
 
+## Prompt 8B.2: domain configuration validation decomposition
+
+Private domain-local validation now lives beside its configuration DTOs for
+market/features/corporate actions, simulation/policy failures, execution,
+brain, observation, splits, learning, reward, and evolution. Private
+`config/validation.rs` remains the explicit ordered coordinator for
+`Config::validate`.
+
+- Mixed simulation/execution economic checks and observation schema compilation
+  with provider cross-checking remain in the coordinator. Backend/device
+  validation remains the final step.
+- Public APIs, validation sequence, first-error precedence and text,
+  serialization, configuration hashes, deterministic behavior, and checkpoint
+  format 12 are unchanged. Configuration dependency reversal has intentionally
+  not been performed.
+
 ## Prompt 8B.1: ordered configuration validation extraction
 
 The complete ordered `Config::validate` implementation now lives in private

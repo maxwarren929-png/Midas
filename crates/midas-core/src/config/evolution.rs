@@ -1,3 +1,4 @@
+use crate::{MidasError, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -32,6 +33,64 @@ impl Default for EvolutionConfig {
             diversity: EvolutionDiversityConfig::default(),
             fitness: EvolutionFitnessConfig::default(),
         }
+    }
+}
+
+impl EvolutionConfig {
+    pub(super) fn validate(&self) -> Result<()> {
+        let bad = |message: &str| Err(MidasError::Config(message.into()));
+        let mutation = &self.mutation;
+        for (name, value) in [
+            ("weight_probability", mutation.weight_probability),
+            ("bias_probability", mutation.bias_probability),
+            ("reset_probability", mutation.reset_probability),
+            ("trait_probability", mutation.trait_probability),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return bad(&format!("evolution.mutation.{name} must be within [0, 1]"));
+            }
+        }
+        for (name, value) in [
+            ("weight_sigma", mutation.weight_sigma),
+            ("bias_sigma", mutation.bias_sigma),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return bad(&format!("evolution.mutation.{name} must be non-negative"));
+            }
+        }
+        if self.selection.tournament_size == 0
+            || !self.selection.minimum_net_worth.is_finite()
+            || self.selection.minimum_net_worth < 0.0
+            || !self.diversity.sharing_radius.is_finite()
+            || self.diversity.sharing_radius < 0.0
+            || !self.diversity.minimum_mating_distance.is_finite()
+            || self.diversity.minimum_mating_distance < 0.0
+        {
+            return bad("evolution selection or diversity configuration is invalid");
+        }
+        for (name, value) in [
+            (
+                "evolution.fitness.return_weight",
+                self.fitness.return_weight,
+            ),
+            (
+                "evolution.fitness.survival_weight",
+                self.fitness.survival_weight,
+            ),
+            (
+                "evolution.fitness.drawdown_weight",
+                self.fitness.drawdown_weight,
+            ),
+            (
+                "evolution.fitness.turnover_weight",
+                self.fitness.turnover_weight,
+            ),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return bad(&format!("{name} must be finite and non-negative"));
+            }
+        }
+        Ok(())
     }
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
