@@ -1,5 +1,18 @@
 # Implementation Status
 
+## Prompt 8C.2: backend device construction ownership
+
+Compute-device construction and validation now belong to the brain domain.
+Configuration maps `BackendConfig` into a private brain-owned option contract;
+configuration validation, simulation setup, and checkpoint resume use that
+contract directly.
+
+- Public `BackendConfig::compute_device` remains compatible through the isolated
+  private `config/backend_compat.rs` adapter.
+- Backend validation remains the final ordered configuration validation step.
+  Device error text, backend identity, configuration serialization and hashes,
+  checkpoint format 12, and deterministic behavior are unchanged.
+
 ## Prompt 8C.3: configuration dependency audit
 
 The current configuration dependency graph, visibility boundary, accepted leaf

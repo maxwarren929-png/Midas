@@ -45,16 +45,16 @@ The public whole-config entry points delegate through
 
 ## Construction dependencies
 
-Two configuration-to-domain construction dependencies remain intentional in
-the current tree:
+Ordered configuration validation compiles an observation schema at the
+established point in validation. This protects schema/provider consistency and
+must not be reordered.
 
-1. Ordered configuration validation compiles an observation schema at the
-   established point in validation. This protects schema/provider consistency
-   and must not be reordered.
-2. `BackendConfig::compute_device` constructs and validates
-   `brain::ComputeDevice`. This is the remaining config/brain construction edge
-   and should be addressed by the dedicated backend ownership stage, not by an
-   audit cleanup commit.
+Backend runtime construction is brain-owned. Configuration maps
+`BackendConfig` into a private `ComputeDeviceOptions` contract, and brain
+constructs and validates `ComputeDevice`. Configuration validation, simulation
+setup, and checkpoint resume use that constructor directly. The established
+public `BackendConfig::compute_device` API delegates through the isolated
+`config/backend_compat.rs` adapter.
 
 `BrainArchitecture::from_config` already accepts `BrainConfig` plus explicit
 schema hash, observation size, and asset count. It is a narrow domain-owned
@@ -70,6 +70,9 @@ compiler and does not require root `Config`.
   them internally.
 - Observation compatibility methods remain public because they are established
   API.
+- Brain device option views and construction use `pub(crate)` for configuration
+  mapping and composition-root callers. The configuration compatibility method
+  remains public because it is established API.
 
 No visibility can be narrowed further without breaking existing cross-module
 or public contracts. No new public configuration items are needed.
@@ -89,14 +92,11 @@ configuration cleanup.
 
 ## Next priorities
 
-1. Move backend runtime construction ownership to brain through a narrow
-   brain-owned device option contract while retaining
-   `BackendConfig::compute_device` as a compatibility adapter.
-2. Narrow `ReplacementContext` to explicit evolution, replacement, brain, and
+1. Narrow `ReplacementContext` to explicit evolution, replacement, brain, and
    learning inputs before adding replacement strategies.
-3. Evaluate narrow market loading and feature-pipeline option views before
+2. Evaluate narrow market loading and feature-pipeline option views before
    adding data providers or feature configuration.
-4. Consider narrowing agent construction inputs only alongside a dedicated
+3. Consider narrowing agent construction inputs only alongside a dedicated
    agent-factory compatibility plan.
 
 Every stage must keep the configuration regression snapshots, version-12

@@ -51,8 +51,35 @@ pub trait NeuralModel: Send {
 pub enum ComputeDevice {
     CpuNdArray { device: String },
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ComputeBackend {
+    CpuNdArray,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ComputeDeviceOptions<'a> {
+    pub(crate) backend: ComputeBackend,
+    pub(crate) device: &'a str,
+}
+
 impl ComputeDevice {
     pub const CPU_NDARRAY_DEFAULT: &'static str = "default";
+
+    pub(crate) fn from_options(options: ComputeDeviceOptions<'_>) -> Result<Self> {
+        if options.device.trim().is_empty() {
+            return Err(MidasError::Config(
+                "backend.device must not be empty".into(),
+            ));
+        }
+        let device = match options.backend {
+            ComputeBackend::CpuNdArray => Self::CpuNdArray {
+                device: options.device.to_owned(),
+            },
+        };
+        device.validate()?;
+        Ok(device)
+    }
 
     pub fn validate(&self) -> Result<()> {
         match self {

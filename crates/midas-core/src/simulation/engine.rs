@@ -63,7 +63,7 @@ impl SimulationEngine {
         factory: Box<dyn AgentFactory>,
     ) -> Result<Self> {
         config.validate()?;
-        let compute_device = config.backend.compute_device()?;
+        let compute_device = ComputeDevice::from_options(config.backend.compute_device_options())?;
         let pipeline = BackwardFeaturePipeline::from_config(&config);
         let dates = data.split_dates(split.range(&config));
         if dates.len() < 2 {

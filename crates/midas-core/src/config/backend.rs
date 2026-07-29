@@ -1,4 +1,4 @@
-use crate::{MidasError, Result};
+use crate::brain::{ComputeBackend, ComputeDeviceOptions};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -16,18 +16,12 @@ pub enum BackendKind {
 }
 
 impl BackendConfig {
-    pub fn compute_device(&self) -> Result<crate::brain::ComputeDevice> {
-        if self.device.trim().is_empty() {
-            return Err(MidasError::Config(
-                "backend.device must not be empty".into(),
-            ));
-        }
-        let device = match self.kind {
-            BackendKind::Cpu => crate::brain::ComputeDevice::CpuNdArray {
-                device: self.device.clone(),
+    pub(crate) fn compute_device_options(&self) -> ComputeDeviceOptions<'_> {
+        ComputeDeviceOptions {
+            backend: match self.kind {
+                BackendKind::Cpu => ComputeBackend::CpuNdArray,
             },
-        };
-        device.validate()?;
-        Ok(device)
+            device: &self.device,
+        }
     }
 }

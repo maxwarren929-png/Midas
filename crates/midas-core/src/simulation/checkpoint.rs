@@ -264,7 +264,7 @@ impl SimulationEngine {
             ObservationSchema::from_options(config.observation_schema_options());
         let schema_hash = observation_schema.identity(data.assets.len())?;
         validate_schema(&cp, &schema_hash)?;
-        let compute_device = config.backend.compute_device()?;
+        let compute_device = ComputeDevice::from_options(config.backend.compute_device_options())?;
         validate_backend(&cp, &compute_device.identity())?;
         validate_resume_config(&cp, &config.hash()?)?;
         let architecture = BrainArchitecture::from_config(

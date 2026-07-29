@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
 mod backend;
+mod backend_compat;
 mod brain;
 mod checkpoint;
 mod evolution;

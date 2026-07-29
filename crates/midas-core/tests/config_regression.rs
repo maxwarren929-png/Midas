@@ -224,6 +224,27 @@ fn validation_returns_the_first_error_with_exact_text() {
 }
 
 #[test]
+fn backend_device_compatibility_preserves_identity_and_error_text() {
+    let mut config = load("configs/default.toml");
+    assert_eq!(
+        config.backend.compute_device().unwrap().identity(),
+        "cpu_ndarray:default"
+    );
+
+    config.backend.device.clear();
+    assert_eq!(
+        config.backend.compute_device().unwrap_err().to_string(),
+        "configuration error: backend.device must not be empty"
+    );
+
+    config.backend.device = "unsupported".into();
+    assert_eq!(
+        config.backend.compute_device().unwrap_err().to_string(),
+        "configuration error: unsupported CPU NdArray device 'unsupported'; only 'default' is implemented"
+    );
+}
+
+#[test]
 fn default_rolling_config_is_omitted_from_serialization() {
     let mut config = load("configs/default.toml");
     config.observations.rolling_market_stats = RollingMarketStatsConfig::default();

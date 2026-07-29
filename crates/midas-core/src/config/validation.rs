@@ -19,7 +19,7 @@ impl Config {
         self.learning.validate()?;
         self.reward.validate()?;
         self.evolution.validate()?;
-        self.backend.compute_device()?;
+        crate::brain::ComputeDevice::from_options(self.backend.compute_device_options())?;
         Ok(())
     }
 }

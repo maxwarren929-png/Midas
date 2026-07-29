@@ -52,3 +52,19 @@ fn observation_core_keeps_root_config_in_the_compatibility_adapter() {
     assert!(compatibility.contains("pub fn from_config"));
     assert!(compatibility.contains("pub fn try_from_config"));
 }
+
+#[test]
+fn backend_runtime_construction_is_brain_owned_and_compatibility_is_isolated() {
+    let backend_config = include_str!("../src/config/backend.rs");
+    assert!(backend_config.contains("ComputeDeviceOptions"));
+    assert!(!backend_config.contains("ComputeDevice::"));
+    assert!(!backend_config.contains("pub fn compute_device"));
+
+    let compatibility = include_str!("../src/config/backend_compat.rs");
+    assert!(compatibility.contains("pub fn compute_device"));
+    assert!(compatibility.contains("ComputeDevice::from_options"));
+
+    let brain_model = include_str!("../src/brain/model.rs");
+    assert!(brain_model.contains("fn from_options"));
+    assert!(brain_model.contains("backend.device must not be empty"));
+}
