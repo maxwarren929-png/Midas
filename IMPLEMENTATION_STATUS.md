@@ -1,5 +1,20 @@
 # Implementation Status
 
+## Prompt 8C.3: configuration dependency audit
+
+The current configuration dependency graph, visibility boundary, accepted leaf
+DTO consumption, remaining root-`Config` consumers, and construction edges are
+recorded in `docs/CONFIG_ARCHITECTURE.md`. The audit distinguishes composition
+and compatibility contracts from candidates for later narrowing.
+
+- A regression test now prevents root `Config` from returning to observation
+  schema, builder, registry, normalization, or provider code and confirms the
+  established public adapters remain isolated in `observation/config_compat.rs`.
+- No production visibility or ownership changes were justified independently
+  of the skipped backend/brain construction stage. Backend device construction,
+  replacement context, market loading, and agent construction remain explicitly
+  documented future work.
+
 ## Prompt 8C.1: observation configuration contract narrowing
 
 Observation schema compilation and built-in provider construction now consume

@@ -69,6 +69,13 @@ be added to the narrow view only when schema compilation or provider
 construction actually requires them; do not reintroduce root-configuration
 access into `observation/schema.rs` or `observation/builder.rs`.
 
+The audited configuration dependency rules and remaining narrowing candidates
+are documented in [Configuration Architecture](CONFIG_ARCHITECTURE.md). Treat
+root-`Config` dependencies as composition or compatibility decisions requiring
+explicit justification; leaf DTO consumption is acceptable when the consuming
+domain owns compilation or runtime behavior. The architecture regression test
+keeps root configuration out of observation core.
+
 ## Market data and corporate actions
 
 Implement `MarketDataSource` and construct `MarketDataset` through validated constructors. Provider-adjusted history is not accepted as point-in-time data. Raw opens/closes are used for execution and valuation. `FeaturePriceSeries` may apply only split ratios known on or before the requested date; cash dividends remain explicit cash events. New corporate actions belong in the canonical `CorporateAction` enum and need an explicit timeline rule, portfolio accounting test, and future-safety test. The current timeline applies events at the start of the next-open execution date, before planning; same-day splits are ordered before dividends.
