@@ -1,5 +1,24 @@
 # Implementation Status
 
+## Prompt 9C: replacement context narrowing
+
+`ReplacementContext` no longer exposes the root serialized `Config` to
+replacement strategies. It now carries explicit replacement and evolution
+DTOs, evolvable brain traits, architecture, compute device, observation schema,
+deterministic seed material, living summaries, completed lives, and the genome
+registry.
+
+- Built-in replacement behavior, selection inputs, mutation and crossover
+  configuration, RNG derivation, spawn requests, and transactional strategy
+  forking are unchanged.
+- Learning and complete agent construction remain owned by `AgentFactory`
+  after the strategy returns an `AgentSpawnRequest`; replacement strategies do
+  not receive unrelated market, execution, reward, checkpoint, or simulation
+  configuration.
+- An architecture regression prevents `replacement.rs` from regaining a root
+  `Config` dependency. Configuration serialization and hashes, checkpoint
+  format 12, checkpoint bytes, and deterministic reports remain unchanged.
+
 ## Prompt 9B: replacement population semantics
 
 Evolutionary parent selection now uses the configured reproductive-fitness

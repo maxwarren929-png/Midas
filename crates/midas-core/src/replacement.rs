@@ -2,7 +2,7 @@ use crate::{
     AgentId, Result,
     agent::{AgentSpawnRequest, AgentState, SpawnMetadata},
     brain::{BrainArchitecture, BrainGenome, ComputeDevice, PolicyBlueprint},
-    config::Config,
+    config::{EvolutionConfig, EvolvableTraitsConfig, ReplacementConfig},
     evolution::{
         CompletedLifeSummary, DefaultGenomeMutator, EvolutionRng, FitnessScore, GenomeMutator,
         GenomeRecord, MutationContext, MutationReport, ParentCandidate, ParentSelector,
@@ -27,7 +27,9 @@ pub struct ReplacementContext<'a> {
     pub dead_agent: &'a AgentState,
     pub dead_policy: PolicyBlueprint,
     pub living_population: &'a [LivingAgentSummary<'a>],
-    pub config: &'a Config,
+    pub replacement: &'a ReplacementConfig,
+    pub evolution: &'a EvolutionConfig,
+    pub evolvable_traits: &'a EvolvableTraitsConfig,
     pub architecture: &'a BrainArchitecture,
     pub compute_device: &'a ComputeDevice,
     pub observation_schema: &'a ObservationSchema,
@@ -79,7 +81,7 @@ impl ReplacementStrategy for NonEvolutionaryRandomGenomeReplacement {
         let genome = if c.dead_policy == PolicyBlueprint::Neural {
             Some(BrainGenome::random(
                 c.architecture,
-                &c.config.brain.traits,
+                c.evolvable_traits,
                 c.deterministic_seed,
             )?)
         } else {
@@ -138,7 +140,7 @@ impl ReplacementStrategy for EvolutionaryReplacementStrategy {
             })
             .collect::<Vec<_>>();
         let mut candidates = candidates;
-        if c.config.evolution.diversity.fitness_sharing {
+        if c.evolution.diversity.fitness_sharing {
             let genomes = candidates
                 .iter()
                 .map(|candidate| candidate.genome.clone())
@@ -148,7 +150,7 @@ impl ReplacementStrategy for EvolutionaryReplacementStrategy {
                     candidate.fitness,
                     &candidate.genome,
                     &genomes,
-                    c.config.evolution.diversity.sharing_radius as f64,
+                    c.evolution.diversity.sharing_radius as f64,
                 )?;
             }
         }
@@ -157,7 +159,7 @@ impl ReplacementStrategy for EvolutionaryReplacementStrategy {
         let mut selection_rng = EvolutionRng::seed(stream_seed ^ 0x53454c454354_u64);
         let mut crossover_rng = EvolutionRng::seed(stream_seed ^ 0x43524f53534f_u64);
         let mut mutation_rng = EvolutionRng::seed(stream_seed ^ 0x4d5554415445_u64);
-        let selection_config = c.config.evolution.selection.clone();
+        let selection_config = c.evolution.selection.clone();
         let mut selector: Box<dyn ParentSelector> = match selection_config.method {
             crate::config::SelectionMethod::Tournament => Box::new(TournamentSelection {
                 config: selection_config.clone(),
@@ -166,7 +168,7 @@ impl ReplacementStrategy for EvolutionaryReplacementStrategy {
                 config: selection_config.clone(),
             }),
         };
-        let minimum_distance = c.config.evolution.diversity.minimum_mating_distance as f64;
+        let minimum_distance = c.evolution.diversity.minimum_mating_distance as f64;
         let parents = match selector.select_parents_with_constraints(
             &population,
             &crate::evolution::PairConstraints { minimum_distance },
@@ -174,7 +176,7 @@ impl ReplacementStrategy for EvolutionaryReplacementStrategy {
         ) {
             Ok(parents) => parents,
             Err(error) => {
-                let (request, outcome) = match c.config.evolution.fallback {
+                let (request, outcome) = match c.evolution.fallback {
                     crate::config::EvolutionFallback::AbortExperiment => Err(error),
                     crate::config::EvolutionFallback::CloneBestEligible => {
                         let best = population
@@ -204,7 +206,7 @@ impl ReplacementStrategy for EvolutionaryReplacementStrategy {
                             policy_blueprint: PolicyBlueprint::Neural,
                             genome: Some(BrainGenome::random(
                                 c.architecture,
-                                &c.config.brain.traits,
+                                c.evolvable_traits,
                                 c.deterministic_seed,
                             )?),
                             parent_ids: Vec::new(),
@@ -230,11 +232,11 @@ impl ReplacementStrategy for EvolutionaryReplacementStrategy {
         let mut child = match crossover(
             &parents.first.genome,
             &parents.second.genome,
-            &c.config.evolution.crossover,
+            &c.evolution.crossover,
             &mut crossover_rng,
         ) {
             Ok(child) => child,
-            Err(error) => match c.config.evolution.fallback {
+            Err(error) => match c.evolution.fallback {
                 crate::config::EvolutionFallback::AbortExperiment => return Err(error),
                 crate::config::EvolutionFallback::CloneBestEligible => {
                     fallback_reason = Some(format!("crossover_failed:{error}"));
@@ -246,27 +248,23 @@ impl ReplacementStrategy for EvolutionaryReplacementStrategy {
                     fallback_reason = Some(format!("crossover_failed:{error}"));
                     fallback_outcome = Some(EvolutionReplacementOutcome::RandomFallback);
                     crossover_applied = false;
-                    BrainGenome::random(
-                        c.architecture,
-                        &c.config.brain.traits,
-                        c.deterministic_seed,
-                    )?
+                    BrainGenome::random(c.architecture, c.evolvable_traits, c.deterministic_seed)?
                 }
             },
         };
         let mutator = DefaultGenomeMutator {
-            config: c.config.evolution.mutation.clone(),
+            config: c.evolution.mutation.clone(),
         };
         let mutation_report = match mutator.mutate(
             &mut child,
             &MutationContext {
-                traits: &c.config.brain.traits,
+                traits: c.evolvable_traits,
             },
             &mut mutation_rng,
         ) {
             Ok(report) => Some(report),
             Err(error) => {
-                match c.config.evolution.fallback {
+                match c.evolution.fallback {
                     crate::config::EvolutionFallback::AbortExperiment => return Err(error),
                     crate::config::EvolutionFallback::CloneBestEligible => {
                         fallback_reason = Some(format!("mutation_failed:{error}"));
@@ -280,7 +278,7 @@ impl ReplacementStrategy for EvolutionaryReplacementStrategy {
                         crossover_applied = false;
                         child = BrainGenome::random(
                             c.architecture,
-                            &c.config.brain.traits,
+                            c.evolvable_traits,
                             c.deterministic_seed,
                         )?
                     }

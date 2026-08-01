@@ -68,3 +68,14 @@ fn backend_runtime_construction_is_brain_owned_and_compatibility_is_isolated() {
     assert!(brain_model.contains("fn from_options"));
     assert!(brain_model.contains("backend.device must not be empty"));
 }
+
+#[test]
+fn replacement_strategies_do_not_depend_on_root_config() {
+    let replacement = include_str!("../src/replacement.rs");
+    assert!(!replacement.contains("config::Config"));
+    assert!(!replacement.contains("config::{Config"));
+    assert!(!replacement.contains("pub config:"));
+    assert!(replacement.contains("pub replacement: &'a ReplacementConfig"));
+    assert!(replacement.contains("pub evolution: &'a EvolutionConfig"));
+    assert!(replacement.contains("pub evolvable_traits: &'a EvolvableTraitsConfig"));
+}

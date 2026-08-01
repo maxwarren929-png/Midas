@@ -34,7 +34,7 @@ uses are classified as follows:
 | observation compatibility adapter | Preserves public `from_config` APIs | Isolated compatibility debt |
 | market data source and feature pipeline | Existing public loading/construction contract | Candidate for later narrowing |
 | agent construction and blueprint selection | Cross-domain composition input | Candidate for later narrowing |
-| replacement context | Existing strategy contract exposes full experiment configuration | High-value later narrowing |
+| replacement context | Explicit leaf DTOs and runtime inputs; no root configuration | Narrowed |
 | `DatasetSplit::range` | Convenience lookup into root split configuration | Low-priority cleanup |
 
 Observation schema compilation and built-in builder construction do not consume
@@ -86,19 +86,23 @@ only retains mixed simulation/execution checks and observation schema/provider
 cross-checks.
 
 Root `Config` remains owned by `SimulationEngine` because checkpoints, reports,
-replacement, and runtime construction require a stable experiment definition.
+and runtime construction require a stable experiment definition.
 Changing that ownership would be a simulation contract redesign, not
 configuration cleanup.
 
+Replacement strategies consume `ReplacementConfig`, `EvolutionConfig`, and
+`EvolvableTraitsConfig` directly alongside explicit runtime inputs. They do not
+receive root `Config`; learning configuration and complete policy construction
+remain downstream in `AgentFactory` because a replacement strategy only
+selects an `AgentSpawnRequest`.
+
 ## Next priorities
 
-1. Narrow `ReplacementContext` to explicit evolution, replacement, brain, and
-   learning inputs before adding replacement strategies.
-2. Define how stateful custom replacement strategies participate in checkpoint
+1. Define how stateful custom replacement strategies participate in checkpoint
    resume before advertising them as replay-safe.
-3. Evaluate narrow market loading and feature-pipeline option views before
+2. Evaluate narrow market loading and feature-pipeline option views before
    adding data providers or feature configuration.
-4. Consider narrowing agent construction inputs only alongside a dedicated
+3. Consider narrowing agent construction inputs only alongside a dedicated
    agent-factory compatibility plan.
 
 Every stage must keep the configuration regression snapshots, version-12
