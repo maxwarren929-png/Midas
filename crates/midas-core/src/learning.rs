@@ -496,7 +496,11 @@ pub fn generalized_advantages_masked(
     });
     if !fully_valued {
         let mut returns = vec![None; transitions.len()];
-        let mut discounted = 0.0_f32;
+        let mut discounted = transitions
+            .last()
+            .filter(|transition| !transition.done || transition.truncated)
+            .and_then(|transition| transition.next_value)
+            .unwrap_or(0.0);
         for index in (0..transitions.len()).rev() {
             let transition = &transitions[index];
             if transition.done && !transition.truncated {
@@ -728,6 +732,32 @@ mod tests {
         assert!((returns[0].unwrap() - 1.63).abs() < 1e-6);
         assert_eq!(returns[1], None);
         assert_eq!(returns[2], Some(3.0));
+    }
+
+    #[test]
+    fn masked_continuing_rollout_preserves_boundary_bootstrap() {
+        let mut masked = transition(-2.0, 0.0, 0.0, false);
+        masked.observation = None;
+        masked.action_sample = None;
+        masked.value_estimate = None;
+        masked.next_value = None;
+        masked.recurrent_state_before = None;
+        masked.recurrent_state_after = None;
+        masked.actor_eligible = false;
+        masked.critic_eligible = false;
+        masked.invalid_action = true;
+        let transitions = vec![
+            transition(1.0, 0.0, 0.0, false),
+            masked,
+            transition(3.0, 0.0, 5.0, false),
+        ];
+
+        let (advantages, returns) = generalized_advantages_masked(&transitions, 0.9, 0.95).unwrap();
+
+        assert!((advantages[0].unwrap() - 5.275).abs() < 1e-6);
+        assert!(advantages[1].is_none());
+        assert!((advantages[2].unwrap() - 7.5).abs() < 1e-6);
+        assert_eq!(returns, advantages);
     }
 
     #[test]
