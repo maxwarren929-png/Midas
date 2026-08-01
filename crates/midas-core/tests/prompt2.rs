@@ -2,6 +2,7 @@ use midas_core::{
     agent::{AgentBuildContext, AgentFactory, StandardAgentFactory},
     brain::PolicyBlueprint,
     config::Config,
+    evolution::FitnessScore,
     market::{MarketDataSource, PolarsDataSource},
     replacement::{
         EvolutionReplacementOutcome, EvolutionaryReplacementStrategy, LivingAgentSummary,
@@ -219,6 +220,7 @@ fn evolutionary_replacement_selects_two_parents_and_reports_mutation() {
         .map(|state| LivingAgentSummary {
             id: state.id,
             net_worth: state.portfolio.net_worth,
+            selection_fitness: FitnessScore(state.portfolio.net_worth),
             age: state.age,
             policy: PolicyBlueprint::Neural,
             genome: state.genome.as_ref(),
@@ -301,6 +303,7 @@ fn evolutionary_fallbacks_report_typed_outcomes_and_correct_parentage() {
     let one_living = vec![LivingAgentSummary {
         id: states[1].id,
         net_worth: states[1].portfolio.net_worth,
+        selection_fitness: FitnessScore(states[1].portfolio.net_worth),
         age: states[1].age,
         policy: PolicyBlueprint::Neural,
         genome: states[1].genome.as_ref(),
@@ -365,6 +368,7 @@ fn evolutionary_fallbacks_report_typed_outcomes_and_correct_parentage() {
         LivingAgentSummary {
             id: states[1].id,
             net_worth: states[1].portfolio.net_worth,
+            selection_fitness: FitnessScore(states[1].portfolio.net_worth),
             age: states[1].age,
             policy: PolicyBlueprint::Neural,
             genome: states[1].genome.as_ref(),
@@ -375,6 +379,7 @@ fn evolutionary_fallbacks_report_typed_outcomes_and_correct_parentage() {
         LivingAgentSummary {
             id: states[2].id,
             net_worth: states[2].portfolio.net_worth,
+            selection_fitness: FitnessScore(states[2].portfolio.net_worth),
             age: states[2].age,
             policy: PolicyBlueprint::Neural,
             genome: states[2].genome.as_ref(),
@@ -415,6 +420,74 @@ fn evolutionary_fallbacks_report_typed_outcomes_and_correct_parentage() {
 }
 
 #[test]
+fn evolutionary_replacement_uses_selection_fitness_not_raw_net_worth() {
+    let mut config = prompt2_config();
+    let data = PolarsDataSource.load(&config).unwrap();
+    let engine = SimulationEngine::new(config.clone(), data, DatasetSplit::Training).unwrap();
+    config.evolution.fallback = midas_core::config::EvolutionFallback::CloneBestEligible;
+    config.evolution.diversity.fitness_sharing = false;
+    config.evolution.diversity.minimum_mating_distance = f32::NAN;
+    let states = engine.agents().collect::<Vec<_>>();
+    let dead = states[0].clone();
+    let living = vec![
+        LivingAgentSummary {
+            id: states[1].id,
+            net_worth: 20_000.0,
+            selection_fitness: FitnessScore(-1.0),
+            age: states[1].age,
+            policy: PolicyBlueprint::Neural,
+            genome: states[1].genome.as_ref(),
+            maximum_drawdown: states[1].maximum_drawdown,
+            birth_date: states[1].birth_date,
+            parent_ids: states[1].parent_ids.clone(),
+        },
+        LivingAgentSummary {
+            id: states[2].id,
+            net_worth: 1_000.0,
+            selection_fitness: FitnessScore(1.0),
+            age: states[2].age,
+            policy: PolicyBlueprint::Neural,
+            genome: states[2].genome.as_ref(),
+            maximum_drawdown: states[2].maximum_drawdown,
+            birth_date: states[2].birth_date,
+            parent_ids: states[2].parent_ids.clone(),
+        },
+    ];
+    let architecture = midas_core::brain::BrainArchitecture::from_config(
+        &config.brain,
+        engine
+            .observation_schema()
+            .identity(config.market.assets.len())
+            .unwrap(),
+        engine
+            .observation_schema()
+            .dimension(config.market.assets.len()),
+        config.market.assets.len(),
+    );
+    let device = config.backend.compute_device().unwrap();
+    let schema = engine.observation_schema().clone();
+    let registry = std::collections::BTreeMap::new();
+    let mut strategy = EvolutionaryReplacementStrategy::default();
+
+    let request = strategy
+        .create_replacement(&ReplacementContext {
+            dead_agent: &dead,
+            dead_policy: PolicyBlueprint::Neural,
+            living_population: &living,
+            config: &config,
+            architecture: &architecture,
+            compute_device: &device,
+            observation_schema: &schema,
+            deterministic_seed: 31,
+            completed_lives: &[],
+            genome_registry: &registry,
+        })
+        .unwrap();
+
+    assert_eq!(request.parent_ids, vec![states[2].id]);
+}
+
+#[test]
 fn mating_distance_preserves_configured_selection_pressure() {
     let mut unrestricted = prompt2_config();
     unrestricted.evolution.diversity.minimum_mating_distance = 0.0;
@@ -430,6 +503,7 @@ fn mating_distance_preserves_configured_selection_pressure() {
         .map(|(index, state)| LivingAgentSummary {
             id: state.id,
             net_worth: 10_000.0 + (index as f64) * 10.0,
+            selection_fitness: FitnessScore(10_000.0 + (index as f64) * 10.0),
             age: state.age,
             policy: PolicyBlueprint::Neural,
             genome: state.genome.as_ref(),

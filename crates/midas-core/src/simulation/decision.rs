@@ -392,8 +392,14 @@ impl SimulationEngine {
                 }
             }
         }
+        let eligible_parent_ids = transaction
+            .agents
+            .iter()
+            .filter(|agent| agent.state.alive)
+            .map(|agent| agent.state.id)
+            .collect::<std::collections::BTreeSet<_>>();
         for (id, date) in deaths {
-            self.handle_death_in_transaction(transaction, id, date)?;
+            self.handle_death_in_transaction(transaction, id, date, &eligible_parent_ids)?;
         }
         Ok(())
     }

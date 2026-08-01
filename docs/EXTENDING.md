@@ -137,6 +137,15 @@ The action distribution is `BoundedImpulseBeta`: the actor emits two raw values 
 
 Both initial population and death replacement use `AgentFactory::spawn`. A replacement strategy receives `ReplacementContext` with dead state and blueprint, living summaries, configuration, architecture, observation schema, and deterministic seed material. It returns `AgentSpawnRequest`; it must not construct a policy. Strategies with mutable selection/RNG state should implement `ReplacementStrategy::fork`; the simulation swaps the fork only when the containing step commits. `EvolutionaryReplacementStrategy` uses tournament or rank-weighted selection, configurable eligibility, deterministic crossover and bounded mutation, and explicit random/clone/abort fallbacks. Benchmark blueprints remain non-learning and non-evolutionary unless configuration explicitly chooses otherwise.
 
+`LivingAgentSummary::selection_fitness` is the configured reproductive-fitness
+score for the agent's current life; it is not raw net worth or environment
+reward. Custom strategies constructing summaries must provide a finite score.
+For simultaneous deaths, the simulation freezes the surviving parent set
+before creating any replacement, so a newborn is not eligible to reproduce
+again within the same step. Population metrics define `active_lineages` as the
+number of distinct lineages among currently living agents, not the historical
+lineage count in the ancestry registry.
+
 Evolutionary strategies should expose `EvolutionReplacementReport` from
 `ReplacementStrategy::evolution_report`; the free-form spawn reason is
 diagnostic text, not an accounting protocol. Reproduction, clone fallback, and

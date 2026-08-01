@@ -92,16 +92,13 @@ configuration cleanup.
 
 ## Next priorities
 
-1. Resolve replacement population semantics for configured reproductive
-   fitness, same-step newborn parent eligibility, and active-lineage
-   accounting before changing the strategy boundary.
-2. Narrow `ReplacementContext` to explicit evolution, replacement, brain, and
+1. Narrow `ReplacementContext` to explicit evolution, replacement, brain, and
    learning inputs before adding replacement strategies.
-3. Define how stateful custom replacement strategies participate in checkpoint
+2. Define how stateful custom replacement strategies participate in checkpoint
    resume before advertising them as replay-safe.
-4. Evaluate narrow market loading and feature-pipeline option views before
+3. Evaluate narrow market loading and feature-pipeline option views before
    adding data providers or feature configuration.
-5. Consider narrowing agent construction inputs only alongside a dedicated
+4. Consider narrowing agent construction inputs only alongside a dedicated
    agent-factory compatibility plan.
 
 Every stage must keep the configuration regression snapshots, version-12

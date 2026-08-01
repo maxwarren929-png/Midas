@@ -15,6 +15,7 @@ use crate::{
 pub struct LivingAgentSummary<'a> {
     pub id: AgentId,
     pub net_worth: f64,
+    pub selection_fitness: FitnessScore,
     pub age: u64,
     pub policy: PolicyBlueprint,
     pub genome: Option<&'a BrainGenome>,
@@ -125,7 +126,7 @@ impl ReplacementStrategy for EvolutionaryReplacementStrategy {
             .iter()
             .filter_map(|summary| {
                 let genome = summary.genome?.clone();
-                let fitness = FitnessScore::finite(summary.net_worth.max(1e-9)).ok()?;
+                let fitness = FitnessScore::finite(summary.selection_fitness.0).ok()?;
                 Some(ParentCandidate {
                     agent_id: summary.id,
                     genome_id: None,

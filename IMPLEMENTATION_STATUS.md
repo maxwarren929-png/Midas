@@ -1,5 +1,24 @@
 # Implementation Status
 
+## Prompt 9B: replacement population semantics
+
+Evolutionary parent selection now uses the configured reproductive-fitness
+function for every eligible living agent instead of treating raw net worth as
+fitness. `LivingAgentSummary` exposes that finite selection score explicitly so
+replacement strategies receive the same fitness contract for living and
+completed lives.
+
+- A death batch freezes its eligible parent IDs before any replacement is
+  spawned. Newborn agents cannot become parents for later deaths in the same
+  simulation step, while replacement slots and event order remain unchanged.
+- `active_lineages` now counts distinct lineages in the current living
+  population at initialization and after population transitions, rather than
+  all lineages ever recorded in the genome registry.
+- Existing version-12 checkpoints still resume and re-save byte-identically;
+  no stored checkpoint field, serialization layout, RNG stream, or checkpoint
+  version changed. Replacement-context narrowing and custom strategy
+  checkpoint state remain later work.
+
 ## Prompt 9A: replacement correctness contracts
 
 Replacement strategies now expose an additive typed evolutionary report for
@@ -16,10 +35,7 @@ fallback semantics from free-form spawn-reason text.
   missing parent genomes or identities, and invalid mating-distance metadata
   fail transactionally.
 - Existing strategy implementations remain source-compatible because the new
-  report method has a default. Checkpoint format remains 12. Same-step parent
-  eligibility, reproductive-fitness selection, active-lineage semantics,
-  replacement-context narrowing, and custom strategy checkpoint state remain
-  separate later stages.
+  report method has a default. Checkpoint format remains 12.
 
 ## Prompt 8C.2: backend device construction ownership
 

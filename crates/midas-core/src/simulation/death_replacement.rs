@@ -1,9 +1,9 @@
 use crate::{
     AgentId, MidasError, Result,
-    agent::{AgentBuildContext, AgentSpawnRequest},
+    agent::{Agent, AgentBuildContext, AgentSpawnRequest},
     brain::PolicyBlueprint,
     config::DeathHandling,
-    evolution::{CompletedLifeSummary, DefaultFitnessFunction},
+    evolution::{CompletedLifeSummary, DefaultFitnessFunction, FitnessFunction},
     replacement::{EvolutionReplacementOutcome, LivingAgentSummary, ReplacementContext},
 };
 use chrono::NaiveDate;
@@ -71,12 +71,66 @@ fn inherited_lineage(
         .then_some(first)
 }
 
+fn update_population_evolution_metrics(transaction: &mut StepTransaction) -> Result<()> {
+    let living_genomes = transaction
+        .agents
+        .iter()
+        .filter(|candidate| candidate.state.alive)
+        .filter_map(|candidate| candidate.state.genome.as_ref())
+        .collect::<Vec<_>>();
+    transaction.evolution.update_diversity(&living_genomes)?;
+    let living_lineages = transaction
+        .agents
+        .iter()
+        .filter(|candidate| candidate.state.alive)
+        .filter_map(|candidate| candidate.state.lineage_id)
+        .collect::<Vec<_>>();
+    transaction
+        .evolution
+        .update_active_lineages(&living_lineages);
+    Ok(())
+}
+
 impl SimulationEngine {
+    fn living_agent_summary<'a>(&self, agent: &'a Agent) -> Result<LivingAgentSummary<'a>> {
+        let birth_step = self
+            .features
+            .iter()
+            .position(|feature| feature.date == agent.state.birth_date)
+            .unwrap_or(0);
+        let fitness = DefaultFitnessFunction::from_config(&self.config.evolution.fitness)
+            .evaluate(&CompletedLifeSummary {
+                agent_id: agent.state.id,
+                genome_id: agent.state.genome_id,
+                birth_step,
+                death_step: self.next_step,
+                age: agent.state.age,
+                starting_net_worth: self.config.simulation.starting_cash,
+                final_net_worth: agent.state.portfolio.net_worth,
+                maximum_drawdown: agent.state.maximum_drawdown,
+                turnover: agent.state.portfolio.cumulative_turnover,
+                policy_failures: agent.state.total_policy_failures,
+                fitness: None,
+            })?;
+        Ok(LivingAgentSummary {
+            id: agent.state.id,
+            net_worth: agent.state.portfolio.net_worth,
+            selection_fitness: fitness,
+            age: agent.state.age,
+            policy: agent.policy.policy_blueprint(),
+            genome: agent.state.genome.as_ref(),
+            maximum_drawdown: agent.state.maximum_drawdown,
+            birth_date: agent.state.birth_date,
+            parent_ids: agent.state.parent_ids.clone(),
+        })
+    }
+
     pub(super) fn handle_death_in_transaction(
         &mut self,
         transaction: &mut StepTransaction,
         id: AgentId,
         date: NaiveDate,
+        eligible_parent_ids: &std::collections::BTreeSet<AgentId>,
     ) -> Result<()> {
         let dead_index = transaction
             .agents
@@ -111,13 +165,7 @@ impl SimulationEngine {
             genome_id: dead_snapshot.genome_id,
             fitness: fitness.0,
         });
-        let living_genomes = transaction
-            .agents
-            .iter()
-            .filter(|candidate| candidate.state.alive)
-            .filter_map(|candidate| candidate.state.genome.as_ref())
-            .collect::<Vec<_>>();
-        transaction.evolution.update_diversity(&living_genomes)?;
+        update_population_evolution_metrics(transaction)?;
         match self.config.simulation.death_handling {
             DeathHandling::LeaveVacant => Ok(()),
             DeathHandling::EndAgentOnly => {
@@ -142,18 +190,9 @@ impl SimulationEngine {
                     let living = transaction
                         .agents
                         .iter()
-                        .filter(|a| a.state.alive)
-                        .map(|a| LivingAgentSummary {
-                            id: a.state.id,
-                            net_worth: a.state.portfolio.net_worth,
-                            age: a.state.age,
-                            policy: a.policy.policy_blueprint(),
-                            genome: a.state.genome.as_ref(),
-                            maximum_drawdown: a.state.maximum_drawdown,
-                            birth_date: a.state.birth_date,
-                            parent_ids: a.state.parent_ids.clone(),
-                        })
-                        .collect::<Vec<_>>();
+                        .filter(|a| a.state.alive && eligible_parent_ids.contains(&a.state.id))
+                        .map(|a| self.living_agent_summary(a))
+                        .collect::<Result<Vec<_>>>()?;
                     let request = replacement.create_replacement(&ReplacementContext {
                         dead_agent: &dead_state,
                         dead_policy,
@@ -312,13 +351,7 @@ impl SimulationEngine {
                     }
                 }
                 transaction.agents[slot] = agent;
-                let living_genomes = transaction
-                    .agents
-                    .iter()
-                    .filter(|candidate| candidate.state.alive)
-                    .filter_map(|candidate| candidate.state.genome.as_ref())
-                    .collect::<Vec<_>>();
-                transaction.evolution.update_diversity(&living_genomes)?;
+                update_population_evolution_metrics(transaction)?;
                 transaction.events.push(DomainEvent::AgentBorn {
                     agent_id: new_id,
                     date,

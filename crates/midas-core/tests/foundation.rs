@@ -16,6 +16,7 @@ use midas_core::{
         Config, CorporateActionConfig, CorporateActionMode, DeathHandling, EvolutionFallback,
         LearningKind, ObservationFeatureKind, PolicyFailureBehavior, PolicyKind,
     },
+    evolution::FitnessScore,
     execution::{
         CostExecutionEngine, ExecutionApplier, ExecutionPlanner, ExecutionSnapshot, Portfolio,
         TradeSide,
@@ -867,6 +868,27 @@ fn random_evolution_fallback_emits_event_and_only_random_metric() {
 }
 
 #[test]
+fn simultaneous_deaths_use_frozen_parent_pool_and_current_lineages() {
+    let mut c = bankrupt_config(PolicyKind::BurnActorCritic, DeathHandling::Replace);
+    c.simulation.population_size = 3;
+    c.evolution.enabled = true;
+    c.evolution.fallback = EvolutionFallback::RandomGenome;
+    let data = loaded(&c);
+    let mut engine = SimulationEngine::new(c, data, DatasetSplit::Training).unwrap();
+
+    engine.run_steps(1).unwrap();
+
+    let evolution = engine.evolution_state();
+    assert_eq!(evolution.metrics.random_fallback_births, 3);
+    assert_eq!(evolution.metrics.reproduction_count, 0);
+    assert_eq!(evolution.metrics.crossover_count, 0);
+    assert_eq!(evolution.metrics.mutation_count, 0);
+    assert_eq!(evolution.metrics.active_lineages, 3);
+    assert_eq!(evolution.genome_registry.len(), 6);
+    assert_eq!(engine.report().active_lineages, 3);
+}
+
+#[test]
 fn configured_no_replacement_is_respected() {
     for handling in [DeathHandling::LeaveVacant, DeathHandling::EndAgentOnly] {
         let c = bankrupt_config(PolicyKind::Cash, handling);
@@ -929,6 +951,7 @@ fn replacement_context_supports_deterministic_read_only_selection() {
     let living = vec![LivingAgentSummary {
         id: AgentId(7),
         net_worth: state.portfolio.net_worth,
+        selection_fitness: FitnessScore(state.portfolio.net_worth),
         age: state.age,
         policy: PolicyBlueprint::Neural,
         genome: state.genome.as_ref(),

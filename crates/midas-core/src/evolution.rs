@@ -199,12 +199,6 @@ impl EvolutionState {
             },
         );
         self.metrics.birth_count = self.metrics.birth_count.saturating_add(1);
-        self.metrics.active_lineages = self
-            .genome_registry
-            .values()
-            .map(|r| r.lineage_id)
-            .collect::<std::collections::BTreeSet<_>>()
-            .len() as u64;
         self.metrics.maximum_generation_depth =
             self.metrics.maximum_generation_depth.max(generation_depth);
         self.metrics.mean_generation_depth = self
@@ -284,6 +278,14 @@ impl EvolutionState {
                 distances.iter().copied().fold(f64::INFINITY, f64::min);
         }
         Ok(())
+    }
+
+    pub fn update_active_lineages(&mut self, lineage_ids: &[LineageId]) {
+        self.metrics.active_lineages = lineage_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len() as u64;
     }
 }
 

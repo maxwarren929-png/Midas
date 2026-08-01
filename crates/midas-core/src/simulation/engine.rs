@@ -146,6 +146,12 @@ impl SimulationEngine {
             .filter_map(|agent| agent.state.genome.as_ref())
             .collect::<Vec<_>>();
         evolution.update_diversity(&initial_genomes)?;
+        let initial_lineages = agents
+            .iter()
+            .filter(|agent| agent.state.alive)
+            .filter_map(|agent| agent.state.lineage_id)
+            .collect::<Vec<_>>();
+        evolution.update_active_lineages(&initial_lineages);
         let costs = CostExecutionEngine {
             costs: config.execution.clone(),
         };
