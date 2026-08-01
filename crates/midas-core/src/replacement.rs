@@ -1,5 +1,5 @@
 use crate::{
-    AgentId, Result,
+    AgentId, MidasError, Result,
     agent::{AgentSpawnRequest, AgentState, SpawnMetadata},
     brain::{BrainArchitecture, BrainGenome, ComputeDevice, PolicyBlueprint},
     config::{EvolutionConfig, EvolvableTraitsConfig, ReplacementConfig},
@@ -10,6 +10,75 @@ use crate::{
     },
     observation::ObservationSchema,
 };
+use serde::{Deserialize, Serialize};
+
+pub const REPLACEMENT_STATE_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReplacementStrategyState {
+    pub identity: String,
+    pub version: u32,
+    pub payload: Vec<u8>,
+}
+
+impl ReplacementStrategyState {
+    pub fn stateless(identity: impl Into<String>) -> Self {
+        Self {
+            identity: identity.into(),
+            version: REPLACEMENT_STATE_VERSION,
+            payload: Vec::new(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.identity.trim().is_empty() {
+            return Err(MidasError::Checkpoint(
+                "replacement strategy identity must not be empty".into(),
+            ));
+        }
+        if self.version == 0 {
+            return Err(MidasError::Checkpoint(
+                "replacement strategy state version must be positive".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub trait ReplacementStrategyFactory: Send + Sync {
+    fn restore(&self, state: &ReplacementStrategyState) -> Result<Box<dyn ReplacementStrategy>>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BuiltInReplacementStrategyFactory;
+
+impl ReplacementStrategyFactory for BuiltInReplacementStrategyFactory {
+    fn restore(&self, state: &ReplacementStrategyState) -> Result<Box<dyn ReplacementStrategy>> {
+        state.validate()?;
+        let replacement: Box<dyn ReplacementStrategy> = match state.identity.as_str() {
+            "non_evolutionary_random_genome" => Box::new(NonEvolutionaryRandomGenomeReplacement),
+            "evolutionary_two_parent" => Box::new(EvolutionaryReplacementStrategy::default()),
+            identity => {
+                return Err(MidasError::Checkpoint(format!(
+                    "replacement strategy {identity} is not available from the built-in factory"
+                )));
+            }
+        };
+        if state.version != REPLACEMENT_STATE_VERSION {
+            return Err(MidasError::Checkpoint(format!(
+                "replacement strategy {} state version {} is incompatible with {}",
+                state.identity, state.version, REPLACEMENT_STATE_VERSION
+            )));
+        }
+        if !state.payload.is_empty() {
+            return Err(MidasError::Checkpoint(format!(
+                "built-in replacement strategy {} has unexpected checkpoint state",
+                state.identity
+            )));
+        }
+        Ok(replacement)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct LivingAgentSummary<'a> {
@@ -67,10 +136,18 @@ pub trait ReplacementStrategy: Send {
     fn evolution_report(&self) -> Option<EvolutionReplacementReport> {
         None
     }
+    /// Return stable checkpoint state after the latest committed replacement.
+    /// Stateful strategies must override this together with `fork`.
+    fn checkpoint_state(&self) -> Result<ReplacementStrategyState> {
+        Err(MidasError::Checkpoint(format!(
+            "replacement strategy {} does not support checkpoint state",
+            self.name()
+        )))
+    }
     /// Clone strategy state for a transactional simulation step. Stateful
     /// strategies must override this before they can replace agents.
     fn fork(&self) -> Result<Box<dyn ReplacementStrategy>> {
-        Err(crate::MidasError::Policy(
+        Err(MidasError::Policy(
             "replacement strategy does not support transactional forking".into(),
         ))
     }
@@ -102,6 +179,9 @@ impl ReplacementStrategy for NonEvolutionaryRandomGenomeReplacement {
     }
     fn fork(&self) -> Result<Box<dyn ReplacementStrategy>> {
         Ok(Box::new(Self))
+    }
+    fn checkpoint_state(&self) -> Result<ReplacementStrategyState> {
+        Ok(ReplacementStrategyState::stateless(self.name()))
     }
 }
 
@@ -329,5 +409,8 @@ impl ReplacementStrategy for EvolutionaryReplacementStrategy {
     }
     fn fork(&self) -> Result<Box<dyn ReplacementStrategy>> {
         Ok(Box::new(self.clone()))
+    }
+    fn checkpoint_state(&self) -> Result<ReplacementStrategyState> {
+        Ok(ReplacementStrategyState::stateless(self.name()))
     }
 }

@@ -30,8 +30,13 @@ use midas_core::{
         Observation, ObservationBuilder, ObservationContext, ObservationSchema,
         SchemaObservationBuilder,
     },
-    replacement::{LivingAgentSummary, ReplacementContext, ReplacementStrategy},
-    simulation::{DatasetSplit, DomainEvent, SimulationEngine, SimulationLifecycle},
+    replacement::{
+        LivingAgentSummary, ReplacementContext, ReplacementStrategy, ReplacementStrategyFactory,
+        ReplacementStrategyState,
+    },
+    simulation::{
+        CHECKPOINT_VERSION, DatasetSplit, DomainEvent, SimulationEngine, SimulationLifecycle,
+    },
 };
 use proptest::prelude::*;
 use std::{fs, path::PathBuf};
@@ -932,6 +937,152 @@ impl ReplacementStrategy for SelectSpecificLiving {
     }
 }
 
+#[derive(Clone)]
+struct AlternatingReplacement {
+    replacements: u64,
+}
+
+impl ReplacementStrategy for AlternatingReplacement {
+    fn create_replacement(
+        &mut self,
+        _context: &ReplacementContext<'_>,
+    ) -> midas_core::Result<AgentSpawnRequest> {
+        self.replacements += 1;
+        let policy_blueprint = if self.replacements.is_multiple_of(2) {
+            PolicyBlueprint::Random
+        } else {
+            PolicyBlueprint::Cash
+        };
+        Ok(AgentSpawnRequest {
+            policy_blueprint,
+            genome: None,
+            parent_ids: Vec::new(),
+            metadata: SpawnMetadata {
+                reason: format!("alternating_replacement:{}", self.replacements),
+                ..SpawnMetadata::default()
+            },
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "test_alternating_replacement"
+    }
+
+    fn fork(&self) -> midas_core::Result<Box<dyn ReplacementStrategy>> {
+        Ok(Box::new(self.clone()))
+    }
+
+    fn checkpoint_state(&self) -> midas_core::Result<ReplacementStrategyState> {
+        Ok(ReplacementStrategyState {
+            identity: self.name().into(),
+            version: 1,
+            payload: self.replacements.to_le_bytes().to_vec(),
+        })
+    }
+}
+
+struct AlternatingReplacementFactory;
+
+impl ReplacementStrategyFactory for AlternatingReplacementFactory {
+    fn restore(
+        &self,
+        state: &ReplacementStrategyState,
+    ) -> midas_core::Result<Box<dyn ReplacementStrategy>> {
+        state.validate()?;
+        if state.identity != "test_alternating_replacement" || state.version != 1 {
+            return Err(MidasError::Checkpoint(
+                "incompatible alternating replacement state".into(),
+            ));
+        }
+        let payload: [u8; 8] = state.payload.as_slice().try_into().map_err(|_| {
+            MidasError::Checkpoint("invalid alternating replacement payload".into())
+        })?;
+        Ok(Box::new(AlternatingReplacement {
+            replacements: u64::from_le_bytes(payload),
+        }))
+    }
+}
+
+#[test]
+fn stateful_replacement_is_checkpointed_before_commit_and_resumes_deterministically() {
+    let directory = tempfile::tempdir().unwrap();
+    let automatic = directory.path().join("automatic.bin");
+    let full_checkpoint = directory.path().join("full.bin");
+    let resumed_checkpoint = directory.path().join("resumed.bin");
+    let mut c = bankrupt_config(PolicyKind::Cash, DeathHandling::Replace);
+    c.checkpoint.every_steps = 1;
+    c.checkpoint.path = automatic.to_string_lossy().into_owned();
+    let data = loaded(&c);
+
+    let mut full = SimulationEngine::new(c.clone(), data.clone(), DatasetSplit::Training).unwrap();
+    full.set_replacement_strategy(Box::new(AlternatingReplacement { replacements: 0 }));
+    full.run_steps(2).unwrap();
+    full.save_checkpoint(&full_checkpoint).unwrap();
+
+    let mut partial =
+        SimulationEngine::new(c.clone(), data.clone(), DatasetSplit::Training).unwrap();
+    partial.set_replacement_strategy(Box::new(AlternatingReplacement { replacements: 0 }));
+    partial.run_steps(1).unwrap();
+    assert_eq!(
+        u32::from_le_bytes(fs::read(&automatic).unwrap()[..4].try_into().unwrap()),
+        CHECKPOINT_VERSION
+    );
+    assert_eq!(
+        SimulationEngine::resume(c.clone(), data.clone(), &automatic)
+            .err()
+            .unwrap()
+            .to_string(),
+        "checkpoint error: replacement strategy test_alternating_replacement is not available from the built-in factory"
+    );
+
+    let mut resumed = SimulationEngine::resume_with_replacement_factory(
+        c.clone(),
+        data.clone(),
+        &automatic,
+        Box::new(AlternatingReplacementFactory),
+    )
+    .unwrap();
+    resumed.run_steps(1).unwrap();
+    resumed.save_checkpoint(&resumed_checkpoint).unwrap();
+
+    assert_eq!(
+        fs::read(full_checkpoint).unwrap(),
+        fs::read(&resumed_checkpoint).unwrap()
+    );
+    assert_eq!(
+        full.agent_blueprints().collect::<Vec<_>>(),
+        resumed.agent_blueprints().collect::<Vec<_>>()
+    );
+    assert_eq!(full.domain_events, resumed.domain_events);
+    assert_eq!(full.metrics, resumed.metrics);
+
+    SimulationEngine::evaluate_checkpoint_with_replacement_factory(
+        c,
+        data,
+        resumed_checkpoint,
+        DatasetSplit::Validation,
+        Box::new(AlternatingReplacementFactory),
+    )
+    .unwrap();
+}
+
+#[test]
+fn checkpoint_rejects_a_strategy_without_state_support() {
+    let c = config();
+    let data = loaded(&c);
+    let mut engine = SimulationEngine::new(c, data, DatasetSplit::Training).unwrap();
+    engine.set_replacement_strategy(Box::new(SelectSpecificLiving));
+    let checkpoint = tempfile::NamedTempFile::new().unwrap();
+
+    assert_eq!(
+        engine
+            .save_checkpoint(checkpoint.path())
+            .unwrap_err()
+            .to_string(),
+        "checkpoint error: replacement strategy test_specific_living does not support checkpoint state"
+    );
+}
+
 #[test]
 fn replacement_context_supports_deterministic_read_only_selection() {
     let c = config();
@@ -1190,7 +1341,7 @@ fn checkpoint_v6_is_rejected_as_bias_only_optimizer_layout() {
     let file = tempfile::NamedTempFile::new().unwrap();
     engine.save_checkpoint(file.path()).unwrap();
     let mut bytes = fs::read(file.path()).unwrap();
-    assert_eq!(bytes.first().copied(), Some(12));
+    assert_eq!(bytes.first().copied(), Some(CHECKPOINT_VERSION as u8));
     bytes[0] = 6;
     fs::write(file.path(), bytes).unwrap();
     let error = match SimulationEngine::resume(c, data, file.path()) {
@@ -1210,7 +1361,7 @@ fn checkpoint_v8_is_rejected_as_single_asset_action_layout() {
     let file = tempfile::NamedTempFile::new().unwrap();
     engine.save_checkpoint(file.path()).unwrap();
     let mut bytes = fs::read(file.path()).unwrap();
-    assert_eq!(bytes.first().copied(), Some(12));
+    assert_eq!(bytes.first().copied(), Some(CHECKPOINT_VERSION as u8));
     bytes[0] = 8;
     fs::write(file.path(), bytes).unwrap();
     let error = match SimulationEngine::resume(c, data, file.path()) {
@@ -1230,14 +1381,14 @@ fn checkpoint_v10_is_rejected_as_pre_impulse_metrics_layout() {
     let file = tempfile::NamedTempFile::new().unwrap();
     engine.save_checkpoint(file.path()).unwrap();
     let mut bytes = fs::read(file.path()).unwrap();
-    assert_eq!(bytes.first().copied(), Some(12));
+    assert_eq!(bytes.first().copied(), Some(CHECKPOINT_VERSION as u8));
     bytes[0] = 10;
     fs::write(file.path(), bytes).unwrap();
     let error = match SimulationEngine::resume(c, data, file.path()) {
         Ok(_) => panic!("checkpoint 10 was accepted"),
         Err(error) => error,
     };
-    assert!(error.to_string().contains("incompatible with 12"));
+    assert!(error.to_string().contains("incompatible with 13"));
 }
 
 #[test]
@@ -1250,7 +1401,7 @@ fn checkpoint_v11_is_rejected_as_pre_registry_observation_layout() {
     let file = tempfile::NamedTempFile::new().unwrap();
     engine.save_checkpoint(file.path()).unwrap();
     let mut bytes = fs::read(file.path()).unwrap();
-    assert_eq!(bytes.first().copied(), Some(12));
+    assert_eq!(bytes.first().copied(), Some(CHECKPOINT_VERSION as u8));
     bytes[0] = 11;
     fs::write(file.path(), bytes).unwrap();
     let error = match SimulationEngine::resume(c, data, file.path()) {

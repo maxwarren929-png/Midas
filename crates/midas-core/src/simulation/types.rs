@@ -2,11 +2,11 @@ use crate::config::{Config, DateRange};
 use serde::{Deserialize, Serialize};
 
 // Version 11 replaces target allocations with persistent incremental trade
-// impulses and persists their diagnostics in the checkpointed metrics state.
-// Older checkpoints contain incompatible action samples or state layouts and
-// cannot be migrated safely.
-/// Format 12 records the modular observation-registry schema identity.
-pub const CHECKPOINT_VERSION: u32 = 12;
+// impulses. Version 12 records the modular observation-registry schema and can
+// be migrated because built-in replacement strategies had no persisted state.
+// Earlier checkpoints contain incompatible action samples or state layouts.
+/// Format 13 records replacement-strategy identity, version, and state.
+pub const CHECKPOINT_VERSION: u32 = 13;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum DatasetSplit {

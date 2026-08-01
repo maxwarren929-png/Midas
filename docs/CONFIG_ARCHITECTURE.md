@@ -98,13 +98,11 @@ selects an `AgentSpawnRequest`.
 
 ## Next priorities
 
-1. Define how stateful custom replacement strategies participate in checkpoint
-   resume before advertising them as replay-safe.
-2. Evaluate narrow market loading and feature-pipeline option views before
+1. Evaluate narrow market loading and feature-pipeline option views before
    adding data providers or feature configuration.
-3. Consider narrowing agent construction inputs only alongside a dedicated
+2. Consider narrowing agent construction inputs only alongside a dedicated
    agent-factory compatibility plan.
 
 Every stage must keep the configuration regression snapshots, version-12
-checkpoint comparisons, schema and architecture identities, deterministic
-reports, and benchmark output unchanged.
+checkpoint migration coverage, current checkpoint comparisons, schema and
+architecture identities, deterministic reports, and benchmark output stable.

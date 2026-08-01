@@ -9,7 +9,10 @@ use crate::{
     market::{BackwardFeaturePipeline, FeaturePipeline, FeatureRow, MarketDataset},
     metrics::MetricsCollector,
     observation::{ObservationSchema, SchemaObservationBuilder},
-    replacement::{NonEvolutionaryRandomGenomeReplacement, ReplacementStrategy},
+    replacement::{
+        BuiltInReplacementStrategyFactory, NonEvolutionaryRandomGenomeReplacement,
+        ReplacementStrategy, ReplacementStrategyFactory, ReplacementStrategyState,
+    },
     reward::configured_reward,
 };
 use chrono::NaiveDate;
@@ -45,6 +48,49 @@ pub(super) struct Checkpoint {
     pub(super) accessed_through: Option<NaiveDate>,
     pub(super) backend_identity: String,
     pub(super) evolution: EvolutionState,
+    pub(super) replacement: Option<ReplacementStrategyState>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CheckpointV12 {
+    version: u32,
+    config_hash: String,
+    dataset_identity: String,
+    observation_schema_hash: String,
+    architecture: BrainArchitecture,
+    split: DatasetSplit,
+    next_step: usize,
+    next_agent_id: u64,
+    lifecycle: SimulationLifecycle,
+    agents: Vec<AgentCheckpoint>,
+    metrics: MetricsCollector,
+    domain_events: Vec<DomainEvent>,
+    accessed_through: Option<NaiveDate>,
+    backend_identity: String,
+    evolution: EvolutionState,
+}
+
+impl From<CheckpointV12> for Checkpoint {
+    fn from(checkpoint: CheckpointV12) -> Self {
+        Self {
+            version: checkpoint.version,
+            config_hash: checkpoint.config_hash,
+            dataset_identity: checkpoint.dataset_identity,
+            observation_schema_hash: checkpoint.observation_schema_hash,
+            architecture: checkpoint.architecture,
+            split: checkpoint.split,
+            next_step: checkpoint.next_step,
+            next_agent_id: checkpoint.next_agent_id,
+            lifecycle: checkpoint.lifecycle,
+            agents: checkpoint.agents,
+            metrics: checkpoint.metrics,
+            domain_events: checkpoint.domain_events,
+            accessed_through: checkpoint.accessed_through,
+            backend_identity: checkpoint.backend_identity,
+            evolution: checkpoint.evolution,
+            replacement: None,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -62,8 +108,11 @@ pub(super) fn from_state(
     metrics: MetricsCollector,
     domain_events: Vec<DomainEvent>,
     evolution: EvolutionState,
+    replacement: &dyn ReplacementStrategy,
     lifecycle: SimulationLifecycle,
 ) -> Result<Checkpoint> {
+    let replacement = replacement.checkpoint_state()?;
+    replacement.validate()?;
     Ok(Checkpoint {
         version: CHECKPOINT_VERSION,
         config_hash: config.hash()?,
@@ -89,6 +138,7 @@ pub(super) fn from_state(
         accessed_through: features.get(next_step).map(|feature| feature.date),
         backend_identity: compute_device.identity(),
         evolution,
+        replacement: Some(replacement),
     })
 }
 
@@ -102,28 +152,46 @@ pub(super) fn write(path: impl AsRef<Path>, checkpoint: &Checkpoint) -> Result<(
 
 pub(super) fn load_for_resume(path: impl AsRef<Path>) -> Result<Checkpoint> {
     let bytes = fs::read(path)?;
-    let checkpoint: Checkpoint = bincode::deserialize(&bytes).map_err(|error| {
-        MidasError::Checkpoint(format!(
-            "incompatible checkpoint; expected format version {CHECKPOINT_VERSION}; older files use an incompatible neural action-sample layout: {error}"
-        ))
-    })?;
+    let checkpoint = deserialize_checkpoint(&bytes, "resume")?;
     validate_resume_version(&checkpoint)?;
     Ok(checkpoint)
 }
 
 pub(super) fn load_for_evaluation(path: impl AsRef<Path>) -> Result<Checkpoint> {
     let bytes = fs::read(path)?;
-    let checkpoint: Checkpoint = bincode::deserialize(&bytes).map_err(|error| {
-        MidasError::Checkpoint(format!(
-            "incompatible checkpoint; expected format version {CHECKPOINT_VERSION}; older files use an incompatible neural action-sample or metrics layout: {error}"
-        ))
-    })?;
+    let checkpoint = deserialize_checkpoint(&bytes, "evaluation")?;
     validate_evaluation_version(&checkpoint)?;
     Ok(checkpoint)
 }
 
+fn deserialize_checkpoint(bytes: &[u8], operation: &str) -> Result<Checkpoint> {
+    let version = bytes
+        .get(..std::mem::size_of::<u32>())
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u32::from_le_bytes)
+        .ok_or_else(|| {
+            MidasError::Checkpoint(format!(
+                "incompatible checkpoint for {operation}; missing format version"
+            ))
+        })?;
+    if version == 12 {
+        return bincode::deserialize::<CheckpointV12>(bytes)
+            .map(Checkpoint::from)
+            .map_err(|error| {
+                MidasError::Checkpoint(format!(
+                    "incompatible version-12 checkpoint for {operation}: {error}"
+                ))
+            });
+    }
+    bincode::deserialize::<Checkpoint>(bytes).map_err(|error| {
+        MidasError::Checkpoint(format!(
+            "incompatible checkpoint for {operation}; expected format version {CHECKPOINT_VERSION}: {error}"
+        ))
+    })
+}
+
 fn validate_resume_version(checkpoint: &Checkpoint) -> Result<()> {
-    if checkpoint.version != CHECKPOINT_VERSION {
+    if !matches!(checkpoint.version, CHECKPOINT_VERSION | 12) {
         let detail = if checkpoint.version == 11 {
             "; checkpoint 11 predates the modular observation registry and cannot be migrated safely"
         } else if checkpoint.version == 6 {
@@ -142,7 +210,7 @@ fn validate_resume_version(checkpoint: &Checkpoint) -> Result<()> {
 }
 
 fn validate_evaluation_version(checkpoint: &Checkpoint) -> Result<()> {
-    if checkpoint.version != CHECKPOINT_VERSION {
+    if !matches!(checkpoint.version, CHECKPOINT_VERSION | 12) {
         return Err(MidasError::Checkpoint(format!(
             "checkpoint version {} is incompatible with {CHECKPOINT_VERSION}; observation-registry and neural action distribution layouts are not migrated",
             checkpoint.version
@@ -209,6 +277,39 @@ pub(super) fn validate_feature_count(count: usize) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn restore_replacement(
+    checkpoint: &Checkpoint,
+    config: &Config,
+    factory: &dyn ReplacementStrategyFactory,
+) -> Result<Box<dyn ReplacementStrategy>> {
+    let Some(state) = checkpoint.replacement.as_ref() else {
+        if checkpoint.version == 12 {
+            return Ok(configured_replacement(config));
+        }
+        return Err(MidasError::Checkpoint(
+            "checkpoint replacement strategy state is missing".into(),
+        ));
+    };
+    state.validate()?;
+    let replacement = factory.restore(state)?;
+    let restored_state = replacement.checkpoint_state()?;
+    if restored_state != *state {
+        return Err(MidasError::Checkpoint(format!(
+            "restored replacement strategy state does not match checkpoint for {}",
+            state.identity
+        )));
+    }
+    Ok(replacement)
+}
+
+fn configured_replacement(config: &Config) -> Box<dyn ReplacementStrategy> {
+    if config.evolution.enabled {
+        Box::new(crate::replacement::EvolutionaryReplacementStrategy::default())
+    } else {
+        Box::new(NonEvolutionaryRandomGenomeReplacement)
+    }
+}
+
 impl SimulationEngine {
     pub fn save_checkpoint(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let checkpoint = from_state(
@@ -225,6 +326,7 @@ impl SimulationEngine {
             self.metrics.clone(),
             self.domain_events.clone(),
             self.evolution.clone(),
+            self.replacement.as_ref(),
             self.lifecycle.clone(),
         )?;
         write(path.as_ref(), &checkpoint)?;
@@ -241,18 +343,50 @@ impl SimulationEngine {
         Ok(())
     }
     pub fn resume(config: Config, data: MarketDataset, path: impl AsRef<Path>) -> Result<Self> {
-        Self::resume_with_factory(
+        Self::resume_with_factories(
             config,
             data,
             path,
             Box::new(StandardAgentFactory::default()),
+            Box::new(BuiltInReplacementStrategyFactory),
         )
     }
     pub fn resume_with_factory(
         config: Config,
+        data: MarketDataset,
+        path: impl AsRef<Path>,
+        factory: Box<dyn AgentFactory>,
+    ) -> Result<Self> {
+        Self::resume_with_factories(
+            config,
+            data,
+            path,
+            factory,
+            Box::new(BuiltInReplacementStrategyFactory),
+        )
+    }
+
+    pub fn resume_with_replacement_factory(
+        config: Config,
+        data: MarketDataset,
+        path: impl AsRef<Path>,
+        replacement_factory: Box<dyn ReplacementStrategyFactory>,
+    ) -> Result<Self> {
+        Self::resume_with_factories(
+            config,
+            data,
+            path,
+            Box::new(StandardAgentFactory::default()),
+            replacement_factory,
+        )
+    }
+
+    pub fn resume_with_factories(
+        config: Config,
         mut data: MarketDataset,
         path: impl AsRef<Path>,
         factory: Box<dyn AgentFactory>,
+        replacement_factory: Box<dyn ReplacementStrategyFactory>,
     ) -> Result<Self> {
         let cp = load_for_resume(path)?;
         validate_dataset(&cp, &data.identity)?;
@@ -275,6 +409,7 @@ impl SimulationEngine {
         );
         validate_architecture(&cp, &architecture)?;
         validate_feature_count(features.len())?;
+        let replacement = restore_replacement(&cp, &config, replacement_factory.as_ref())?;
         let observation_builder = SchemaObservationBuilder::from_options(
             observation_schema.clone(),
             config.observation_builder_options(),
@@ -305,11 +440,6 @@ impl SimulationEngine {
             costs: config.execution.clone(),
         };
         let reward_function = configured_reward(&config.reward);
-        let replacement: Box<dyn ReplacementStrategy> = if config.evolution.enabled {
-            Box::new(crate::replacement::EvolutionaryReplacementStrategy::default())
-        } else {
-            Box::new(NonEvolutionaryRandomGenomeReplacement)
-        };
         Ok(Self {
             config,
             data,

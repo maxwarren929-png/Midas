@@ -8,6 +8,7 @@ use crate::{
     learning::LearningStrategyState,
     market::MarketDataset,
     metrics::{EventSink, MetricsCollector},
+    replacement::{BuiltInReplacementStrategyFactory, ReplacementStrategyFactory},
 };
 use std::path::Path;
 
@@ -25,9 +26,26 @@ impl SimulationEngine {
         path: impl AsRef<Path>,
         split: DatasetSplit,
     ) -> Result<Self> {
+        Self::evaluate_checkpoint_with_replacement_factory(
+            config,
+            data,
+            path,
+            split,
+            Box::new(BuiltInReplacementStrategyFactory),
+        )
+    }
+
+    pub fn evaluate_checkpoint_with_replacement_factory(
+        config: Config,
+        data: MarketDataset,
+        path: impl AsRef<Path>,
+        split: DatasetSplit,
+        replacement_factory: Box<dyn ReplacementStrategyFactory>,
+    ) -> Result<Self> {
         let cp = checkpoint::load_for_evaluation(path)?;
         checkpoint::validate_dataset(&cp, &data.identity)?;
         checkpoint::validate_evaluation_config(&cp, &config.hash()?)?;
+        checkpoint::restore_replacement(&cp, &config, replacement_factory.as_ref())?;
 
         let mut evaluation_config = config;
         evaluation_config.learning.implementation = LearningKind::NoLearning;

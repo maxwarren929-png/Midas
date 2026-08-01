@@ -273,7 +273,7 @@ fn nondefault_rolling_config_is_serialized_exactly() {
 }
 
 #[test]
-fn version_12_checkpoint_resume_is_byte_and_report_compatible() {
+fn version_12_checkpoint_resume_migrates_to_version_13_without_report_drift() {
     let checkpoint = root().join("checkpoints/prompt6/default-control-seed-41.bin");
     let before = fs::read(&checkpoint).unwrap();
     assert_eq!(before.len(), 2_431_176);
@@ -293,8 +293,18 @@ fn version_12_checkpoint_resume_is_byte_and_report_compatible() {
 
     let saved = tempfile::NamedTempFile::new().unwrap();
     engine.save_checkpoint(saved.path()).unwrap();
-    assert_eq!(fs::read(saved.path()).unwrap(), before);
+    let migrated = fs::read(saved.path()).unwrap();
+    assert_ne!(migrated, before);
+    assert_eq!(u32::from_le_bytes(migrated[..4].try_into().unwrap()), 13);
     assert_eq!(fs::read(checkpoint).unwrap(), before);
+
+    let config = load("configs/prompt6/runs/default-control-seed-41.toml");
+    let data = load_data(&config);
+    let mut restored = SimulationEngine::resume(config, data, saved.path()).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&restored.run().unwrap()).unwrap(),
+        serde_json::to_vec(&report).unwrap()
+    );
 }
 
 #[test]

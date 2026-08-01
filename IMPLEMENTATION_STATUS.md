@@ -1,5 +1,28 @@
 # Implementation Status
 
+## Prompt 9D: stateful replacement checkpointing
+
+Checkpoint format 13 adds a versioned `ReplacementStrategyState` containing a
+stable strategy identity and opaque deterministic payload. Automatic
+checkpoints snapshot the transaction-local replacement fork before authoritative
+commit, so strategy state and the population transition share one checkpoint
+boundary.
+
+- `ReplacementStrategy::checkpoint_state` is required for checkpoint-safe
+  custom strategies; its default fails explicitly instead of silently dropping
+  state. Built-in strategies emit validated stateless version-1 snapshots.
+- `ReplacementStrategyFactory` restores strategy state during resume and frozen
+  evaluation. The engine verifies that the restored strategy re-snapshots to
+  the exact stored identity, version, and payload. New factory-aware resume and
+  evaluation entry points preserve the existing built-in APIs.
+- Format-12 checkpoints are decoded through their original envelope and safely
+  reconstruct the configured built-in strategy. They retain identical reports
+  and are written as format 13 only when explicitly re-saved; older incompatible
+  formats remain rejected.
+- A stateful alternating-strategy regression proves byte-identical uninterrupted
+  and checkpoint-resumed state, including the automatic pre-commit checkpoint
+  path. Configuration hashes and report serialization are unchanged.
+
 ## Prompt 9C: replacement context narrowing
 
 `ReplacementContext` no longer exposes the root serialized `Config` to

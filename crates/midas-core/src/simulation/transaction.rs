@@ -78,6 +78,10 @@ impl SimulationEngine {
             candidate_metrics.record_neural_allocations(&transaction.allocation_stats);
             let mut candidate_events = self.domain_events.clone();
             candidate_events.extend(transaction.events.clone());
+            let replacement = transaction
+                .replacement
+                .as_deref()
+                .unwrap_or(self.replacement.as_ref());
             let checkpoint = checkpoint::from_state(
                 &self.config,
                 &self.data,
@@ -92,6 +96,7 @@ impl SimulationEngine {
                 candidate_metrics,
                 candidate_events,
                 transaction.evolution.clone(),
+                replacement,
                 self.lifecycle.clone(),
             )?;
             checkpoint::write(&checkpoint_path, &checkpoint)?;

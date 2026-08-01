@@ -156,6 +156,16 @@ and genome identity, and mating-distance metadata before spawning. Invalid
 requests abort the step transaction without committing IDs, events, strategy
 state, or ancestry.
 
+Checkpoint-safe custom strategies must implement both transactional `fork` and
+`checkpoint_state`. The latter returns `ReplacementStrategyState` with a stable
+identity, a positive implementation-owned version, and deterministic payload
+bytes. Supply a `ReplacementStrategyFactory` through
+`resume_with_replacement_factory`, `resume_with_factories`, or
+`evaluate_checkpoint_with_replacement_factory` to restore custom state. Resume
+validates the stored state and requires the restored strategy to reproduce it
+exactly. A strategy that retains the default checkpoint method fails checkpoint
+creation explicitly.
+
 ### Evolution and ancestry
 
 `GenomeId`, `LineageId`, and `AgentId` are distinct. `EvolutionState` stores flat `GenomeRecord` ancestry, completed-life fitness summaries, deterministic evolutionary RNG state, and population metrics. Default `GenomeOnly` inheritance crosses birth genomes only; lifetime-trained weights, optimizer state, recurrent memory, and rollouts are reset at birth. Genetic distance is symmetric and supports fitness sharing and minimum mating distance. The mating distance filters the second-parent pool while retaining tournament/rank-weighted selection pressure. If no qualifying pair exists, the same configured selector chooses a constrained fallback and emits `DiversityConstraintRelaxed`; it is never replaced by an unlabelled uniform pair draw. Reset mutation independently samples every weight and bias and resets selected values to zero, reporting weight and bias counts separately.
@@ -239,7 +249,7 @@ compatibility facade, so existing `midas_core::simulation::*` imports remain
 valid. Checkpoint format 12, deterministic replay, evaluation behavior, report
 bytes, event/trace ordering, and all public APIs are unchanged.
 
-`DomainEvent` is deterministic and checkpointed. `OperationalEvent` records effects such as successful checkpoint writes and is not part of simulation equivalence. `SimulationLifecycle` makes completion idempotent. Checkpoint format 12 records the modular observation-schema identity alongside backend identity, the bounded-impulse-Beta distribution identity, separated neural/runtime/optimizer state, full actor/critic head momentum, unfinished masked rollouts with latent impulse samples, deterministic learning state, evolution registries, life records, IDs, impulse diagnostics, mutation diagnostics, and a persistent failed lifecycle. Format 11 and formats 6 through 10 are rejected because their positional observation, metrics, optimizer/rollout, or action-distribution layouts cannot be migrated safely; format or schema changes require a version bump and explicit rejection of incompatible files. Policy failures emit diagnostics, count per agent, and follow `policy_failures.behavior` after configured consecutive/total limits.
+`DomainEvent` is deterministic and checkpointed. `OperationalEvent` records effects such as successful checkpoint writes and is not part of simulation equivalence. `SimulationLifecycle` makes completion idempotent. Checkpoint format 13 records the modular observation-schema and backend identities, bounded-impulse-Beta distribution identity, separated neural/runtime/optimizer state, unfinished masked rollouts, deterministic learning and evolution state, replacement-strategy identity/version/payload, metrics, events, IDs, and persistent failed lifecycle. Format 12 is migrated safely because built-in replacement strategies had no future-affecting persisted state; an explicit re-save writes format 13. Format 11 and formats 6 through 10 remain incompatible because their positional observation, metrics, optimizer/rollout, or action-distribution layouts cannot be migrated safely. Policy failures emit diagnostics, count per agent, and follow `policy_failures.behavior` after configured consecutive/total limits.
 
 Every simulation step is a transaction. The engine forks mutable policy/neural state, buffers domain events, and commits agents, replacement state, counters, metrics, and `next_step` only after the complete close-to-next-open path succeeds. A `StopExperiment` limit discards that transaction and enters `SimulationLifecycle::Failed { reason }`; it does not apply corporate actions, trades, costs, valuation, aging, or automatic checkpoint writes. Repeated calls after failure return the stored reason without mutation. The failure event is diagnostic metadata; the checkpoint boundary remains the previous committed step. Completed runs are likewise idempotent.
 
