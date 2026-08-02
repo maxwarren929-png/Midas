@@ -1,0 +1,72 @@
+{
+  "conditions": [
+    "combined-ppo",
+    "combined-ppo-evolution",
+    "cash",
+    "equal-weight",
+    "buy-and-hold",
+    "random",
+    "momentum"
+  ],
+  "confirmatory_seeds": [
+    41,
+    42,
+    43,
+    44,
+    45,
+    46,
+    47,
+    48,
+    49,
+    50
+  ],
+  "folds": [
+    "fold-1",
+    "fold-2",
+    "fold-3"
+  ],
+  "holdout_folds": [
+    "fold-3"
+  ],
+  "holdout_market_count": 4,
+  "implementation_commit": "23aba2a1bd720304f47f8899409fd6e48562161b",
+  "market_count": 24,
+  "neural_checkpoint_selection": "completed training boundary",
+  "planned_tasks": {
+    "confirmation": 6480,
+    "holdout": 360,
+    "screening": 3240,
+    "total": 10080
+  },
+  "protocol_status": "frozen_before_results",
+  "regime_families": [
+    "uptrend",
+    "downtrend",
+    "sideways",
+    "high-volatility",
+    "low-volatility",
+    "regime-switching",
+    "cross-sectional",
+    "correlated-stress"
+  ],
+  "runner_jobs": 4,
+  "screening_seeds": [
+    41,
+    42,
+    43,
+    44,
+    45
+  ],
+  "success_criteria": {
+    "beats_cash_percentage_minimum": 60.0,
+    "beats_equal_weight_percentage_minimum": 60.0,
+    "beats_momentum_percentage_strictly_greater_than": 50.0,
+    "maximum_single_market_profit_contribution_percentage": 35.0,
+    "minimum_positive_regime_families": 5,
+    "positive_aggregate_paired_advantage_after_costs": true,
+    "positive_development_median": true,
+    "positive_holdout_median": true,
+    "profitable_run_percentage_minimum": 60.0
+  },
+  "task_timeout_seconds": 1800
+}
