@@ -20,7 +20,7 @@ mod validation;
 pub use backend::{BackendConfig, BackendKind};
 pub use brain::{
     ActionDistributionConfig, ActionDistributionKind, Activation, AssetOrder, BrainConfig,
-    EvolvableTraitConfig, EvolvableTraitsConfig, PolicyKind, TradingConfig,
+    EvolvableTraitConfig, EvolvableTraitsConfig, MomentumConfig, PolicyKind, TradingConfig,
 };
 pub use checkpoint::CheckpointConfig;
 pub use evolution::{

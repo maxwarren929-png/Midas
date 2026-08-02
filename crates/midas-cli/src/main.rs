@@ -175,6 +175,7 @@ fn main() -> Result<()> {
                 PolicyKind::Random,
                 PolicyKind::EqualWeight,
                 PolicyKind::BuyAndHold,
+                PolicyKind::Momentum,
             ] {
                 let mut c = base.clone();
                 c.brain.policy = policy;

@@ -16,3 +16,13 @@ __pycache__/
 /reports/prompt3b/final-evolution-report.json
 /reports/prompt4/*-seed-*
 /reports/prompt4/diagnostics-*/
+
+# Prompt 9 markets, materialized run configs, checkpoints, and raw worker output
+# are deterministic from tracked manifests/specifications. Compact aggregate
+# tables and provenance metadata remain tracked.
+/data/prompt9/*/
+!/data/prompt9/manifests/
+/configs/prompt9/runs/
+/reports/prompt9/raw/
+/reports/prompt9/logs/
+/reports/prompt9/*-run-manifest.csv

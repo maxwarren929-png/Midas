@@ -1,0 +1,118 @@
+{
+  "assets": [
+    {
+      "drift_offset": 0.0,
+      "start_price": 100.0,
+      "symbol": "SPY"
+    },
+    {
+      "drift_offset": 4e-05,
+      "start_price": 80.0,
+      "symbol": "AAA"
+    },
+    {
+      "drift_offset": -3e-05,
+      "start_price": 120.0,
+      "symbol": "BBB"
+    },
+    {
+      "drift_offset": 2e-05,
+      "start_price": 60.0,
+      "symbol": "CCC"
+    }
+  ],
+  "days": 1600,
+  "generation_timestamp": "2026-08-02T00:00:00Z",
+  "name": "regime-switching-01",
+  "regime_family": "regime-switching",
+  "regimes": [
+    {
+      "asset_drift_offsets": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "correlation": 0.35,
+      "drift": 0.00045,
+      "end": 400,
+      "label": "low_volatility_uptrend",
+      "leadership_rotation_period": 0,
+      "mean_reversion": 0.0,
+      "shock_mean": 0.0,
+      "shock_probability": 0.0,
+      "shock_volatility": 0.0,
+      "start": 0,
+      "volatility": 0.005,
+      "volatility_clustering": 0.25
+    },
+    {
+      "asset_drift_offsets": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "correlation": 0.72,
+      "drift": -0.00055,
+      "end": 800,
+      "label": "high_volatility_downtrend",
+      "leadership_rotation_period": 0,
+      "mean_reversion": 0.0,
+      "shock_mean": -0.025,
+      "shock_probability": 0.02,
+      "shock_volatility": 0.012,
+      "start": 400,
+      "volatility": 0.02,
+      "volatility_clustering": 0.82
+    },
+    {
+      "asset_drift_offsets": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "correlation": 0.4,
+      "drift": 5e-05,
+      "end": 1200,
+      "label": "sideways_recovery",
+      "leadership_rotation_period": 0,
+      "mean_reversion": 0.004,
+      "shock_mean": 0.0,
+      "shock_probability": 0.0,
+      "shock_volatility": 0.0,
+      "start": 800,
+      "volatility": 0.011,
+      "volatility_clustering": 0.25
+    },
+    {
+      "asset_drift_offsets": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "correlation": 0.48,
+      "drift": 0.00035,
+      "end": 1600,
+      "label": "renewed_trend",
+      "leadership_rotation_period": 0,
+      "mean_reversion": 0.0,
+      "shock_mean": 0.0,
+      "shock_probability": 0.0,
+      "shock_volatility": 0.0,
+      "start": 1200,
+      "volatility": 0.009,
+      "volatility_clustering": 0.25
+    }
+  ],
+  "seed": 90601,
+  "start_date": "2010-01-04",
+  "version": 1,
+  "volume": {
+    "base": 2000000.0,
+    "noise": 0.22,
+    "volatility_sensitivity": 8.0
+  }
+}

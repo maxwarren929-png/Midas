@@ -1,0 +1,58 @@
+{
+  "assets": [
+    {
+      "drift_offset": 0.0,
+      "start_price": 100.0,
+      "symbol": "SPY"
+    },
+    {
+      "drift_offset": 4e-05,
+      "start_price": 80.0,
+      "symbol": "AAA"
+    },
+    {
+      "drift_offset": -3e-05,
+      "start_price": 120.0,
+      "symbol": "BBB"
+    },
+    {
+      "drift_offset": 2e-05,
+      "start_price": 60.0,
+      "symbol": "CCC"
+    }
+  ],
+  "days": 1600,
+  "generation_timestamp": "2026-08-02T00:00:00Z",
+  "name": "holdout-04-correlated-stress",
+  "regime_family": "correlated-stress",
+  "regimes": [
+    {
+      "asset_drift_offsets": [
+        8e-05,
+        2e-05,
+        -4e-05,
+        -8e-05
+      ],
+      "correlation": 0.88,
+      "drift": 0.00012,
+      "end": 1600,
+      "label": "correlation_stress",
+      "leadership_rotation_period": 0,
+      "mean_reversion": 0.0,
+      "shock_mean": -0.028,
+      "shock_probability": 0.025,
+      "shock_volatility": 0.016,
+      "start": 0,
+      "volatility": 0.013,
+      "volatility_clustering": 0.78
+    }
+  ],
+  "seed": 99004,
+  "start_date": "2010-01-04",
+  "version": 1,
+  "volume": {
+    "base": 2000000.0,
+    "noise": 0.22,
+    "volatility_sensitivity": 8.0
+  }
+}

@@ -1,0 +1,2 @@
+fold,training_start,training_end,validation_start,validation_end,test_start,test_end
+fold-3,2010-01-04,2014-08-08,2014-08-11,2015-05-15,2015-05-18,2016-02-19

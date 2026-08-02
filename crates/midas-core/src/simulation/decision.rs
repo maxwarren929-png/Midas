@@ -116,7 +116,8 @@ impl SimulationEngine {
                 crate::brain::PolicyBlueprint::Neural => None,
                 crate::brain::PolicyBlueprint::Cash
                 | crate::brain::PolicyBlueprint::EqualWeight
-                | crate::brain::PolicyBlueprint::BuyAndHold { .. } => None,
+                | crate::brain::PolicyBlueprint::BuyAndHold { .. }
+                | crate::brain::PolicyBlueprint::Momentum { .. } => None,
             };
             let action_context = ActionValidationContext {
                 asset_count: self.data.assets.len(),

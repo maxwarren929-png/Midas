@@ -2,7 +2,7 @@ use crate::{
     AgentId, MidasError, Result,
     brain::{
         BrainArchitecture, BrainGenome, BurnNeuralModelFactory, BuyAndHoldPolicy, CashPolicy,
-        ComputeDevice, EqualWeightPolicy, NeuralModelFactory, NeuralPolicy, Policy,
+        ComputeDevice, EqualWeightPolicy, MomentumPolicy, NeuralModelFactory, NeuralPolicy, Policy,
         PolicyBlueprint, PolicySnapshot, RandomPolicy,
     },
     config::Config,
@@ -127,6 +127,13 @@ impl StandardAgentFactory {
                     maximum_trade_fraction,
                 ))
             }
+            PolicyBlueprint::Momentum {
+                signal_indices,
+                minimum_signal_bits,
+            } => Box::new(MomentumPolicy::new(
+                signal_indices.clone(),
+                f32::from_bits(*minimum_signal_bits),
+            )),
         })
     }
     fn build_learning(
@@ -255,6 +262,10 @@ impl AgentFactory for StandardAgentFactory {
                     maximum_trade_fraction,
                 ))
             }
+            PolicySnapshot::Momentum {
+                signal_indices,
+                minimum_signal,
+            } => Box::new(MomentumPolicy::new(signal_indices, minimum_signal)),
         };
         let learning = self.build_learning(
             &policy.policy_blueprint(),
@@ -284,5 +295,39 @@ pub fn configured_blueprint(config: &Config) -> Result<PolicyBlueprint> {
                 .ok_or_else(|| MidasError::Config("benchmark asset missing".into()))?,
         },
         crate::config::PolicyKind::BurnActorCritic => PolicyBlueprint::Neural,
+        crate::config::PolicyKind::Momentum => {
+            let schema = crate::observation::ObservationSchema::try_from_options(
+                config.observation_schema_options(),
+            )?;
+            let signal_indices = (0..config.market.assets.len())
+                .map(|asset_index| {
+                    schema
+                        .entries
+                        .iter()
+                        .find(|entry| {
+                            matches!(
+                                entry.source,
+                                Some(crate::observation::ObservationSource::Market {
+                                    feature,
+                                    asset_index: source_asset,
+                                }) if feature == config.brain.momentum.signal_feature
+                                    && source_asset == asset_index
+                            )
+                        })
+                        .map(|entry| entry.index)
+                        .ok_or_else(|| {
+                            MidasError::Config(format!(
+                                "momentum signal {:?} is missing for asset {}",
+                                config.brain.momentum.signal_feature,
+                                config.market.assets[asset_index]
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            PolicyBlueprint::Momentum {
+                signal_indices,
+                minimum_signal_bits: config.brain.momentum.minimum_signal.to_bits(),
+            }
+        }
     })
 }

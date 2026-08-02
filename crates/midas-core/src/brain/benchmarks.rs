@@ -96,6 +96,82 @@ pub struct BuyAndHoldPolicy {
     pub(crate) initialized: bool,
     pub(crate) target_asset: usize,
 }
+
+pub struct MomentumPolicy {
+    pub(crate) signal_indices: Vec<usize>,
+    pub(crate) minimum_signal: f32,
+}
+
+impl MomentumPolicy {
+    pub fn new(signal_indices: Vec<usize>, minimum_signal: f32) -> Self {
+        Self {
+            signal_indices,
+            minimum_signal,
+        }
+    }
+}
+
+impl Policy for MomentumPolicy {
+    fn propose_action(
+        &mut self,
+        observation: &Observation,
+        c: &PolicyContext<'_>,
+    ) -> Result<ProposedAction> {
+        let selected = self
+            .signal_indices
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(asset_index, _)| c.tradable.get(*asset_index).copied().unwrap_or(false))
+            .filter_map(|(asset_index, observation_index)| {
+                observation
+                    .values
+                    .get(observation_index)
+                    .copied()
+                    .filter(|signal| signal.is_finite() && *signal > self.minimum_signal)
+                    .map(|signal| (asset_index, signal))
+            })
+            .max_by(|left, right| {
+                left.1
+                    .total_cmp(&right.1)
+                    .then_with(|| right.0.cmp(&left.0))
+            })
+            .map(|(asset_index, _)| asset_index);
+
+        let mut weights = vec![0.0; c.tradable.len() + 1];
+        if let Some(asset_index) = selected {
+            weights[asset_index + 1] = 1.0;
+        } else {
+            weights[0] = 1.0;
+        }
+        Ok(ProposedAction::Allocation(ProposedAllocation::rebalance(
+            weights,
+        )))
+    }
+
+    fn snapshot(&self) -> Result<PolicySnapshot> {
+        Ok(PolicySnapshot::Momentum {
+            signal_indices: self.signal_indices.clone(),
+            minimum_signal: self.minimum_signal,
+        })
+    }
+
+    fn reset_episode_state(&mut self) {}
+
+    fn policy_blueprint(&self) -> PolicyBlueprint {
+        PolicyBlueprint::Momentum {
+            signal_indices: self.signal_indices.clone(),
+            minimum_signal_bits: self.minimum_signal.to_bits(),
+        }
+    }
+
+    fn fork(&self) -> Result<Box<dyn Policy>> {
+        Ok(Box::new(Self::new(
+            self.signal_indices.clone(),
+            self.minimum_signal,
+        )))
+    }
+}
 impl BuyAndHoldPolicy {
     pub fn new(target_asset: usize) -> Self {
         Self {
@@ -139,5 +215,61 @@ impl Policy for BuyAndHoldPolicy {
             initialized: self.initialized,
             target_asset: self.target_asset,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn weights(action: ProposedAction) -> Vec<f64> {
+        match action {
+            ProposedAction::Allocation(allocation) => allocation.weights,
+            ProposedAction::TradeImpulses(_) => panic!("benchmark returned trade impulses"),
+        }
+    }
+
+    #[test]
+    fn momentum_uses_only_configured_current_observation_values() {
+        let observation = Observation {
+            schema_hash: "schema".into(),
+            values: vec![0.2, 99.0, 0.4, -99.0, 0.4],
+        };
+        let current = [1.0, 0.0, 0.0, 0.0];
+        let mut policy = MomentumPolicy::new(vec![0, 2, 4], 0.0);
+
+        let tied = policy
+            .propose_action(
+                &observation,
+                &PolicyContext {
+                    tradable: &[true, true, true],
+                    current_allocations: &current,
+                },
+            )
+            .unwrap();
+        assert_eq!(weights(tied), vec![0.0, 0.0, 1.0, 0.0]);
+
+        let unavailable_leader = policy
+            .propose_action(
+                &observation,
+                &PolicyContext {
+                    tradable: &[true, false, true],
+                    current_allocations: &current,
+                },
+            )
+            .unwrap();
+        assert_eq!(weights(unavailable_leader), vec![0.0, 0.0, 0.0, 1.0]);
+
+        policy.minimum_signal = 0.5;
+        let below_threshold = policy
+            .propose_action(
+                &observation,
+                &PolicyContext {
+                    tradable: &[true, true, true],
+                    current_allocations: &current,
+                },
+            )
+            .unwrap();
+        assert_eq!(weights(below_threshold), vec![1.0, 0.0, 0.0, 0.0]);
     }
 }

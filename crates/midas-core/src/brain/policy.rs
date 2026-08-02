@@ -15,8 +15,14 @@ pub enum PolicyBlueprint {
     Cash,
     Random,
     EqualWeight,
-    BuyAndHold { target_asset: usize },
+    BuyAndHold {
+        target_asset: usize,
+    },
     Neural,
+    Momentum {
+        signal_indices: Vec<usize>,
+        minimum_signal_bits: u32,
+    },
 }
 pub struct PolicyContext<'a> {
     pub tradable: &'a [bool],
@@ -89,6 +95,10 @@ pub enum PolicySnapshot {
         rng: ChaCha8Rng,
         temperature: f32,
         maximum_trade_fraction: f64,
+    },
+    Momentum {
+        signal_indices: Vec<usize>,
+        minimum_signal: f32,
     },
 }
 

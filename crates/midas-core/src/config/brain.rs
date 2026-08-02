@@ -1,3 +1,4 @@
+use super::market::FeatureKind;
 use crate::{MidasError, Result};
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +18,8 @@ pub struct BrainConfig {
     pub action_distribution: ActionDistributionConfig,
     #[serde(default)]
     pub trading: TradingConfig,
+    #[serde(default, skip_serializing_if = "MomentumConfig::is_default")]
+    pub momentum: MomentumConfig,
 }
 fn default_activation() -> Activation {
     Activation::Gelu
@@ -54,6 +57,7 @@ impl BrainConfig {
         {
             return bad("brain.trading.maximum_trade_fraction must be in (0, 1]");
         }
+        self.momentum.validate()?;
         for (name, value) in [
             ("learning_rate", &self.traits.learning_rate),
             ("entropy_coefficient", &self.traits.entropy_coefficient),
@@ -97,6 +101,45 @@ pub enum PolicyKind {
     EqualWeight,
     BuyAndHold,
     BurnActorCritic,
+    Momentum,
+}
+
+/// Point-in-time cross-sectional momentum benchmark configuration.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MomentumConfig {
+    #[serde(default = "default_momentum_signal_feature")]
+    pub signal_feature: FeatureKind,
+    #[serde(default)]
+    pub minimum_signal: f32,
+}
+
+fn default_momentum_signal_feature() -> FeatureKind {
+    FeatureKind::Return20
+}
+
+impl MomentumConfig {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    fn validate(&self) -> Result<()> {
+        if !self.minimum_signal.is_finite() {
+            return Err(MidasError::Config(
+                "brain.momentum.minimum_signal must be finite".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for MomentumConfig {
+    fn default() -> Self {
+        Self {
+            signal_feature: default_momentum_signal_feature(),
+            minimum_signal: 0.0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

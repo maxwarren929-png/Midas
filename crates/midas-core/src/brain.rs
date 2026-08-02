@@ -17,7 +17,9 @@ mod state;
 mod tests;
 
 pub use architecture::{BrainArchitecture, MemoryArchitecture};
-pub use benchmarks::{BuyAndHoldPolicy, CashPolicy, EqualWeightPolicy, RandomPolicy};
+pub use benchmarks::{
+    BuyAndHoldPolicy, CashPolicy, EqualWeightPolicy, MomentumPolicy, RandomPolicy,
+};
 pub use burn_runtime::{BurnNeuralModel, BurnNeuralModelFactory};
 pub use genome::{BrainGenome, DenseGenome, LearningTraits};
 pub(crate) use model::{ComputeBackend, ComputeDeviceOptions};

@@ -1,0 +1,8 @@
+condition,kind,template
+combined-ppo,neural,configs/prompt9/conditions/combined-ppo.toml
+combined-ppo-evolution,neural,configs/prompt9/conditions/combined-ppo-evolution.toml
+cash,benchmark,configs/prompt9/conditions/cash.toml
+equal-weight,benchmark,configs/prompt9/conditions/equal-weight.toml
+buy-and-hold,benchmark,configs/prompt9/conditions/buy-and-hold.toml
+random,benchmark,configs/prompt9/conditions/random.toml
+momentum,benchmark,configs/prompt9/conditions/momentum.toml

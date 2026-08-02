@@ -3,7 +3,7 @@ use clap::{Parser, ValueEnum};
 use midas_core::{
     config::Config,
     market::{MarketDataSource, PolarsDataSource},
-    simulation::{DatasetSplit, SimulationEngine},
+    simulation::{DatasetSplit, ReportTrace, SimulationEngine},
 };
 use serde_json::json;
 use std::path::PathBuf;
@@ -70,14 +70,52 @@ fn main() -> Result<()> {
             .ok_or_else(|| anyhow!("train mode requires --checkpoint"))?;
         engine.save_checkpoint(checkpoint)?;
     }
-    let agents = engine.agents().cloned().collect::<Vec<_>>();
+    let agents = engine
+        .agents()
+        .map(|agent| {
+            json!({
+                "id": agent.id,
+                "alive": agent.alive,
+                "age": agent.age,
+                "portfolio": agent.portfolio,
+                "total_policy_failures": agent.total_policy_failures,
+                "consecutive_policy_failures": agent.consecutive_policy_failures,
+                "genome_id": agent.genome_id,
+                "lineage_id": agent.lineage_id,
+            })
+        })
+        .collect::<Vec<_>>();
+    let evolution = engine.evolution_state();
+    let mut decision_count = 0usize;
+    let mut cash_allocation_total = 0.0;
+    let mut concentration_total = 0.0;
+    let mut active_positions_total = 0usize;
+    for trace in &engine.report_traces {
+        if let ReportTrace::Decision(decision) = trace {
+            decision_count += 1;
+            cash_allocation_total += decision.cash_allocation;
+            concentration_total += decision.maximum_concentration;
+            active_positions_total += decision.active_positions;
+        }
+    }
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
             "report": report,
             "metrics": engine.metrics,
             "agents": agents,
-            "evolution": engine.evolution_state(),
+            "evolution": {
+                "metrics": evolution.metrics,
+                "next_genome_id": evolution.next_genome_id,
+                "next_lineage_id": evolution.next_lineage_id,
+            },
+            "diagnostics": {
+                "report_trace_count": engine.report_traces.len(),
+                "decision_count": decision_count,
+                "mean_cash_allocation": if decision_count == 0 { 0.0 } else { cash_allocation_total / decision_count as f64 },
+                "mean_concentration": if decision_count == 0 { 0.0 } else { concentration_total / decision_count as f64 },
+                "mean_active_positions": if decision_count == 0 { 0.0 } else { active_positions_total as f64 / decision_count as f64 },
+            },
             "config_hash": config_hash,
         }))?
     );
