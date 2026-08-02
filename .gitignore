@@ -2,6 +2,8 @@
 /checkpoints/
 /data/processed/
 *.proptest-regressions
+__pycache__/
+*.pyc
 
 # Prompt 3B raw traces and calibration outputs are reproducible and kept locally;
 # compact summaries and representative diagnostics under reports/prompt3b are tracked.
