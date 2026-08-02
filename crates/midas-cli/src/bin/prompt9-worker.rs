@@ -86,6 +86,7 @@ fn main() -> Result<()> {
         })
         .collect::<Vec<_>>();
     let evolution = engine.evolution_state();
+    let metrics = &engine.metrics;
     let mut decision_count = 0usize;
     let mut cash_allocation_total = 0.0;
     let mut concentration_total = 0.0;
@@ -102,7 +103,21 @@ fn main() -> Result<()> {
         "{}",
         serde_json::to_string_pretty(&json!({
             "report": report,
-            "metrics": engine.metrics,
+            "metrics": {
+                "invalid_actions": metrics.invalid_actions,
+                "rejected_trades": metrics.rejected_trades,
+                "policy_failures": metrics.policy_failures,
+                "deaths": metrics.deaths,
+                "births": metrics.births,
+                "learning_updates": metrics.learning_updates,
+                "fitness_assignments": metrics.fitness_assignments,
+                "reproductions": metrics.reproductions,
+                "evolution_fallbacks": metrics.evolution_fallbacks,
+                "masked_failure_transitions": metrics.masked_failure_transitions,
+                "actor_ineligible_transitions": metrics.actor_ineligible_transitions,
+                "critic_ineligible_transitions": metrics.critic_ineligible_transitions,
+                "invalid_action_penalty_total": metrics.invalid_action_penalty_total,
+            },
             "agents": agents,
             "evolution": {
                 "metrics": evolution.metrics,
