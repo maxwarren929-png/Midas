@@ -112,6 +112,21 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual((root / "worker-count").read_text(), "1")
             self.assertEqual(json.loads(output.read_text())["report"], {})
 
+    def test_manifest_recovery_ignores_incomplete_rows_and_replaces_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "reports/prompt9/screening-run-manifest.csv"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text("status,task\npassed,complete\npassed\n", encoding="utf-8")
+            with patch.object(run_experiment, "ROOT", root):
+                run_experiment.write_run_manifest(
+                    "screening",
+                    [{"task": "new", "status": "passed", "output": "new.json"}],
+                )
+            rows = run_experiment.read_manifest(manifest)
+            self.assertEqual([row["task"] for row in rows], ["complete", "new"])
+            self.assertFalse(manifest.with_suffix(".tmp").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

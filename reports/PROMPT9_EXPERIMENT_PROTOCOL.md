@@ -2,6 +2,19 @@
 
 Status: frozen before screening, confirmatory test, or holdout evaluation.
 
+### Recorded Protocol Correction
+
+During the required interrupted-run resume check after screening outputs had been
+created, an incomplete final CSV row caused the runner's manifest rewrite to sort
+a null task key and truncate the manifest. Raw reports, checkpoints, market data,
+and simulation results were not affected. A regression test and atomic,
+incomplete-row-tolerant manifest rewrite were added in a separate correctness
+commit. Existing raw outputs are retained because the worker and all simulation
+inputs are unchanged; the affected manifest is rebuilt from provenance-matched
+outputs. The implementation commit below remains the simulation/generator/worker
+identity embedded in every run, while the final report will identify the runner
+correctness commit separately.
+
 ## Implementation
 
 - Implementation commit: `23aba2a1bd720304f47f8899409fd6e48562161b`

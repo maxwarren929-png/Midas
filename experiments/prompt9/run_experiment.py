@@ -229,13 +229,19 @@ def execute_task(task: Task, worker: Path, timeout: int) -> dict[str, Any]:
 def write_run_manifest(stage: str, rows: list[dict[str, Any]]) -> None:
     path = ROOT / "reports" / "prompt9" / f"{stage}-run-manifest.csv"
     path.parent.mkdir(parents=True, exist_ok=True)
-    existing = {row["task"]: row for row in read_manifest(path)} if path.exists() else {}
+    existing = (
+        {row["task"]: row for row in read_manifest(path) if row.get("task")}
+        if path.exists()
+        else {}
+    )
     existing.update({row["task"]: {key: str(value) for key, value in row.items()} for row in rows})
     fieldnames = sorted({key for row in existing.values() for key in row})
-    with path.open("w", newline="", encoding="utf-8") as handle:
+    temporary = path.with_suffix(".tmp")
+    with temporary.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, lineterminator="\n")
         writer.writeheader()
         writer.writerows(existing[key] for key in sorted(existing))
+    temporary.replace(path)
 
 
 def main() -> None:
