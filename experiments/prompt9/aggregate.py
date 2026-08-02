@@ -249,6 +249,8 @@ def aggregate(
     write_csv(output_dir / "per-run-results.csv", rows)
     write_csv(output_dir / "per-market-summary.csv", summarize(rows, ("condition", "split", "market_id")))
     write_csv(output_dir / "per-regime-summary.csv", summarize(rows, ("condition", "split", "regime_family")))
+    write_csv(output_dir / "per-fold-summary.csv", summarize(rows, ("condition", "split", "fold")))
+    write_csv(output_dir / "per-seed-summary.csv", summarize(rows, ("condition", "split", "seed")))
     write_csv(output_dir / "all-markets-summary.csv", summarize(rows, ("condition", "split")))
     write_csv(output_dir / "paired-comparisons.csv", paired_comparisons(rows))
     write_csv(output_dir / "holdout-summary.csv", summarize([row for row in rows if row["holdout"] == "true"], ("condition", "split")))

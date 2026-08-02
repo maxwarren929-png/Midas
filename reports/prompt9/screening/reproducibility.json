@@ -1,0 +1,19 @@
+{
+  "completed_evaluations": 2520,
+  "failed_tasks": 0,
+  "input_manifests": {
+    "data/prompt9/manifests/markets.csv": "f84a46a792089fedb14295b92cd5bb4b1db019fa03fc1370d76c970e33930634",
+    "reports/prompt9/screening-run-manifest.csv": "27b1b356a6cc6e10f69fa37b9ee95c942ae546394cd7b6e6502bb6a9a63df740"
+  },
+  "output_sha256": {
+    "all-markets-summary.csv": "48302bab3b2e25fe039f12f50d4d5bd6ccec0d667299c87f5d12703380040c60",
+    "failures.csv": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+    "holdout-summary.csv": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+    "paired-comparisons.csv": "fb5ba0955c25770cf42c2d5dbede33ea0f3e6bb5150a93e2b2fae358a437e51f",
+    "per-fold-summary.csv": "f3ac31f89d15e726d19350fa3bb25195d17f6783d0990e89d6725e2c5e7bc149",
+    "per-market-summary.csv": "1dc40edde17bb11a3c9d1adc677aaf771a44af565e53bb72af7457b868bddbb9",
+    "per-regime-summary.csv": "e0136930d816229a1e814b14144acb844eaa5cc795f46120c865f3dbf805b9e4",
+    "per-run-results.csv": "1239f3bee885dcb5c1471c5562b1f38f7a0c140f7ccf1ce7f7d4d51ca50937cc",
+    "per-seed-summary.csv": "993c0694df33bcc930b531e062ede34dd63a9f10a85123769ffb43819cd62187"
+  }
+}
