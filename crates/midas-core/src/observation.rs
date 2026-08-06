@@ -23,9 +23,10 @@ pub use contracts::{
 pub use normalization::NormalizationRule;
 pub(crate) use options::{ObservationBuilderOptions, ObservationSchemaOptions};
 pub use registry::ObservationRegistry;
+pub(crate) use schema::AGENT_AWARENESS_PROVIDER;
 pub use schema::{
-    AgentStateFeatureSpec, ObservationFeatureSpec, ObservationSchema, ObservationSchemaEntry,
-    ObservationSource, PortfolioFeatureSpec, RollingMarketMetric,
+    AgentAwarenessFeatureSpec, AgentStateFeatureSpec, ObservationFeatureSpec, ObservationSchema,
+    ObservationSchemaEntry, ObservationSource, PortfolioFeatureSpec, RollingMarketMetric,
 };
 
 #[cfg(test)]

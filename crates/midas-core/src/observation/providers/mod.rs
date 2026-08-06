@@ -1,3 +1,4 @@
+mod agent_awareness;
 mod agent_state;
 mod market;
 mod portfolio;
@@ -10,15 +11,16 @@ use crate::{
 };
 
 use self::{
-    agent_state::AgentStateObservationProvider, market::MarketObservationProvider,
-    portfolio::PortfolioObservationProvider, rolling_market_stats::RollingMarketStatsProvider,
+    agent_awareness::AgentAwarenessProvider, agent_state::AgentStateObservationProvider,
+    market::MarketObservationProvider, portfolio::PortfolioObservationProvider,
+    rolling_market_stats::RollingMarketStatsProvider,
 };
 use super::{
     contracts::{ObservationMetadata, ObservationShape, ObservationValueType},
     registry::ObservationRegistry,
     schema::{
-        AGENT_STATE_PROVIDER, MARKET_PROVIDER, ObservationSchema, PORTFOLIO_PROVIDER,
-        ROLLING_MARKET_STATS_PROVIDER,
+        AGENT_AWARENESS_PROVIDER, AGENT_STATE_PROVIDER, MARKET_PROVIDER, ObservationSchema,
+        PORTFOLIO_PROVIDER, ROLLING_MARKET_STATS_PROVIDER,
     },
 };
 
@@ -45,12 +47,16 @@ pub(crate) fn built_in_registry(
             AGENT_STATE_PROVIDER if used => {
                 registry.register(Box::new(AgentStateObservationProvider::new(schema)?))?
             }
+            AGENT_AWARENESS_PROVIDER if used => {
+                registry.register(Box::new(AgentAwarenessProvider::new(schema)?))?
+            }
             ROLLING_MARKET_STATS_PROVIDER if used => registry.register(Box::new(
                 RollingMarketStatsProvider::new(schema, asset_count, rolling_config, market_data)?,
             ))?,
             MARKET_PROVIDER
             | PORTFOLIO_PROVIDER
             | AGENT_STATE_PROVIDER
+            | AGENT_AWARENESS_PROVIDER
             | ROLLING_MARKET_STATS_PROVIDER => {}
             name => {
                 return Err(crate::MidasError::Config(format!(

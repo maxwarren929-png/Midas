@@ -1,5 +1,30 @@
 # Implementation Status
 
+## V2: self-awareness and evolvable traits
+
+The first V2 implementation is complete and opt-in through
+`configs/v2-evolvable.toml`.
+
+- The observation registry now supports six named agent-awareness signals:
+  recent reward, rolling reward mean, rolling reward volatility, exploration
+  level, survival-cost ratio, and reward trend. Their values are published by
+  a dedicated provider and enter the vector only when the provider and schema
+  features are configured.
+- `AgentState` persists reward EMAs and trend state. Neural policies expose
+  current and birth temperatures through the policy boundary, so the provider
+  remains independent of policy implementation details.
+- All seven genome traits are enabled in the V2 config. Learning rate mutation
+  uses log-space noise; the other traits use bounded mutation. Neural trade
+  impulses honor inherited maximum allocation, and risk-adjusted reward uses
+  inherited drawdown/turnover sensitivities when they are enabled.
+- Awareness checkpoints use format 14. Existing configurations continue to
+  write format 13, and legacy format-12/13 agent layouts are migrated with
+  zeroed awareness state so existing baselines remain resumable.
+
+The V2 configuration has been validated and exercised through a one-step PPO
+evolution run, including a format-14 checkpoint write. Experimental comparison
+results from the six-condition protocol remain to be collected.
+
 ## Prompt 9D: stateful replacement checkpointing
 
 Checkpoint format 13 adds a versioned `ReplacementStrategyState` containing a

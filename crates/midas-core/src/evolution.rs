@@ -677,11 +677,18 @@ impl GenomeMutator for DefaultGenomeMutator {
             }
         }
         if rng.0.gen_bool(self.config.trait_probability as f64) {
-            let mut apply = |value: &mut f32, bounds: &crate::config::EvolvableTraitConfig| {
+            let mut apply = |value: &mut f32,
+                             bounds: &crate::config::EvolvableTraitConfig,
+                             log_scale: bool| {
                 if bounds.evolvable {
                     let before = *value;
-                    *value = (*value + normal(rng) * bounds.mutation_scale)
-                        .clamp(bounds.minimum, bounds.maximum);
+                    *value = if log_scale {
+                        ((*value).max(bounds.minimum).ln() + normal(rng) * bounds.mutation_scale)
+                            .exp()
+                    } else {
+                        *value + normal(rng) * bounds.mutation_scale
+                    }
+                    .clamp(bounds.minimum, bounds.maximum);
                     if *value != before {
                         report.trait_changes += 1;
                     }
@@ -690,30 +697,37 @@ impl GenomeMutator for DefaultGenomeMutator {
             apply(
                 &mut genome.traits.learning_rate,
                 &context.traits.learning_rate,
+                true,
             );
             apply(
                 &mut genome.traits.entropy_coefficient,
                 &context.traits.entropy_coefficient,
+                false,
             );
             apply(
                 &mut genome.traits.action_temperature,
                 &context.traits.action_temperature,
+                false,
             );
             apply(
                 &mut genome.traits.temperature_decay,
                 &context.traits.temperature_decay,
+                false,
             );
             apply(
                 &mut genome.traits.drawdown_sensitivity,
                 &context.traits.drawdown_sensitivity,
+                false,
             );
             apply(
                 &mut genome.traits.turnover_sensitivity,
                 &context.traits.turnover_sensitivity,
+                false,
             );
             apply(
                 &mut genome.traits.maximum_allocation,
                 &context.traits.maximum_allocation,
+                false,
             );
         }
         genome.validate_with_traits(&genome.architecture, context.traits)?;
@@ -918,6 +932,48 @@ mod tests {
         assert_eq!(before, unchanged);
         assert_eq!(before.architecture, child.architecture);
         assert_eq!(a.architecture, b.architecture);
+    }
+
+    #[test]
+    fn enabled_trait_mutation_changes_genome_traits_within_bounds() {
+        let mut bounds = EvolvableTraitsConfig::default();
+        for trait_config in [
+            &mut bounds.learning_rate,
+            &mut bounds.entropy_coefficient,
+            &mut bounds.action_temperature,
+            &mut bounds.temperature_decay,
+            &mut bounds.drawdown_sensitivity,
+            &mut bounds.turnover_sensitivity,
+            &mut bounds.maximum_allocation,
+        ] {
+            trait_config.evolvable = true;
+            trait_config.mutation_scale = 0.01;
+        }
+        bounds.learning_rate.mutation_scale = 0.3;
+        let mut genome = BrainGenome::random(&architecture(), &bounds, 11).unwrap();
+        let before = genome.traits.clone();
+        let mutator = DefaultGenomeMutator {
+            config: EvolutionMutationConfig {
+                weight_probability: 0.0,
+                bias_probability: 0.0,
+                reset_probability: 0.0,
+                trait_probability: 1.0,
+                ..EvolutionMutationConfig::default()
+            },
+        };
+        let report = mutator
+            .mutate(
+                &mut genome,
+                &MutationContext { traits: &bounds },
+                &mut EvolutionRng::seed(17),
+            )
+            .unwrap();
+        assert!(report.trait_changes > 0);
+        assert_ne!(genome.traits, before);
+        genome
+            .validate_with_traits(&architecture(), &bounds)
+            .unwrap();
+        assert!(genome.traits.learning_rate > 0.0);
     }
 
     #[test]

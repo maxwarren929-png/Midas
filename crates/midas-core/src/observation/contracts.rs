@@ -20,6 +20,13 @@ pub struct ObservationContext<'a> {
     pub maximum_net_worth: f64,
     pub age: u64,
     pub episode_steps: usize,
+    pub recent_reward: f64,
+    pub rolling_mean_reward: f64,
+    pub rolling_reward_volatility: f64,
+    pub reward_trend: f64,
+    pub current_temperature: f32,
+    pub initial_temperature: f32,
+    pub daily_survival_cost: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

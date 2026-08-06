@@ -804,6 +804,13 @@ fn observation_schema_drives_dimension_order_and_unrealized_return() {
         maximum_net_worth: 80.0,
         age: 0,
         episode_steps: 1,
+        recent_reward: 0.0,
+        rolling_mean_reward: 0.0,
+        rolling_reward_volatility: 0.0,
+        reward_trend: 0.0,
+        current_temperature: 1.0,
+        initial_temperature: 1.0,
+        daily_survival_cost: 0.0,
     };
     let observation = builder.build(&context).unwrap();
     assert!((observation.values[0] - 0.5).abs() < 1e-6);

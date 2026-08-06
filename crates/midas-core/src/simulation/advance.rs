@@ -192,6 +192,15 @@ impl SimulationEngine {
                 .maximum_drawdown
                 .max(1.0 - current / agent.state.maximum_net_worth);
         }
+        let use_genome_sensitivities = agent.state.genome.is_some()
+            && (self.config.brain.traits.drawdown_sensitivity.evolvable
+                || self.config.brain.traits.turnover_sensitivity.evolvable);
+        let genome_sensitivities = agent.state.genome.as_ref().map(|genome| {
+            (
+                f64::from(genome.traits.drawdown_sensitivity),
+                f64::from(genome.traits.turnover_sensitivity),
+            )
+        });
         let reward_context = RewardContext {
             previous_net_worth: previous,
             current_net_worth: current,
@@ -199,9 +208,16 @@ impl SimulationEngine {
             turnover: (agent.state.portfolio.cumulative_turnover - turnover_before).max(0.0),
             bankrupt,
             invalid_action,
+            drawdown_sensitivity: use_genome_sensitivities
+                .then(|| genome_sensitivities.map(|values| values.0))
+                .flatten(),
+            turnover_sensitivity: use_genome_sensitivities
+                .then(|| genome_sensitivities.map(|values| values.1))
+                .flatten(),
         };
         let reward_breakdown = self.reward_function.breakdown(&reward_context)?;
         let reward = reward_breakdown.clipped_total;
+        agent.state.update_reward_statistics(reward);
         trade_summary.turnover = reward_context.turnover;
         trade_summary.cash_after = agent.state.portfolio.cash;
         trade_summary.holdings_after = agent

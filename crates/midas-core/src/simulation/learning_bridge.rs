@@ -4,7 +4,6 @@ use crate::{
     agent::Agent,
     brain::PolicyContext,
     learning::{EpisodeEndContext, LearningUpdate, Transition},
-    observation::ObservationContext,
 };
 use chrono::NaiveDate;
 
@@ -45,17 +44,11 @@ impl SimulationEngine {
             .features
             .get(step)
             .ok_or_else(|| MidasError::Data("next-value feature row is missing".into()))?;
-        let observation = self.observation_builder.build(&ObservationContext {
-            market,
-            portfolio: &agent.state.portfolio,
-            prices,
-            starting_net_worth: self.config.simulation.starting_cash,
-            maximum_net_worth: agent.state.maximum_net_worth,
-            age: agent.state.age,
-            episode_steps: self.features.len() - 1,
-        })?;
+        let observation = self
+            .observation_builder
+            .build(&self.observation_context(agent, market, prices))?;
         let allocations = agent.state.portfolio.allocations(prices)?;
-        let maximum_asset_allocation = self.config.brain.trading.maximum_trade_fraction;
+        let maximum_asset_allocation = self.neural_maximum_trade_fraction(agent);
         let evaluation = policy.evaluate_action(
             &observation,
             &PolicyContext {

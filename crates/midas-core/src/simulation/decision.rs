@@ -127,7 +127,7 @@ impl SimulationEngine {
                     agent.policy.policy_blueprint(),
                     crate::brain::PolicyBlueprint::Neural
                 )
-                .then_some(self.config.brain.trading.maximum_trade_fraction),
+                .then_some(self.neural_maximum_trade_fraction(agent)),
                 market_maximum_asset_allocation: None,
             };
             let outcome = self.decide_policy(
@@ -405,6 +405,41 @@ impl SimulationEngine {
         Ok(())
     }
 
+    pub(super) fn neural_maximum_trade_fraction(&self, agent: &Agent) -> f64 {
+        let configured = self.config.brain.trading.maximum_trade_fraction;
+        agent
+            .state
+            .genome
+            .as_ref()
+            .map(|genome| configured.min(genome.traits.maximum_allocation as f64))
+            .unwrap_or(configured)
+    }
+
+    pub(super) fn observation_context<'a>(
+        &self,
+        agent: &'a Agent,
+        market: &'a FeatureRow,
+        prices: &'a [Option<f64>],
+    ) -> ObservationContext<'a> {
+        let (current_temperature, initial_temperature) = agent.policy.temperature_state();
+        ObservationContext {
+            market,
+            portfolio: &agent.state.portfolio,
+            prices,
+            starting_net_worth: self.config.simulation.starting_cash,
+            maximum_net_worth: agent.state.maximum_net_worth,
+            age: agent.state.age,
+            episode_steps: self.features.len() - 1,
+            recent_reward: agent.state.last_reward,
+            rolling_mean_reward: agent.state.reward_ema,
+            rolling_reward_volatility: agent.state.reward_variance_ema,
+            reward_trend: agent.state.reward_trend,
+            current_temperature,
+            initial_temperature,
+            daily_survival_cost: self.config.simulation.daily_survival_cost,
+        }
+    }
+
     fn decide_policy(
         &self,
         agent: &mut Agent,
@@ -414,15 +449,10 @@ impl SimulationEngine {
         allocations: &[f64],
         action_context: &ActionValidationContext<'_>,
     ) -> Result<PolicyDecisionOutcome> {
-        let observation = match self.observation_builder.build(&ObservationContext {
-            market,
-            portfolio: &agent.state.portfolio,
-            prices,
-            starting_net_worth: self.config.simulation.starting_cash,
-            maximum_net_worth: agent.state.maximum_net_worth,
-            age: agent.state.age,
-            episode_steps: self.features.len() - 1,
-        }) {
+        let observation = match self
+            .observation_builder
+            .build(&self.observation_context(agent, market, prices))
+        {
             Ok(observation) => observation,
             Err(error) => {
                 let incident = PolicyFailureIncident {
@@ -451,7 +481,9 @@ impl SimulationEngine {
             agent.policy.policy_blueprint(),
             crate::brain::PolicyBlueprint::Neural
         ) {
-            self.config.brain.trading.maximum_trade_fraction
+            action_context
+                .policy_maximum_trade_fraction
+                .unwrap_or(self.config.brain.trading.maximum_trade_fraction)
         } else {
             action_context
                 .policy_maximum_asset_allocation

@@ -16,6 +16,7 @@ use super::{
 pub(crate) const MARKET_PROVIDER: &str = "market";
 pub(crate) const PORTFOLIO_PROVIDER: &str = "portfolio";
 pub(crate) const AGENT_STATE_PROVIDER: &str = "agent_state";
+pub(crate) const AGENT_AWARENESS_PROVIDER: &str = "agent_awareness";
 pub(crate) const ROLLING_MARKET_STATS_PROVIDER: &str = "rolling_market_stats";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -35,6 +36,16 @@ pub enum AgentStateFeatureSpec {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub enum AgentAwarenessFeatureSpec {
+    RecentReward,
+    RollingMeanReward,
+    RollingRewardVolatility,
+    ExplorationLevel,
+    SurvivalCostRatio,
+    RewardTrend,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum ObservationFeatureSpec {
     Market {
         feature: FeatureKind,
@@ -46,6 +57,10 @@ pub enum ObservationFeatureSpec {
     },
     AgentState {
         feature: AgentStateFeatureSpec,
+        normalization: NormalizationRule,
+    },
+    AgentAwareness {
+        feature: AgentAwarenessFeatureSpec,
         normalization: NormalizationRule,
     },
 }
@@ -62,6 +77,9 @@ pub enum ObservationSource {
     },
     AgentState {
         feature: AgentStateFeatureSpec,
+    },
+    AgentAwareness {
+        feature: AgentAwarenessFeatureSpec,
     },
     RollingMarketStats {
         metric: RollingMarketMetric,
@@ -91,6 +109,7 @@ impl ObservationSource {
             Self::Market { .. } => MARKET_PROVIDER,
             Self::Portfolio { .. } => PORTFOLIO_PROVIDER,
             Self::AgentState { .. } => AGENT_STATE_PROVIDER,
+            Self::AgentAwareness { .. } => AGENT_AWARENESS_PROVIDER,
             Self::RollingMarketStats { .. } => ROLLING_MARKET_STATS_PROVIDER,
         }
     }
@@ -177,6 +196,36 @@ impl ObservationSchema {
                         },
                     })
                 }
+                ObservationFeatureKind::RecentReward => features.push(agent_awareness(
+                    AgentAwarenessFeatureSpec::RecentReward,
+                    -5.0,
+                    5.0,
+                )),
+                ObservationFeatureKind::RollingMeanReward => features.push(agent_awareness(
+                    AgentAwarenessFeatureSpec::RollingMeanReward,
+                    -5.0,
+                    5.0,
+                )),
+                ObservationFeatureKind::RollingRewardVolatility => features.push(agent_awareness(
+                    AgentAwarenessFeatureSpec::RollingRewardVolatility,
+                    0.0,
+                    25.0,
+                )),
+                ObservationFeatureKind::ExplorationLevel => features.push(agent_awareness(
+                    AgentAwarenessFeatureSpec::ExplorationLevel,
+                    0.0,
+                    1.0,
+                )),
+                ObservationFeatureKind::SurvivalCostRatio => features.push(agent_awareness(
+                    AgentAwarenessFeatureSpec::SurvivalCostRatio,
+                    0.0,
+                    10.0,
+                )),
+                ObservationFeatureKind::RewardTrend => features.push(agent_awareness(
+                    AgentAwarenessFeatureSpec::RewardTrend,
+                    -1.0,
+                    1.0,
+                )),
             }
         }
         let mut entries = Vec::new();
@@ -243,6 +292,20 @@ impl ObservationSchema {
                         &mut entries,
                         name.clone(),
                         ObservationSource::AgentState {
+                            feature: feature.clone(),
+                        },
+                        apply_override(normalization, &name, options.normalizations)?,
+                    );
+                }
+                ObservationFeatureSpec::AgentAwareness {
+                    feature,
+                    normalization,
+                } => {
+                    let name = agent_awareness_name(feature);
+                    push_entry(
+                        &mut entries,
+                        name.clone(),
+                        ObservationSource::AgentAwareness {
                             feature: feature.clone(),
                         },
                         apply_override(normalization, &name, options.normalizations)?,
@@ -511,6 +574,21 @@ fn agent_state_name(feature: &AgentStateFeatureSpec) -> String {
     }
 }
 
+fn agent_awareness_name(feature: &AgentAwarenessFeatureSpec) -> String {
+    format!("agent.{}", agent_awareness_feature_name(feature))
+}
+
+fn agent_awareness_feature_name(feature: &AgentAwarenessFeatureSpec) -> &'static str {
+    match feature {
+        AgentAwarenessFeatureSpec::RecentReward => "recent_reward",
+        AgentAwarenessFeatureSpec::RollingMeanReward => "rolling_mean_reward",
+        AgentAwarenessFeatureSpec::RollingRewardVolatility => "rolling_reward_volatility",
+        AgentAwarenessFeatureSpec::ExplorationLevel => "exploration_level",
+        AgentAwarenessFeatureSpec::SurvivalCostRatio => "survival_cost_ratio",
+        AgentAwarenessFeatureSpec::RewardTrend => "reward_trend",
+    }
+}
+
 fn feature_name(feature: FeatureKind) -> &'static str {
     match feature {
         FeatureKind::Return1 => "return1",
@@ -540,6 +618,17 @@ fn portfolio_feature_name(feature: &PortfolioFeatureSpec) -> &'static str {
 
 fn portfolio(feature: PortfolioFeatureSpec, minimum: f64, maximum: f64) -> ObservationFeatureSpec {
     ObservationFeatureSpec::Portfolio {
+        feature,
+        normalization: NormalizationRule::RatioClipped { minimum, maximum },
+    }
+}
+
+fn agent_awareness(
+    feature: AgentAwarenessFeatureSpec,
+    minimum: f64,
+    maximum: f64,
+) -> ObservationFeatureSpec {
+    ObservationFeatureSpec::AgentAwareness {
         feature,
         normalization: NormalizationRule::RatioClipped { minimum, maximum },
     }

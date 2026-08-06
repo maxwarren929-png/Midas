@@ -18,4 +18,6 @@ pub use diagnostics::{DecisionTrace, PpoUpdateTrace, ReportTrace};
 pub use engine::SimulationEngine;
 pub use events::{DomainEvent, OperationalEvent};
 pub use report::SimulationReport;
-pub use types::{CHECKPOINT_VERSION, DatasetSplit, DeathCause, SimulationLifecycle};
+pub use types::{
+    AWARENESS_CHECKPOINT_VERSION, CHECKPOINT_VERSION, DatasetSplit, DeathCause, SimulationLifecycle,
+};

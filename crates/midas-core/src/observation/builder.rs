@@ -15,7 +15,9 @@ use super::{
 };
 
 #[cfg(test)]
-use super::schema::{AgentStateFeatureSpec, ObservationFeatureSpec, PortfolioFeatureSpec};
+use super::schema::{
+    AgentAwarenessFeatureSpec, AgentStateFeatureSpec, ObservationFeatureSpec, PortfolioFeatureSpec,
+};
 
 #[derive(Default)]
 struct ObservationScratch {
@@ -234,6 +236,17 @@ fn validate_context(context: &ObservationContext<'_>, asset_count: usize) -> Res
         || context.starting_net_worth <= 0.0
         || !context.maximum_net_worth.is_finite()
         || context.maximum_net_worth <= 0.0
+        || !context.recent_reward.is_finite()
+        || !context.rolling_mean_reward.is_finite()
+        || !context.rolling_reward_volatility.is_finite()
+        || context.rolling_reward_volatility < 0.0
+        || !context.reward_trend.is_finite()
+        || !context.current_temperature.is_finite()
+        || context.current_temperature <= 0.0
+        || !context.initial_temperature.is_finite()
+        || context.initial_temperature <= 0.0
+        || !context.daily_survival_cost.is_finite()
+        || context.daily_survival_cost < 0.0
     {
         return Err(crate::MidasError::Policy(
             "invalid observation context dimensions or bounds".into(),
@@ -326,6 +339,26 @@ pub(crate) fn legacy_default_values(
                     context.age as f64 / context.episode_steps.max(1) as f64,
                     normalization,
                 )?);
+            }
+            ObservationFeatureSpec::AgentAwareness {
+                feature,
+                normalization,
+            } => {
+                let value = match feature {
+                    AgentAwarenessFeatureSpec::RecentReward => context.recent_reward,
+                    AgentAwarenessFeatureSpec::RollingMeanReward => context.rolling_mean_reward,
+                    AgentAwarenessFeatureSpec::RollingRewardVolatility => {
+                        context.rolling_reward_volatility
+                    }
+                    AgentAwarenessFeatureSpec::ExplorationLevel => {
+                        f64::from(context.current_temperature / context.initial_temperature)
+                    }
+                    AgentAwarenessFeatureSpec::SurvivalCostRatio => {
+                        context.daily_survival_cost / context.portfolio.net_worth.max(1e-9)
+                    }
+                    AgentAwarenessFeatureSpec::RewardTrend => context.reward_trend,
+                };
+                values.push(normalize(value, normalization)?);
             }
         }
     }

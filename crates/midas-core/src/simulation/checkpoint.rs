@@ -4,7 +4,7 @@ use crate::{
     agent::{Agent, AgentBuildContext, AgentFactory, StandardAgentFactory},
     brain::{BrainArchitecture, ComputeDevice, PolicySnapshot},
     config::Config,
-    evolution::EvolutionState,
+    evolution::{EvolutionState, GenomeId, LineageId},
     execution::CostExecutionEngine,
     market::{BackwardFeaturePipeline, FeaturePipeline, FeatureRow, MarketDataset},
     metrics::MetricsCollector,
@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
 use super::{
-    CHECKPOINT_VERSION, DatasetSplit, DomainEvent, OperationalEvent, SimulationEngine,
-    SimulationLifecycle,
+    AWARENESS_CHECKPOINT_VERSION, CHECKPOINT_VERSION, DatasetSplit, DomainEvent, OperationalEvent,
+    SimulationEngine, SimulationLifecycle,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -51,8 +51,74 @@ pub(super) struct Checkpoint {
     pub(super) replacement: Option<ReplacementStrategyState>,
 }
 
+/// Agent state as it appeared in format 12/13. Keep this layout separate from
+/// the current state so old bincode checkpoints can be migrated without
+/// relying on serde defaults, which bincode does not use for missing tuple
+/// fields.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct CheckpointV12 {
+struct AgentStateLegacy {
+    id: crate::AgentId,
+    birth_date: NaiveDate,
+    age: u64,
+    portfolio: crate::execution::Portfolio,
+    maximum_net_worth: f64,
+    maximum_drawdown: f64,
+    alive: bool,
+    genome: Option<crate::brain::BrainGenome>,
+    #[serde(default)]
+    genome_id: Option<GenomeId>,
+    #[serde(default)]
+    lineage_id: Option<LineageId>,
+    parent_ids: Vec<crate::AgentId>,
+    total_policy_failures: u32,
+    consecutive_policy_failures: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AgentCheckpointLegacy {
+    state: AgentStateLegacy,
+    policy: PolicySnapshot,
+    learning: crate::learning::LearningStrategyState,
+}
+
+impl From<AgentStateLegacy> for crate::agent::AgentState {
+    fn from(state: AgentStateLegacy) -> Self {
+        Self {
+            id: state.id,
+            birth_date: state.birth_date,
+            age: state.age,
+            portfolio: state.portfolio,
+            maximum_net_worth: state.maximum_net_worth,
+            maximum_drawdown: state.maximum_drawdown,
+            alive: state.alive,
+            genome: state.genome,
+            genome_id: state.genome_id,
+            lineage_id: state.lineage_id,
+            parent_ids: state.parent_ids,
+            total_policy_failures: state.total_policy_failures,
+            consecutive_policy_failures: state.consecutive_policy_failures,
+            reward_ema: 0.0,
+            reward_variance_ema: 0.0,
+            last_reward: 0.0,
+            short_reward_ema: 0.0,
+            long_reward_ema: 0.0,
+            reward_trend: 0.0,
+        }
+    }
+}
+
+impl From<AgentCheckpointLegacy> for AgentCheckpoint {
+    fn from(checkpoint: AgentCheckpointLegacy) -> Self {
+        Self {
+            state: checkpoint.state.into(),
+            policy: checkpoint.policy,
+            learning: checkpoint.learning,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CheckpointV12Legacy {
     version: u32,
     config_hash: String,
     dataset_identity: String,
@@ -62,7 +128,7 @@ struct CheckpointV12 {
     next_step: usize,
     next_agent_id: u64,
     lifecycle: SimulationLifecycle,
-    agents: Vec<AgentCheckpoint>,
+    agents: Vec<AgentCheckpointLegacy>,
     metrics: MetricsCollector,
     domain_events: Vec<DomainEvent>,
     accessed_through: Option<NaiveDate>,
@@ -70,8 +136,32 @@ struct CheckpointV12 {
     evolution: EvolutionState,
 }
 
-impl From<CheckpointV12> for Checkpoint {
-    fn from(checkpoint: CheckpointV12) -> Self {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CheckpointV13Legacy {
+    version: u32,
+    config_hash: String,
+    dataset_identity: String,
+    observation_schema_hash: String,
+    architecture: BrainArchitecture,
+    split: DatasetSplit,
+    next_step: usize,
+    next_agent_id: u64,
+    lifecycle: SimulationLifecycle,
+    agents: Vec<AgentCheckpointLegacy>,
+    metrics: MetricsCollector,
+    domain_events: Vec<DomainEvent>,
+    accessed_through: Option<NaiveDate>,
+    backend_identity: String,
+    evolution: EvolutionState,
+    replacement: Option<ReplacementStrategyState>,
+}
+
+fn migrate_agents(agents: Vec<AgentCheckpointLegacy>) -> Vec<AgentCheckpoint> {
+    agents.into_iter().map(AgentCheckpoint::from).collect()
+}
+
+impl From<CheckpointV12Legacy> for Checkpoint {
+    fn from(checkpoint: CheckpointV12Legacy) -> Self {
         Self {
             version: checkpoint.version,
             config_hash: checkpoint.config_hash,
@@ -82,13 +172,36 @@ impl From<CheckpointV12> for Checkpoint {
             next_step: checkpoint.next_step,
             next_agent_id: checkpoint.next_agent_id,
             lifecycle: checkpoint.lifecycle,
-            agents: checkpoint.agents,
+            agents: migrate_agents(checkpoint.agents),
             metrics: checkpoint.metrics,
             domain_events: checkpoint.domain_events,
             accessed_through: checkpoint.accessed_through,
             backend_identity: checkpoint.backend_identity,
             evolution: checkpoint.evolution,
             replacement: None,
+        }
+    }
+}
+
+impl From<CheckpointV13Legacy> for Checkpoint {
+    fn from(checkpoint: CheckpointV13Legacy) -> Self {
+        Self {
+            version: checkpoint.version,
+            config_hash: checkpoint.config_hash,
+            dataset_identity: checkpoint.dataset_identity,
+            observation_schema_hash: checkpoint.observation_schema_hash,
+            architecture: checkpoint.architecture,
+            split: checkpoint.split,
+            next_step: checkpoint.next_step,
+            next_agent_id: checkpoint.next_agent_id,
+            lifecycle: checkpoint.lifecycle,
+            agents: migrate_agents(checkpoint.agents),
+            metrics: checkpoint.metrics,
+            domain_events: checkpoint.domain_events,
+            accessed_through: checkpoint.accessed_through,
+            backend_identity: checkpoint.backend_identity,
+            evolution: checkpoint.evolution,
+            replacement: checkpoint.replacement,
         }
     }
 }
@@ -114,7 +227,15 @@ pub(super) fn from_state(
     let replacement = replacement.checkpoint_state()?;
     replacement.validate()?;
     Ok(Checkpoint {
-        version: CHECKPOINT_VERSION,
+        version: if observation_schema
+            .providers
+            .iter()
+            .any(|provider| provider == crate::observation::AGENT_AWARENESS_PROVIDER)
+        {
+            AWARENESS_CHECKPOINT_VERSION
+        } else {
+            CHECKPOINT_VERSION
+        },
         config_hash: config.hash()?,
         dataset_identity: data.identity.clone(),
         observation_schema_hash: observation_schema.identity(data.assets.len())?,
@@ -175,7 +296,7 @@ fn deserialize_checkpoint(bytes: &[u8], operation: &str) -> Result<Checkpoint> {
             ))
         })?;
     if version == 12 {
-        return bincode::deserialize::<CheckpointV12>(bytes)
+        return bincode::deserialize::<CheckpointV12Legacy>(bytes)
             .map(Checkpoint::from)
             .map_err(|error| {
                 MidasError::Checkpoint(format!(
@@ -183,15 +304,30 @@ fn deserialize_checkpoint(bytes: &[u8], operation: &str) -> Result<Checkpoint> {
                 ))
             });
     }
+    if version == CHECKPOINT_VERSION {
+        return match bincode::deserialize::<Checkpoint>(bytes) {
+            Ok(checkpoint) => Ok(checkpoint),
+            Err(current_error) => bincode::deserialize::<CheckpointV13Legacy>(bytes)
+                .map(Checkpoint::from)
+                .map_err(|legacy_error| {
+                    MidasError::Checkpoint(format!(
+                        "incompatible checkpoint for {operation}; expected format version {CHECKPOINT_VERSION}: {current_error}; legacy decode failed: {legacy_error}"
+                    ))
+                }),
+        };
+    }
     bincode::deserialize::<Checkpoint>(bytes).map_err(|error| {
         MidasError::Checkpoint(format!(
-            "incompatible checkpoint for {operation}; expected format version {CHECKPOINT_VERSION}: {error}"
+            "incompatible checkpoint for {operation}; expected format versions {CHECKPOINT_VERSION} or {AWARENESS_CHECKPOINT_VERSION}: {error}"
         ))
     })
 }
 
 fn validate_resume_version(checkpoint: &Checkpoint) -> Result<()> {
-    if !matches!(checkpoint.version, CHECKPOINT_VERSION | 12) {
+    if !matches!(
+        checkpoint.version,
+        CHECKPOINT_VERSION | AWARENESS_CHECKPOINT_VERSION | 12
+    ) {
         let detail = if checkpoint.version == 11 {
             "; checkpoint 11 predates the modular observation registry and cannot be migrated safely"
         } else if checkpoint.version == 6 {
@@ -210,7 +346,10 @@ fn validate_resume_version(checkpoint: &Checkpoint) -> Result<()> {
 }
 
 fn validate_evaluation_version(checkpoint: &Checkpoint) -> Result<()> {
-    if !matches!(checkpoint.version, CHECKPOINT_VERSION | 12) {
+    if !matches!(
+        checkpoint.version,
+        CHECKPOINT_VERSION | AWARENESS_CHECKPOINT_VERSION | 12
+    ) {
         return Err(MidasError::Checkpoint(format!(
             "checkpoint version {} is incompatible with {CHECKPOINT_VERSION}; observation-registry and neural action distribution layouts are not migrated",
             checkpoint.version

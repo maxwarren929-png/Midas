@@ -42,6 +42,12 @@ pub enum ObservationFeatureKind {
     PortfolioReturn1,
     TurnoverToNetWorth,
     NormalizedAge,
+    RecentReward,
+    RollingMeanReward,
+    RollingRewardVolatility,
+    ExplorationLevel,
+    SurvivalCostRatio,
+    RewardTrend,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

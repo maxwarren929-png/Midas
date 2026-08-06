@@ -4,7 +4,7 @@ use midas_core::{
         RollingMarketStatsConfig,
     },
     market::{MarketDataSource, PolarsDataSource},
-    simulation::{DatasetSplit, SimulationEngine},
+    simulation::{AWARENESS_CHECKPOINT_VERSION, DatasetSplit, SimulationEngine},
 };
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
@@ -305,6 +305,25 @@ fn version_12_checkpoint_resume_migrates_to_version_13_without_report_drift() {
         serde_json::to_vec(&restored.run().unwrap()).unwrap(),
         serde_json::to_vec(&report).unwrap()
     );
+}
+
+#[test]
+fn v2_awareness_run_round_trips_format_14_checkpoint_state() {
+    let config = load("configs/v2-evolvable.toml");
+    let data = load_data(&config);
+    let mut engine =
+        SimulationEngine::new(config.clone(), data.clone(), DatasetSplit::Training).unwrap();
+    engine.run_steps(1).unwrap();
+    let checkpoint = tempfile::NamedTempFile::new().unwrap();
+    engine.save_checkpoint(checkpoint.path()).unwrap();
+    let bytes = fs::read(checkpoint.path()).unwrap();
+    assert_eq!(
+        u32::from_le_bytes(bytes[..4].try_into().unwrap()),
+        AWARENESS_CHECKPOINT_VERSION
+    );
+
+    let mut resumed = SimulationEngine::resume(config, data, checkpoint.path()).unwrap();
+    resumed.run_steps(1).unwrap();
 }
 
 #[test]

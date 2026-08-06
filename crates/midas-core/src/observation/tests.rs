@@ -167,6 +167,13 @@ fn modular_default_builder_matches_prompt4_positional_vector() {
         maximum_net_worth: 120.0,
         age: 3,
         episode_steps: 12,
+        recent_reward: 0.0,
+        rolling_mean_reward: 0.0,
+        rolling_reward_volatility: 0.0,
+        reward_trend: 0.0,
+        current_temperature: 1.0,
+        initial_temperature: 1.0,
+        daily_survival_cost: 0.0,
     };
     let expected = legacy_default_values(
         &schema,
@@ -442,6 +449,92 @@ fn rolling_provider_is_opt_in_and_schema_identity_is_dimensioned() {
 }
 
 #[test]
+fn agent_awareness_provider_publishes_named_self_state_and_changes_schema_identity() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut config = Config::load(root.join("configs/test.toml")).unwrap();
+    let baseline = ObservationSchema::try_from_config(&config).unwrap();
+    config.observation.version = 3;
+    config.observation.features.extend([
+        crate::config::ObservationFeatureKind::RecentReward,
+        crate::config::ObservationFeatureKind::RollingMeanReward,
+        crate::config::ObservationFeatureKind::RollingRewardVolatility,
+        crate::config::ObservationFeatureKind::ExplorationLevel,
+        crate::config::ObservationFeatureKind::SurvivalCostRatio,
+        crate::config::ObservationFeatureKind::RewardTrend,
+    ]);
+    config.observations.providers.push("agent_awareness".into());
+    config.validate().unwrap();
+    let schema = ObservationSchema::try_from_config(&config).unwrap();
+    assert_ne!(
+        schema.identity(config.market.assets.len()).unwrap(),
+        baseline.identity(config.market.assets.len()).unwrap()
+    );
+    assert_eq!(
+        schema
+            .entries
+            .iter()
+            .filter(|entry| entry.provider == "agent_awareness")
+            .count(),
+        6
+    );
+
+    let builder = SchemaObservationBuilder::from_config(schema.clone(), &config, None).unwrap();
+    let market = FeatureRow {
+        date: NaiveDate::from_ymd_opt(2020, 1, 1).unwrap(),
+        values: vec![0.0; config.market.assets.len() * config.features.features.len()],
+        tradable: vec![true; config.market.assets.len()],
+    };
+    let portfolio = Portfolio::new(100.0, config.market.assets.len());
+    let prices = vec![Some(10.0); config.market.assets.len()];
+    let observation = builder
+        .build(&ObservationContext {
+            market: &market,
+            portfolio: &portfolio,
+            prices: &prices,
+            starting_net_worth: 100.0,
+            maximum_net_worth: 100.0,
+            age: 0,
+            episode_steps: 1,
+            recent_reward: -0.25,
+            rolling_mean_reward: 0.10,
+            rolling_reward_volatility: 0.04,
+            reward_trend: -1.0,
+            current_temperature: 0.5,
+            initial_temperature: 1.0,
+            daily_survival_cost: 2.0,
+        })
+        .unwrap();
+    for (name, expected) in [
+        ("agent.recent_reward", -0.25),
+        ("agent.rolling_mean_reward", 0.10),
+        ("agent.rolling_reward_volatility", 0.04),
+        ("agent.exploration_level", 0.5),
+        ("agent.survival_cost_ratio", 0.02),
+        ("agent.reward_trend", -1.0),
+    ] {
+        let index = schema
+            .entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .unwrap()
+            .index;
+        assert!(
+            (f64::from(observation.values[index]) - expected).abs() < 1e-6,
+            "{name}"
+        );
+    }
+    assert!(
+        builder
+            .registry()
+            .metadata_by_name("agent.recent_reward")
+            .unwrap()
+            .tags
+            .iter()
+            .any(|tag| tag == "agent_awareness")
+    );
+}
+
+#[test]
 fn rolling_provider_compiles_schema_order_and_exposes_metadata() {
     let mut config = rolling_config();
     config.observations.normalizations.insert(
@@ -480,6 +573,13 @@ fn rolling_provider_compiles_schema_order_and_exposes_metadata() {
             maximum_net_worth: 100.0,
             age: 0,
             episode_steps: 1,
+            recent_reward: 0.0,
+            rolling_mean_reward: 0.0,
+            rolling_reward_volatility: 0.0,
+            reward_trend: 0.0,
+            current_temperature: 1.0,
+            initial_temperature: 1.0,
+            daily_survival_cost: 0.0,
         })
         .unwrap();
     assert_eq!(
@@ -592,6 +692,13 @@ fn compilation_is_independent_of_provider_registration_order() {
         maximum_net_worth: 100.0,
         age: 0,
         episode_steps: 1,
+        recent_reward: 0.0,
+        rolling_mean_reward: 0.0,
+        rolling_reward_volatility: 0.0,
+        reward_trend: 0.0,
+        current_temperature: 1.0,
+        initial_temperature: 1.0,
+        daily_survival_cost: 0.0,
     };
     assert_eq!(first.build(&context).unwrap().values, vec![2.0, 1.0]);
     assert_eq!(
@@ -771,6 +878,13 @@ fn dimension_mismatch_and_non_finite_provider_output_fail_loudly() {
         maximum_net_worth: 100.0,
         age: 0,
         episode_steps: 1,
+        recent_reward: 0.0,
+        rolling_mean_reward: 0.0,
+        rolling_reward_volatility: 0.0,
+        reward_trend: 0.0,
+        current_temperature: 1.0,
+        initial_temperature: 1.0,
+        daily_survival_cost: 0.0,
     };
     assert!(builder.build(&context).is_err());
 

@@ -12,6 +12,10 @@ pub struct RewardContext {
     pub turnover: f64,
     pub bankrupt: bool,
     pub invalid_action: bool,
+    /// Optional genome-controlled sensitivities. `None` preserves the
+    /// experiment-level reward configuration for baseline runs.
+    pub drawdown_sensitivity: Option<f64>,
+    pub turnover_sensitivity: Option<f64>,
 }
 
 /// A reportable decomposition of the scalar environment reward. The fields
@@ -69,9 +73,14 @@ impl RewardFunction for RiskAdjustedReturnReward {
     }
     fn breakdown(&self, context: &RewardContext) -> Result<RewardBreakdown> {
         let raw_log_return = log_return(context);
-        let drawdown_penalty =
-            self.config.drawdown_penalty_weight as f64 * context.maximum_drawdown;
-        let turnover_penalty = self.config.turnover_penalty_weight as f64 * context.turnover;
+        let drawdown_penalty = context
+            .drawdown_sensitivity
+            .unwrap_or(self.config.drawdown_penalty_weight as f64)
+            * context.maximum_drawdown;
+        let turnover_penalty = context
+            .turnover_sensitivity
+            .unwrap_or(self.config.turnover_penalty_weight as f64)
+            * context.turnover;
         finish_breakdown_with_components(
             raw_log_return,
             drawdown_penalty,
@@ -165,6 +174,8 @@ mod tests {
             turnover: 2.0,
             bankrupt: false,
             invalid_action: true,
+            drawdown_sensitivity: None,
+            turnover_sensitivity: None,
         }
     }
 
@@ -199,5 +210,22 @@ mod tests {
             }
             assert!(breakdown.invalid_action_penalty > 0.0);
         }
+    }
+
+    #[test]
+    fn genome_sensitivities_override_global_risk_penalty_weights_when_present() {
+        let config = RewardConfig {
+            kind: RewardKind::RiskAdjustedReturn,
+            drawdown_penalty_weight: 0.0,
+            turnover_penalty_weight: 0.0,
+            ..RewardConfig::default()
+        };
+        let reward = configured_reward(&config);
+        let mut context = context();
+        context.drawdown_sensitivity = Some(0.5);
+        context.turnover_sensitivity = Some(0.25);
+        let breakdown = reward.breakdown(&context).unwrap();
+        assert!((breakdown.drawdown_penalty - 0.05).abs() < 1e-12);
+        assert!((breakdown.turnover_penalty - 0.5).abs() < 1e-12);
     }
 }

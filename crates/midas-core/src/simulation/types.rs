@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 // Earlier checkpoints contain incompatible action samples or state layouts.
 /// Format 13 records replacement-strategy identity, version, and state.
 pub const CHECKPOINT_VERSION: u32 = 13;
+/// Format 14 adds persistent agent self-awareness statistics. Baseline
+/// configurations continue to write format 13 for compatibility.
+pub const AWARENESS_CHECKPOINT_VERSION: u32 = 14;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum DatasetSplit {

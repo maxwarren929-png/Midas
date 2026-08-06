@@ -22,6 +22,13 @@ The default schema registers three providers:
 - `portfolio`: cash fraction, per-asset allocation, unrealised return, net-worth ratio, drawdown, one-step portfolio return, and turnover ratio when selected by the schema.
 - `agent_state`: normalised age when selected by the schema.
 
+`agent_awareness` is an additional opt-in provider for V2 self-awareness:
+recent clipped reward, an EMA reward mean, EMA reward volatility, exploration
+temperature relative to birth, daily survival cost relative to net worth, and
+the sign of short- versus long-term reward EMAs. These values are persisted in
+the agent state and are only added to the neural vector when explicitly listed
+in `[observation].features` and `[observations].providers`.
+
 `rolling_market_stats` is an opt-in fourth provider introduced in Prompt 6. It
 precomputes immutable, past-only values from the canonical point-in-time raw
 close series and publishes them by decision date. It has no dependency on PPO,
@@ -112,6 +119,11 @@ The schema output is the authoritative input map. It is suitable for recording e
 
 ## Compatibility and future providers
 
-The schema hash includes its version, entries, providers, and normalisation rules. It is embedded in `BrainArchitecture` and checkpoint compatibility. Current checkpoint format 13 safely reads format 12, while format 11 remains incompatible because it predates the registry identity; no positional-schema migration is attempted. Prompt 6 did not change the format-12 observation layout. An enabled rolling provider has a different schema/configuration identity and is rejected on restore against a default-schema checkpoint.
+The schema hash includes its version, entries, providers, and normalisation rules. It is embedded in `BrainArchitecture` and checkpoint compatibility. Baseline checkpoint format 13 safely reads format 12 and legacy format-13 agent layouts, while awareness schemas use format 14 because they persist additional agent state. Format 11 remains incompatible because it predates the registry identity; no positional-schema migration is attempted. Prompt 6 did not change the format-12 observation layout. An enabled rolling or awareness provider has a different schema/configuration identity and is rejected on restore against a default-schema checkpoint.
 
 Future indicators, external data, or evolutionary sensor selection must add providers or explicit schema entries through this boundary. They must not append positional fields in `SimulationEngine`, modify PPO input handling, or make a provider mutate simulation state. Future genome-controlled sensor subsets can be represented as a selected schema without changing the policy or learning interfaces.
+
+V2 awareness schemas use checkpoint format 14 because their persistent agent
+statistics extend the serialized state. Baseline schemas retain format 13;
+format-12 and legacy format-13 checkpoints are migrated with zeroed awareness
+statistics when loaded under a compatible baseline configuration.

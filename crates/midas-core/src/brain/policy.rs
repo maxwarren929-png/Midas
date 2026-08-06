@@ -37,6 +37,11 @@ pub trait Policy: Send {
     fn snapshot(&self) -> Result<PolicySnapshot>;
     fn reset_episode_state(&mut self);
     fn policy_blueprint(&self) -> PolicyBlueprint;
+    /// Returns the current and birth action temperatures used to describe
+    /// exploration to an optional agent-awareness provider.
+    fn temperature_state(&self) -> (f32, f32) {
+        (1.0, 1.0)
+    }
     fn evaluate_action(
         &mut self,
         observation: &Observation,
@@ -219,6 +224,9 @@ impl Policy for NeuralPolicy {
     }
     fn policy_blueprint(&self) -> PolicyBlueprint {
         PolicyBlueprint::Neural
+    }
+    fn temperature_state(&self) -> (f32, f32) {
+        (self.temperature, self.genome.traits.action_temperature)
     }
     fn fork(&self) -> Result<Box<dyn Policy>> {
         Ok(Box::new(Self {

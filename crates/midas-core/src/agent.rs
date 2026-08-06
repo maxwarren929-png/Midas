@@ -15,6 +15,9 @@ use crate::{
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
+pub const REWARD_EMA_ALPHA: f64 = 0.05;
+const SHORT_REWARD_EMA_ALPHA: f64 = 0.20;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentState {
     pub id: AgentId,
@@ -32,6 +35,33 @@ pub struct AgentState {
     pub parent_ids: Vec<AgentId>,
     pub total_policy_failures: u32,
     pub consecutive_policy_failures: u32,
+    #[serde(default)]
+    pub reward_ema: f64,
+    #[serde(default)]
+    pub reward_variance_ema: f64,
+    #[serde(default)]
+    pub last_reward: f64,
+    #[serde(default)]
+    pub short_reward_ema: f64,
+    #[serde(default)]
+    pub long_reward_ema: f64,
+    #[serde(default)]
+    pub reward_trend: f64,
+}
+impl AgentState {
+    pub fn update_reward_statistics(&mut self, reward: f32) {
+        let reward = f64::from(reward);
+        self.last_reward = reward;
+        self.reward_ema = REWARD_EMA_ALPHA * reward + (1.0 - REWARD_EMA_ALPHA) * self.reward_ema;
+        let deviation = (reward - self.reward_ema).powi(2);
+        self.reward_variance_ema =
+            REWARD_EMA_ALPHA * deviation + (1.0 - REWARD_EMA_ALPHA) * self.reward_variance_ema;
+        self.short_reward_ema = SHORT_REWARD_EMA_ALPHA * reward
+            + (1.0 - SHORT_REWARD_EMA_ALPHA) * self.short_reward_ema;
+        self.long_reward_ema =
+            REWARD_EMA_ALPHA * reward + (1.0 - REWARD_EMA_ALPHA) * self.long_reward_ema;
+        self.reward_trend = (self.short_reward_ema - self.long_reward_ema).signum();
+    }
 }
 pub struct Agent {
     pub state: AgentState,
@@ -193,6 +223,12 @@ impl AgentFactory for StandardAgentFactory {
                 parent_ids: r.parent_ids,
                 total_policy_failures: 0,
                 consecutive_policy_failures: 0,
+                reward_ema: 0.0,
+                reward_variance_ema: 0.0,
+                last_reward: 0.0,
+                short_reward_ema: 0.0,
+                long_reward_ema: 0.0,
+                reward_trend: 0.0,
             },
             policy,
             learning,
@@ -330,4 +366,45 @@ pub fn configured_blueprint(config: &Config) -> Result<PolicyBlueprint> {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reward_statistics_track_recent_mean_variance_and_trend() {
+        let mut state = AgentState {
+            id: crate::AgentId(1),
+            birth_date: NaiveDate::from_ymd_opt(2020, 1, 1).unwrap(),
+            age: 0,
+            portfolio: Portfolio::new(100.0, 1),
+            maximum_net_worth: 100.0,
+            maximum_drawdown: 0.0,
+            alive: true,
+            genome: None,
+            genome_id: None,
+            lineage_id: None,
+            parent_ids: Vec::new(),
+            total_policy_failures: 0,
+            consecutive_policy_failures: 0,
+            reward_ema: 0.0,
+            reward_variance_ema: 0.0,
+            last_reward: 0.0,
+            short_reward_ema: 0.0,
+            long_reward_ema: 0.0,
+            reward_trend: 0.0,
+        };
+        for _ in 0..200 {
+            state.update_reward_statistics(1.0);
+        }
+        assert_eq!(state.last_reward, 1.0);
+        assert!((state.reward_ema - 1.0).abs() < 1e-4);
+        assert!(state.reward_variance_ema < 1e-4);
+        assert_eq!(state.reward_trend, 1.0);
+
+        state.update_reward_statistics(-1.0);
+        assert_eq!(state.last_reward, -1.0);
+        assert_eq!(state.reward_trend, -1.0);
+    }
 }
