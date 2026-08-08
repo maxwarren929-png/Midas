@@ -1,5 +1,5 @@
 use super::burn_runtime::BurnRuntimeParameters;
-use super::head_training::accumulate_dense_gradient;
+use super::head_training::autodiff_bptt_gradients;
 use super::impulse_beta::{
     beta_entropy, beta_entropy_derivative_alpha, beta_log_probability,
     beta_log_probability_derivative_alpha, beta_shapes, bounded_impulse_beta_evaluation,
@@ -58,6 +58,7 @@ fn ppo_sample(
     old_log_probability: f32,
 ) -> PpoTrainingSample {
     PpoTrainingSample {
+        sequence_start: true,
         observation: Observation {
             schema_hash: "schema".into(),
             values,
@@ -115,6 +116,7 @@ fn deterministic_head_model() -> BurnNeuralModel {
         },
     };
     lifetime.validate(&architecture).unwrap();
+    let recurrent_outputs = lifetime.recurrent.outputs;
     let burn_device = Default::default();
     BurnNeuralModel {
         architecture,
@@ -124,8 +126,41 @@ fn deterministic_head_model() -> BurnNeuralModel {
             memory: vec![0.0],
             inference_steps: 0,
         },
-        optimizer: OptimizerState::empty(&genome.architecture),
+        optimizer: BpttOptimizerState::empty(&genome.architecture, recurrent_outputs),
     }
+}
+
+fn legacy_recurrent_genome(architecture: &BrainArchitecture, seed: u64) -> BrainGenome {
+    let mut genome =
+        BrainGenome::random(architecture, &EvolvableTraitsConfig::default(), seed).unwrap();
+    let hidden_size = architecture
+        .hidden_layers
+        .last()
+        .copied()
+        .unwrap_or(architecture.observation_size);
+    genome.genome_format_version = 3;
+    genome.recurrent = DenseGenome {
+        inputs: hidden_size + architecture.memory.size,
+        outputs: architecture.memory.size,
+        weights: vec![0.0; (hidden_size + architecture.memory.size) * architecture.memory.size],
+        bias: vec![0.0; architecture.memory.size],
+    };
+    genome.validate(architecture).unwrap();
+    genome
+}
+
+fn deterministic_gru_model() -> BurnNeuralModel {
+    let mut model = deterministic_head_model();
+    model.lifetime.recurrent = DenseGenome {
+        inputs: 3,
+        outputs: 3,
+        weights: vec![0.2, -0.1, 0.3, 0.0, 0.0, 0.0, 0.4, 0.5, 0.6],
+        bias: vec![0.1, -0.2, 0.05],
+    };
+    model.lifetime.actor.weights = vec![1.0, 0.0];
+    model.optimizer = BpttOptimizerState::empty(&model.architecture, 3);
+    model.cached = BurnRuntimeParameters::from_lifetime(&model.lifetime, &Default::default());
+    model
 }
 
 #[test]
@@ -143,6 +178,7 @@ fn burn_training_changes_lifetime_parameters_without_changing_genome() {
     let before = model.lifetime_parameters().unwrap();
     let batch = PpoTrainingBatch {
         samples: vec![PpoTrainingSample {
+            sequence_start: true,
             observation: Observation {
                 schema_hash: "schema".into(),
                 values: vec![0.2, -0.1],
@@ -172,8 +208,104 @@ fn burn_training_changes_lifetime_parameters_without_changing_genome() {
     let metrics = model.train_batch(&batch, &learning_config()).unwrap();
     assert!(metrics.rollout_size > 0);
     assert!(metrics.gradient_norm <= 1.0 + 1e-6);
+    assert!(metrics.pre_clip_gradient_norm + 1e-6 >= metrics.gradient_norm);
+    assert_eq!(
+        metrics.hidden_gradient_norms.len(),
+        architecture.hidden_layers.len()
+    );
+    assert!(
+        metrics
+            .hidden_gradient_norms
+            .iter()
+            .all(|norm| norm.is_finite())
+    );
+    assert!(metrics.recurrent_gradient_norm.is_finite());
+    assert!(metrics.gru_update_gradient_norm.is_some_and(f32::is_finite));
+    assert!(metrics.gru_reset_gradient_norm.is_some_and(f32::is_finite));
+    assert!(
+        metrics
+            .gru_candidate_gradient_norm
+            .is_some_and(f32::is_finite)
+    );
+    assert!(metrics.actor_gradient_norm.is_finite());
+    assert!(metrics.critic_gradient_norm.is_finite());
+    assert!((0.0..=1.0).contains(&metrics.gradient_clip_fraction));
+    assert!(metrics.relative_update_norm.is_finite());
+    assert!(metrics.relative_update_norm > 0.0);
     assert_ne!(before, model.lifetime_parameters().unwrap());
     assert_eq!(before_genome, genome);
+}
+
+#[test]
+fn gru_inference_matches_the_standard_update_reset_candidate_equations() {
+    let model = deterministic_gru_model();
+    let memory = 0.25_f32;
+    let observation = 0.7_f32;
+    let encoded_input = observation * (1.0 / (1.0 + (-observation).exp()));
+    let sigmoid = |value: f32| 1.0 / (1.0 + (-value).exp());
+    let update = sigmoid(encoded_input * 0.2 + memory * 0.4 + 0.1);
+    let reset = sigmoid(encoded_input * -0.1 + memory * 0.5 - 0.2);
+    let candidate = (encoded_input * 0.3 + reset * memory * 0.6 + 0.05).tanh();
+    let expected = update * memory + (1.0 - update) * candidate;
+    let actual = model
+        .encode_observation(
+            &Observation {
+                schema_hash: "schema".into(),
+                values: vec![observation, 0.0],
+            },
+            &NeuralRuntimeState {
+                memory: vec![memory],
+                inference_steps: 0,
+            },
+        )
+        .unwrap()
+        .representation[0];
+    assert!((actual - expected).abs() < 1e-6);
+}
+
+#[test]
+fn packed_gru_autodiff_gradients_match_finite_differences() {
+    let model = deterministic_gru_model();
+    let gradients = autodiff_bptt_gradients(
+        &model,
+        1,
+        vec![0.7, 0.0],
+        vec![0.25],
+        vec![true],
+        vec![1.0, 0.0],
+        vec![0.0],
+    )
+    .unwrap();
+    let epsilon = 1e-3_f32;
+    for index in [0, 1, 2, 6, 7, 8] {
+        let logit = |offset: f32| {
+            let mut perturbed = deterministic_gru_model();
+            perturbed.lifetime.recurrent.weights[index] += offset;
+            perturbed.cached =
+                BurnRuntimeParameters::from_lifetime(&perturbed.lifetime, &Default::default());
+            let encoded = perturbed
+                .encode_observation(
+                    &Observation {
+                        schema_hash: "schema".into(),
+                        values: vec![0.7, 0.0],
+                    },
+                    &NeuralRuntimeState {
+                        memory: vec![0.25],
+                        inference_steps: 0,
+                    },
+                )
+                .unwrap();
+            perturbed
+                .evaluate_representation(&encoded.representation)
+                .unwrap()
+                .logits[0]
+        };
+        let finite_difference = (logit(epsilon) - logit(-epsilon)) / (2.0 * epsilon);
+        assert!(
+            (gradients.recurrent.weight_gradient[index] - finite_difference).abs() < 2e-4,
+            "packed GRU gradient mismatch at weight {index}"
+        );
+    }
 }
 
 #[test]
@@ -194,11 +326,14 @@ fn ppo_head_learning_changes_actor_weights_regression() {
 }
 
 #[test]
-fn full_head_training_updates_heads_but_freezes_encoder_and_genome() {
+fn bptt_training_updates_hidden_recurrent_and_heads_but_freezes_genome() {
     let architecture = architecture();
     let genome = BrainGenome::random(&architecture, &EvolvableTraitsConfig::default(), 41).unwrap();
     let before_genome = genome.clone();
     let mut model = deterministic_head_model();
+    model.lifetime.actor.weights = vec![0.3, -0.2];
+    model.lifetime.critic.weights = vec![0.4];
+    model.cached = BurnRuntimeParameters::from_lifetime(&model.lifetime, &Default::default());
     let before = model.lifetime_parameters().unwrap();
     let builds_before = model.runtime_parameter_builds();
     let batch = PpoTrainingBatch {
@@ -211,11 +346,20 @@ fn full_head_training_updates_heads_but_freezes_encoder_and_genome() {
     assert_ne!(before.actor.bias, after.actor.bias);
     assert_ne!(before.critic.weights, after.critic.weights);
     assert_ne!(before.critic.bias, after.critic.bias);
-    assert_eq!(before.hidden, after.hidden);
-    assert_eq!(before.recurrent, after.recurrent);
+    assert_ne!(before.hidden, after.hidden);
+    assert_ne!(before.recurrent, after.recurrent);
     assert_eq!(before_genome, genome);
 
     let optimizer = model.optimizer_state().unwrap();
+    assert_eq!(optimizer.hidden.len(), architecture.hidden_layers.len());
+    assert_eq!(
+        optimizer.hidden[0].weight_momentum.len(),
+        architecture.observation_size * architecture.hidden_layers[0]
+    );
+    assert_eq!(
+        optimizer.recurrent.weight_momentum.len(),
+        (architecture.hidden_layers[0] + architecture.memory.size) * architecture.memory.size
+    );
     assert_eq!(
         optimizer.actor.weight_momentum.len(),
         architecture.memory.size * architecture.actor_output_size
@@ -291,20 +435,109 @@ fn deterministic_evaluation_does_not_decay_temperature() {
 }
 
 #[test]
-fn dense_gradient_matches_outer_product_exactly() {
-    let representation = [2.0_f32, -1.0];
-    let output_gradient = [0.5_f32, -0.25];
-    let mut weight_gradient = vec![0.0; 4];
-    let mut bias_gradient = vec![0.0; 2];
-    accumulate_dense_gradient(
-        &representation,
-        &output_gradient,
-        &mut weight_gradient,
-        &mut bias_gradient,
+fn burn_autodiff_bptt_vjp_reaches_hidden_recurrent_and_heads() {
+    let mut model = deterministic_head_model();
+    model.lifetime.actor.weights = vec![0.3, -0.2];
+    model.lifetime.critic.weights = vec![0.4];
+    let observations = vec![2.0, 0.0, -1.0, 0.0];
+    let zero = NeuralRuntimeState {
+        memory: vec![0.0],
+        inference_steps: 0,
+    };
+    let mut state = zero;
+    let mut representations = Vec::new();
+    for values in observations.chunks_exact(2) {
+        let encoded = model
+            .encode_observation(
+                &Observation {
+                    schema_hash: "schema".into(),
+                    values: values.to_vec(),
+                },
+                &state,
+            )
+            .unwrap();
+        representations.push(encoded.representation[0]);
+        state = encoded.next_runtime_state;
+    }
+    let gradients = autodiff_bptt_gradients(
+        &model,
+        2,
+        observations,
+        vec![0.0, 0.0],
+        vec![true, false],
+        vec![0.5, -0.25, 0.25, 0.5],
+        vec![0.2, -0.1],
     )
     .unwrap();
-    assert_eq!(weight_gradient, vec![1.0, -0.5, -0.5, 0.25]);
-    assert_eq!(bias_gradient, vec![0.5, -0.25]);
+    let expected_actor = [
+        representations[0] * 0.5 + representations[1] * 0.25,
+        representations[0] * -0.25 + representations[1] * 0.5,
+    ];
+    for (actual, expected) in gradients.actor_weight_gradient.iter().zip(expected_actor) {
+        assert!((actual - expected).abs() < 1e-6);
+    }
+    assert_eq!(gradients.actor_bias_gradient, vec![0.75, 0.25]);
+    assert!(
+        (gradients.critic_weight_gradient[0]
+            - (representations[0] * 0.2 - representations[1] * 0.1))
+            .abs()
+            < 1e-6
+    );
+    assert_eq!(gradients.critic_bias_gradient, vec![0.1]);
+    assert!(
+        gradients.hidden[0]
+            .weight_gradient
+            .iter()
+            .any(|gradient| gradient.abs() > 1e-6)
+    );
+    assert!(
+        gradients
+            .recurrent
+            .weight_gradient
+            .iter()
+            .any(|gradient| gradient.abs() > 1e-6)
+    );
+}
+
+#[test]
+fn bptt_carries_later_loss_into_an_earlier_observation_only_within_a_sequence() {
+    let mut model = deterministic_head_model();
+    model.lifetime.recurrent.weights = vec![1.0, 0.0, 1.0];
+    model.lifetime.actor.weights = vec![1.0, 0.0];
+    let observations = vec![1.0, 0.0, 0.0, 0.0];
+    let actor_upstream = vec![0.0, 0.0, 1.0, 0.0];
+    let temporal = autodiff_bptt_gradients(
+        &model,
+        2,
+        observations.clone(),
+        vec![0.0, 0.0],
+        vec![true, false],
+        actor_upstream.clone(),
+        vec![0.0, 0.0],
+    )
+    .unwrap();
+    let detached = autodiff_bptt_gradients(
+        &model,
+        2,
+        observations,
+        vec![0.0, 0.0],
+        vec![true, true],
+        actor_upstream,
+        vec![0.0, 0.0],
+    )
+    .unwrap();
+    let temporal_norm = temporal.hidden[0]
+        .weight_gradient
+        .iter()
+        .map(|gradient| gradient.abs())
+        .sum::<f32>();
+    let detached_norm = detached.hidden[0]
+        .weight_gradient
+        .iter()
+        .map(|gradient| gradient.abs())
+        .sum::<f32>();
+    assert!(temporal_norm > 1e-6);
+    assert!(detached_norm < 1e-7);
 }
 
 #[test]
@@ -463,7 +696,7 @@ fn critic_learning_is_state_dependent_for_two_encoded_states() {
 }
 
 #[test]
-fn malformed_full_head_optimizer_state_is_rejected_on_restore() {
+fn malformed_bptt_optimizer_state_is_rejected_on_restore() {
     let architecture = architecture();
     let genome = BrainGenome::random(&architecture, &EvolvableTraitsConfig::default(), 51).unwrap();
     let device = ComputeDevice::CpuNdArray {
@@ -473,23 +706,29 @@ fn malformed_full_head_optimizer_state_is_rejected_on_restore() {
         .build(&genome, &architecture, &device)
         .unwrap();
     let base_state = model.snapshot_state().unwrap();
-    for invalid in 0..4 {
-        let NeuralModelState::Burn {
+    for invalid in 0..6 {
+        let NeuralModelState::BurnBptt {
             parameters,
             runtime,
             mut optimizer,
         } = base_state.clone()
         else {
-            panic!("expected Burn state")
+            panic!("expected BPTT Burn state")
         };
         match invalid {
             0 => {
-                optimizer.actor.weight_momentum.pop();
+                optimizer.hidden[0].weight_momentum.pop();
             }
             1 => {
-                optimizer.actor.bias_momentum.pop();
+                optimizer.recurrent.weight_momentum.pop();
             }
             2 => {
+                optimizer.actor.weight_momentum.pop();
+            }
+            3 => {
+                optimizer.actor.bias_momentum.pop();
+            }
+            4 => {
                 optimizer.critic.weight_momentum.pop();
             }
             _ => {
@@ -499,7 +738,7 @@ fn malformed_full_head_optimizer_state_is_rejected_on_restore() {
         let error = match BurnNeuralModelFactory.restore(
             &genome,
             &architecture,
-            NeuralModelState::Burn {
+            NeuralModelState::BurnBptt {
                 parameters,
                 runtime,
                 optimizer,
@@ -514,12 +753,104 @@ fn malformed_full_head_optimizer_state_is_rejected_on_restore() {
 }
 
 #[test]
+fn frozen_encoder_snapshot_migrates_with_zero_hidden_and_recurrent_momentum() {
+    let architecture = architecture();
+    let genome = legacy_recurrent_genome(&architecture, 53);
+    let device = ComputeDevice::CpuNdArray {
+        device: "default".into(),
+    };
+    let parameters = LifetimeParameters::from_genome(&genome);
+    let restored = BurnNeuralModelFactory
+        .restore(
+            &genome,
+            &architecture,
+            NeuralModelState::Burn {
+                parameters: Box::new(parameters),
+                runtime: NeuralRuntimeState {
+                    memory: vec![0.0; architecture.memory.size],
+                    inference_steps: 7,
+                },
+                optimizer: OptimizerState::empty(&architecture),
+            },
+            &device,
+        )
+        .unwrap();
+    let optimizer = restored.optimizer_state().unwrap();
+    assert_eq!(optimizer.step, 0);
+    assert_eq!(optimizer.hidden.len(), architecture.hidden_layers.len());
+    assert!(optimizer.hidden.iter().all(|state| {
+        state
+            .weight_momentum
+            .iter()
+            .chain(&state.bias_momentum)
+            .all(|value| *value == 0.0)
+    }));
+    assert!(
+        optimizer
+            .recurrent
+            .weight_momentum
+            .iter()
+            .chain(&optimizer.recurrent.bias_momentum)
+            .all(|value| *value == 0.0)
+    );
+}
+
+#[test]
+fn trainable_encoder_snapshot_migrates_with_zero_recurrent_momentum() {
+    let architecture = architecture();
+    let genome = legacy_recurrent_genome(&architecture, 59);
+    let device = ComputeDevice::CpuNdArray {
+        device: "default".into(),
+    };
+    let mut encoder_optimizer = TrainableEncoderOptimizerState::empty(&architecture);
+    encoder_optimizer.hidden[0].weight_momentum[0] = 0.25;
+    let restored = BurnNeuralModelFactory
+        .restore(
+            &genome,
+            &architecture,
+            NeuralModelState::BurnTrainableEncoder {
+                parameters: Box::new(LifetimeParameters::from_genome(&genome)),
+                runtime: NeuralRuntimeState {
+                    memory: vec![0.0; architecture.memory.size],
+                    inference_steps: 3,
+                },
+                optimizer: encoder_optimizer,
+            },
+            &device,
+        )
+        .unwrap();
+    let optimizer = restored.optimizer_state().unwrap();
+    assert_eq!(optimizer.hidden[0].weight_momentum[0], 0.25);
+    assert!(
+        optimizer
+            .recurrent
+            .weight_momentum
+            .iter()
+            .chain(&optimizer.recurrent.bias_momentum)
+            .all(|value| *value == 0.0)
+    );
+}
+
+#[test]
 fn genome_validation_rejects_hidden_layout_changes() {
     let architecture = architecture();
     let mut genome =
         BrainGenome::random(&architecture, &EvolvableTraitsConfig::default(), 17).unwrap();
     genome.hidden.pop();
     assert!(genome.validate(&architecture).is_err());
+}
+
+#[test]
+fn new_genomes_use_the_packed_gru_layout() {
+    let architecture = architecture();
+    let genome = BrainGenome::random(&architecture, &EvolvableTraitsConfig::default(), 23).unwrap();
+
+    assert_eq!(genome.genome_format_version, 4);
+    assert_eq!(genome.recurrent.outputs, architecture.memory.size * 3);
+    assert_eq!(
+        genome.recurrent.weights.len(),
+        genome.recurrent.inputs * architecture.memory.size * 3
+    );
 }
 
 #[test]

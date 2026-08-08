@@ -1,6 +1,6 @@
 use super::{
-    BrainArchitecture, BrainGenome, LifetimeParameters, NeuralInput, NeuralModelState,
-    NeuralOutput, NeuralRuntimeState, OptimizerState,
+    BpttOptimizerState, BrainArchitecture, BrainGenome, LifetimeParameters, NeuralInput,
+    NeuralModelState, NeuralOutput, NeuralRuntimeState,
 };
 use crate::{
     MidasError, Result,
@@ -30,7 +30,7 @@ pub trait NeuralModel: Send {
             "neural model is inference-only and cannot train".into(),
         ))
     }
-    fn optimizer_state(&self) -> Result<OptimizerState> {
+    fn optimizer_state(&self) -> Result<BpttOptimizerState> {
         Err(MidasError::Policy(
             "neural model has no optimizer state".into(),
         ))

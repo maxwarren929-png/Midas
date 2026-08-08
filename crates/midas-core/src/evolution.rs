@@ -531,9 +531,13 @@ pub fn crossover(
     config: &EvolutionCrossoverConfig,
     rng: &mut EvolutionRng,
 ) -> Result<BrainGenome> {
-    if a.architecture != b.architecture {
+    if a.architecture != b.architecture
+        || a.genome_format_version != b.genome_format_version
+        || a.recurrent.inputs != b.recurrent.inputs
+        || a.recurrent.outputs != b.recurrent.outputs
+    {
         return Err(MidasError::Policy(
-            "cannot crossover incompatible architectures".into(),
+            "cannot crossover incompatible genome layouts".into(),
         ));
     }
     let mut child = a.clone();
@@ -746,9 +750,13 @@ pub fn genome_distance(
     weight_component: f64,
     trait_component: f64,
 ) -> Result<f64> {
-    if a.architecture != b.architecture {
+    if a.architecture != b.architecture
+        || a.genome_format_version != b.genome_format_version
+        || a.recurrent.inputs != b.recurrent.inputs
+        || a.recurrent.outputs != b.recurrent.outputs
+    {
         return Err(MidasError::Policy(
-            "cannot compare incompatible genomes".into(),
+            "cannot compare incompatible genome layouts".into(),
         ));
     }
     let left = all_layers(a);
@@ -898,6 +906,26 @@ mod tests {
                 - genome_distance(&c, &a, 1.0, 1.0).unwrap())
             .abs()
                 < 1e-12
+        );
+    }
+
+    #[test]
+    fn mixed_legacy_and_gru_layouts_are_rejected() {
+        let architecture = architecture();
+        let traits = EvolvableTraitsConfig::default();
+        let legacy = BrainGenome::random_with_format(&architecture, &traits, 1, 3).unwrap();
+        let gru = BrainGenome::random_with_format(&architecture, &traits, 2, 4).unwrap();
+        let mut rng = EvolutionRng::seed(3);
+
+        assert!(genome_distance(&legacy, &gru, 1.0, 1.0).is_err());
+        assert!(
+            crossover(
+                &legacy,
+                &gru,
+                &EvolutionCrossoverConfig::default(),
+                &mut rng,
+            )
+            .is_err()
         );
     }
 

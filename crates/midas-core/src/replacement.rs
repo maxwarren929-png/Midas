@@ -153,14 +153,25 @@ pub trait ReplacementStrategy: Send {
     }
 }
 pub struct NonEvolutionaryRandomGenomeReplacement;
+
+fn random_replacement_genome(c: &ReplacementContext<'_>) -> Result<BrainGenome> {
+    let genome_format_version = c
+        .dead_agent
+        .genome
+        .as_ref()
+        .map_or(4, |genome| genome.genome_format_version);
+    BrainGenome::random_with_format(
+        c.architecture,
+        c.evolvable_traits,
+        c.deterministic_seed,
+        genome_format_version,
+    )
+}
+
 impl ReplacementStrategy for NonEvolutionaryRandomGenomeReplacement {
     fn create_replacement(&mut self, c: &ReplacementContext<'_>) -> Result<AgentSpawnRequest> {
         let genome = if c.dead_policy == PolicyBlueprint::Neural {
-            Some(BrainGenome::random(
-                c.architecture,
-                c.evolvable_traits,
-                c.deterministic_seed,
-            )?)
+            Some(random_replacement_genome(c)?)
         } else {
             None
         };
@@ -284,11 +295,7 @@ impl ReplacementStrategy for EvolutionaryReplacementStrategy {
                     crate::config::EvolutionFallback::RandomGenome => Ok((
                         AgentSpawnRequest {
                             policy_blueprint: PolicyBlueprint::Neural,
-                            genome: Some(BrainGenome::random(
-                                c.architecture,
-                                c.evolvable_traits,
-                                c.deterministic_seed,
-                            )?),
+                            genome: Some(random_replacement_genome(c)?),
                             parent_ids: Vec::new(),
                             metadata: SpawnMetadata {
                                 reason: "evolution_random_genome_fallback".into(),
@@ -328,7 +335,7 @@ impl ReplacementStrategy for EvolutionaryReplacementStrategy {
                     fallback_reason = Some(format!("crossover_failed:{error}"));
                     fallback_outcome = Some(EvolutionReplacementOutcome::RandomFallback);
                     crossover_applied = false;
-                    BrainGenome::random(c.architecture, c.evolvable_traits, c.deterministic_seed)?
+                    random_replacement_genome(c)?
                 }
             },
         };
@@ -356,11 +363,7 @@ impl ReplacementStrategy for EvolutionaryReplacementStrategy {
                         fallback_reason = Some(format!("mutation_failed:{error}"));
                         fallback_outcome = Some(EvolutionReplacementOutcome::RandomFallback);
                         crossover_applied = false;
-                        child = BrainGenome::random(
-                            c.architecture,
-                            c.evolvable_traits,
-                            c.deterministic_seed,
-                        )?
+                        child = random_replacement_genome(c)?
                     }
                 }
                 None

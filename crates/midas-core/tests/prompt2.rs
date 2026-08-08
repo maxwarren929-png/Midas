@@ -41,7 +41,18 @@ fn ppo_learning_and_checkpoint_resume_are_deterministic() {
         uninterrupted_report.learning_updates,
         resumed_report.learning_updates
     );
-    assert_eq!(uninterrupted.domain_events, resumed.domain_events);
+    assert_eq!(
+        uninterrupted.domain_events.len(),
+        resumed.domain_events.len()
+    );
+    for (index, (left, right)) in uninterrupted
+        .domain_events
+        .iter()
+        .zip(&resumed.domain_events)
+        .enumerate()
+    {
+        assert_eq!(left, right, "domain event mismatch at index {index}");
+    }
     assert_eq!(
         uninterrupted.agents().collect::<Vec<_>>(),
         resumed.agents().collect::<Vec<_>>()
@@ -87,7 +98,7 @@ fn frozen_evaluation_reuses_trained_checkpoint_without_learning() {
 }
 
 #[test]
-fn prompt2_ppo_updates_full_heads_with_a_frozen_encoder() {
+fn prompt2_ppo_updates_hidden_recurrent_and_head_parameters() {
     let config = prompt2_config();
     let data = PolarsDataSource.load(&config).unwrap();
     let mut engine = SimulationEngine::new(config, data, DatasetSplit::Training).unwrap();
@@ -114,8 +125,8 @@ fn prompt2_ppo_updates_full_heads_with_a_frozen_encoder() {
     assert_ne!(before.actor.bias, after.actor.bias);
     assert_ne!(before.critic.weights, after.critic.weights);
     assert_ne!(before.critic.bias, after.critic.bias);
-    assert_eq!(before.hidden, after.hidden);
-    assert_eq!(before.recurrent, after.recurrent);
+    assert_ne!(before.hidden, after.hidden);
+    assert_ne!(before.recurrent, after.recurrent);
     assert_eq!(
         birth_genome,
         engine
@@ -172,7 +183,18 @@ fn prompt3a_multi_asset_portfolios_and_resume_are_deterministic() {
         report.neural_mean_active_positions,
         resumed_report.neural_mean_active_positions
     );
-    assert_eq!(uninterrupted.domain_events, resumed.domain_events);
+    assert_eq!(
+        uninterrupted.domain_events.len(),
+        resumed.domain_events.len()
+    );
+    for (index, (left, right)) in uninterrupted
+        .domain_events
+        .iter()
+        .zip(&resumed.domain_events)
+        .enumerate()
+    {
+        assert_eq!(left, right, "domain event mismatch at index {index}");
+    }
     assert_eq!(
         uninterrupted.agents().collect::<Vec<_>>(),
         resumed.agents().collect::<Vec<_>>()

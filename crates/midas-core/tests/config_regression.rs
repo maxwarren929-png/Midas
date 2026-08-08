@@ -4,7 +4,9 @@ use midas_core::{
         RollingMarketStatsConfig,
     },
     market::{MarketDataSource, PolarsDataSource},
-    simulation::{AWARENESS_CHECKPOINT_VERSION, DatasetSplit, SimulationEngine},
+    simulation::{
+        AWARENESS_CHECKPOINT_VERSION, CHECKPOINT_VERSION, DatasetSplit, SimulationEngine,
+    },
 };
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
@@ -273,7 +275,7 @@ fn nondefault_rolling_config_is_serialized_exactly() {
 }
 
 #[test]
-fn version_12_checkpoint_resume_migrates_to_version_13_without_report_drift() {
+fn version_12_checkpoint_resume_migrates_without_report_drift() {
     let checkpoint = root().join("checkpoints/prompt6/default-control-seed-41.bin");
     let before = fs::read(&checkpoint).unwrap();
     assert_eq!(before.len(), 2_431_176);
@@ -295,7 +297,10 @@ fn version_12_checkpoint_resume_migrates_to_version_13_without_report_drift() {
     engine.save_checkpoint(saved.path()).unwrap();
     let migrated = fs::read(saved.path()).unwrap();
     assert_ne!(migrated, before);
-    assert_eq!(u32::from_le_bytes(migrated[..4].try_into().unwrap()), 13);
+    assert_eq!(
+        u32::from_le_bytes(migrated[..4].try_into().unwrap()),
+        CHECKPOINT_VERSION
+    );
     assert_eq!(fs::read(checkpoint).unwrap(), before);
 
     let config = load("configs/prompt6/runs/default-control-seed-41.toml");
@@ -308,7 +313,7 @@ fn version_12_checkpoint_resume_migrates_to_version_13_without_report_drift() {
 }
 
 #[test]
-fn v2_awareness_run_round_trips_format_14_checkpoint_state() {
+fn v2_awareness_run_round_trips_current_checkpoint_state() {
     let config = load("configs/v2-evolvable.toml");
     let data = load_data(&config);
     let mut engine =

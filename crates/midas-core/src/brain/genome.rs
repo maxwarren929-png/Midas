@@ -50,6 +50,20 @@ impl BrainGenome {
         traits: &EvolvableTraitsConfig,
         seed: u64,
     ) -> Result<Self> {
+        Self::random_with_format(a, traits, seed, 4)
+    }
+
+    pub(crate) fn random_with_format(
+        a: &BrainArchitecture,
+        traits: &EvolvableTraitsConfig,
+        seed: u64,
+        genome_format_version: u32,
+    ) -> Result<Self> {
+        if !matches!(genome_format_version, 3 | 4) {
+            return Err(MidasError::Policy(format!(
+                "unsupported genome format {genome_format_version}"
+            )));
+        }
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let mut input = a.observation_size;
         let mut hidden = Vec::new();
@@ -57,11 +71,16 @@ impl BrainGenome {
             hidden.push(random_dense(input, output, &mut rng));
             input = output;
         }
-        let recurrent = random_dense(input + a.memory.size, a.memory.size, &mut rng);
+        let recurrent_outputs = if genome_format_version == 4 {
+            a.memory.size * 3
+        } else {
+            a.memory.size
+        };
+        let recurrent = random_dense(input + a.memory.size, recurrent_outputs, &mut rng);
         let actor = random_dense(a.memory.size, a.actor_output_size, &mut rng);
         let critic = random_dense(a.memory.size, a.critic_output_size, &mut rng);
         let g = Self {
-            genome_format_version: 3,
+            genome_format_version,
             architecture: a.clone(),
             hidden,
             recurrent,
@@ -73,7 +92,7 @@ impl BrainGenome {
         Ok(g)
     }
     pub fn validate(&self, a: &BrainArchitecture) -> Result<()> {
-        if self.genome_format_version != 3 || &self.architecture != a {
+        if !matches!(self.genome_format_version, 3 | 4) || &self.architecture != a {
             return Err(MidasError::Policy(
                 "genome architecture or observation schema mismatch".into(),
             ));
@@ -97,7 +116,12 @@ impl BrainGenome {
         validate_dense(&self.recurrent, expected + a.memory.size)?;
         validate_dense(&self.actor, a.memory.size)?;
         validate_dense(&self.critic, a.memory.size)?;
-        if self.recurrent.outputs != a.memory.size
+        let expected_recurrent_outputs = if self.genome_format_version == 4 {
+            a.memory.size * 3
+        } else {
+            a.memory.size
+        };
+        if self.recurrent.outputs != expected_recurrent_outputs
             || self.actor.outputs != a.actor_output_size
             || self.critic.outputs != a.critic_output_size
         {

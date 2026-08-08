@@ -5,7 +5,7 @@ use midas_core::{
     config::Config,
     learning::{LearningStrategyState, TrainingMetrics},
     market::{MarketDataSource, PolarsDataSource},
-    simulation::{DatasetSplit, DomainEvent, ReportTrace, SimulationEngine},
+    simulation::{DatasetSplit, DomainEvent, PpoUpdateTrace, ReportTrace, SimulationEngine},
 };
 use serde_json::json;
 use std::{fs, io::Write, path::PathBuf};
@@ -87,6 +87,16 @@ fn main() -> Result<()> {
                 entropy: *entropy,
                 total_loss: 0.0,
                 gradient_norm: *gradient_norm,
+                pre_clip_gradient_norm: *gradient_norm,
+                hidden_gradient_norms: Vec::new(),
+                recurrent_gradient_norm: 0.0,
+                gru_update_gradient_norm: None,
+                gru_reset_gradient_norm: None,
+                gru_candidate_gradient_norm: None,
+                actor_gradient_norm: 0.0,
+                critic_gradient_norm: 0.0,
+                gradient_clip_fraction: 0.0,
+                relative_update_norm: 0.0,
                 approximate_kl: 0.0,
                 clip_fraction: 0.0,
                 update_index: updates.len() as u64,
@@ -138,9 +148,13 @@ fn main() -> Result<()> {
             } => {
                 birth_genome_matches &= snapshot_genome == *genome;
                 temperatures.push(temperature);
-                if let NeuralModelState::Burn { optimizer, .. } = *model_state {
-                    optimizer_steps = optimizer_steps.saturating_add(optimizer.step);
-                }
+                let optimizer_step = match *model_state {
+                    NeuralModelState::Burn { optimizer, .. } => optimizer.step,
+                    NeuralModelState::BurnTrainableEncoder { optimizer, .. } => optimizer.step,
+                    NeuralModelState::BurnBptt { optimizer, .. } => optimizer.step,
+                    NeuralModelState::External { .. } => 0,
+                };
+                optimizer_steps = optimizer_steps.saturating_add(optimizer_step);
             }
             _ => birth_genome_matches = false,
         }
@@ -161,6 +175,48 @@ fn main() -> Result<()> {
         0.0
     } else {
         temperatures.iter().map(|v| f64::from(*v)).sum::<f64>() / temperatures.len() as f64
+    };
+    let mean_ppo = |f: fn(&PpoUpdateTrace) -> f64| {
+        if ppo_traces.is_empty() {
+            0.0
+        } else {
+            ppo_traces.iter().map(|trace| f(trace)).sum::<f64>() / ppo_traces.len() as f64
+        }
+    };
+    let hidden_layer_count = ppo_traces
+        .iter()
+        .map(|trace| trace.hidden_gradient_norms.len())
+        .max()
+        .unwrap_or(0);
+    let mean_hidden_gradient_norms = (0..hidden_layer_count)
+        .map(|layer| {
+            if ppo_traces.is_empty() {
+                0.0
+            } else {
+                ppo_traces
+                    .iter()
+                    .map(|trace| {
+                        trace
+                            .hidden_gradient_norms
+                            .get(layer)
+                            .copied()
+                            .map_or(0.0, f64::from)
+                    })
+                    .sum::<f64>()
+                    / ppo_traces.len() as f64
+            }
+        })
+        .collect::<Vec<_>>();
+    let mean_optional_ppo = |f: fn(&PpoUpdateTrace) -> Option<f32>| {
+        let values = ppo_traces
+            .iter()
+            .filter_map(|trace| f(trace).map(f64::from))
+            .collect::<Vec<_>>();
+        if values.is_empty() {
+            None
+        } else {
+            Some(values.iter().sum::<f64>() / values.len() as f64)
+        }
     };
 
     println!(
@@ -221,6 +277,19 @@ fn main() -> Result<()> {
                 "mean_value_loss": mean(|m| f64::from(m.value_loss)),
                 "mean_entropy": mean(|m| f64::from(m.entropy)),
                 "mean_gradient_norm": mean(|m| f64::from(m.gradient_norm)),
+                "gradient_health": {
+                    "mean_pre_clip_global_norm": mean_ppo(|trace| f64::from(trace.pre_clip_gradient_norm)),
+                    "mean_post_clip_global_norm": mean_ppo(|trace| f64::from(trace.gradient_norm)),
+                    "mean_hidden_layer_norms": mean_hidden_gradient_norms,
+                    "mean_recurrent_norm": mean_ppo(|trace| f64::from(trace.recurrent_gradient_norm)),
+                    "mean_gru_update_gate_norm": mean_optional_ppo(|trace| trace.gru_update_gradient_norm),
+                    "mean_gru_reset_gate_norm": mean_optional_ppo(|trace| trace.gru_reset_gradient_norm),
+                    "mean_gru_candidate_norm": mean_optional_ppo(|trace| trace.gru_candidate_gradient_norm),
+                    "mean_actor_norm": mean_ppo(|trace| f64::from(trace.actor_gradient_norm)),
+                    "mean_critic_norm": mean_ppo(|trace| f64::from(trace.critic_gradient_norm)),
+                    "gradient_clip_frequency": mean_ppo(|trace| f64::from(trace.gradient_clip_fraction)),
+                    "mean_relative_update_norm": mean_ppo(|trace| f64::from(trace.relative_update_norm)),
+                },
                 "mean_approximate_kl": if ppo_traces.is_empty() { 0.0 } else {
                     ppo_traces.iter().map(|trace| f64::from(trace.approximate_kl)).sum::<f64>()
                         / ppo_traces.len() as f64

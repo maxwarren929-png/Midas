@@ -8,6 +8,30 @@ V3 unfreezes the encoder so the entire network learns end-to-end via backpropaga
 
 **This is the highest-impact change identified in the codebase.**
 
+## Implementation status
+
+Phase 1 is implemented through a staged frozen-encoder autodiff boundary. The
+runtime now defines separate Burn `NdArray` inference and
+`Autodiff<NdArray>` training backends. Exact bounded-Beta PPO derivatives are
+injected at the actor-logit boundary because Burn 0.18 does not expose
+differentiable lgamma/digamma tensor operations; Burn performs the full dense
+actor/critic vector-Jacobian product. Existing momentum state, checkpoint
+format, inference tensors, and frozen hidden/recurrent parameters are retained.
+
+The Phase 1 frozen-encoder boundary passed both short and complete-split
+determinism gates. Phase 2 now moves raw observations and all feed-forward
+hidden layers into the autodiff graph. Hidden parameters use persistent clipped
+momentum updates; gradients pass through the recurrent projection, while its
+weights and recurrent sample states remain frozen. Legacy checkpoints migrate
+with zeroed hidden momentum, and parallel graph execution is serialized to
+retain exact checkpoint/resume determinism.
+
+Phase 3 is implemented. Phase 3A trained the legacy recurrent cell through
+explicitly bounded, masked-safe sequences using truncated backpropagation
+through time. Phase 3B replaced it for new genomes with a standard GRU while
+retaining exact legacy-checkpoint execution. Longer truncation-window
+experiments remain future work.
+
 ---
 
 ## Current Architecture (Frozen)
@@ -151,6 +175,10 @@ fn train_step(
 
 ### Phase 2: Unfreeze Hidden Layers (~3 days)
 
+**Status**: Implemented for every feed-forward hidden layer. The fixed
+recurrent projection is inside the graph but its parameters and temporal state
+remain frozen until Phase 3.
+
 **Goal**: Allow gradients to flow through all dense hidden layers.
 
 **Change**: Remove the gradient detachment / `no_grad` barrier between the encoder and heads. In the current hand-rolled system, this is implicit (gradients are only computed for heads). With Burn autodiff, it means simply including hidden layer parameters in the optimizer's parameter set.
@@ -167,11 +195,17 @@ let params = model.hidden_params()
 
 **Risk**: Gradient flow through the entire network can destabilize training. Mitigations:
 - Gradient clipping (already implemented, threshold=1.0)
-- LayerNorm after first hidden layer
-- Lower learning rate for encoder vs heads (differential LR)
-- Monitor gradient norms per layer
+- Persistent momentum state for every hidden layer (implemented)
+- Exact checkpoint/resume and independent replay gates (implemented)
+- LayerNorm after first hidden layer (optional future hardening)
+- Lower learning rate for encoder vs heads (optional differential LR)
+- Report gradient norms per layer (future observability)
 
 ### Phase 3: GRU + Backprop Through Time (~1 week)
+
+**Status**: Implemented. New genome-format-4 agents use a packed standard GRU
+in both inference and Burn autodiff. Genome-format-3 checkpoints retain their
+original dense-SiLU recurrence.
 
 **Goal**: Replace the simple recurrent layer with a GRU and enable temporal gradient flow.
 
@@ -268,7 +302,8 @@ The `LifetimeParameters` struct already contains all layers too. Currently hidde
 
 Lifetime parameters already include hidden/recurrent layers. Checkpoint save/restore will capture the trained encoder state automatically. **No checkpoint format change needed** for unfreezing alone.
 
-If GRU replaces simple recurrent, the recurrent weight layout changes → **checkpoint format bump to 15**.
+The GRU recurrent layout change produced genome format 4 and checkpoint formats
+19/20. Formats 13–18 remain readable through the legacy recurrent runtime.
 If network dimensions change → **architecture version bump** → new checkpoint format.
 
 ### Observation Schema

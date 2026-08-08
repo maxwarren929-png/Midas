@@ -304,14 +304,14 @@ fn deserialize_checkpoint(bytes: &[u8], operation: &str) -> Result<Checkpoint> {
                 ))
             });
     }
-    if version == CHECKPOINT_VERSION {
+    if version == 13 {
         return match bincode::deserialize::<Checkpoint>(bytes) {
             Ok(checkpoint) => Ok(checkpoint),
             Err(current_error) => bincode::deserialize::<CheckpointV13Legacy>(bytes)
                 .map(Checkpoint::from)
                 .map_err(|legacy_error| {
                     MidasError::Checkpoint(format!(
-                        "incompatible checkpoint for {operation}; expected format version {CHECKPOINT_VERSION}: {current_error}; legacy decode failed: {legacy_error}"
+                        "incompatible version-13 checkpoint for {operation}: {current_error}; legacy decode failed: {legacy_error}"
                     ))
                 }),
         };
@@ -326,7 +326,7 @@ fn deserialize_checkpoint(bytes: &[u8], operation: &str) -> Result<Checkpoint> {
 fn validate_resume_version(checkpoint: &Checkpoint) -> Result<()> {
     if !matches!(
         checkpoint.version,
-        CHECKPOINT_VERSION | AWARENESS_CHECKPOINT_VERSION | 12
+        CHECKPOINT_VERSION | AWARENESS_CHECKPOINT_VERSION | 12 | 13 | 14 | 15 | 16 | 17 | 18
     ) {
         let detail = if checkpoint.version == 11 {
             "; checkpoint 11 predates the modular observation registry and cannot be migrated safely"
@@ -348,7 +348,7 @@ fn validate_resume_version(checkpoint: &Checkpoint) -> Result<()> {
 fn validate_evaluation_version(checkpoint: &Checkpoint) -> Result<()> {
     if !matches!(
         checkpoint.version,
-        CHECKPOINT_VERSION | AWARENESS_CHECKPOINT_VERSION | 12
+        CHECKPOINT_VERSION | AWARENESS_CHECKPOINT_VERSION | 12 | 13 | 14 | 15 | 16 | 17 | 18
     ) {
         return Err(MidasError::Checkpoint(format!(
             "checkpoint version {} is incompatible with {CHECKPOINT_VERSION}; observation-registry and neural action distribution layouts are not migrated",

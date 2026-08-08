@@ -35,6 +35,9 @@ pub struct Transition {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PpoTrainingSample {
+    /// True when this sample starts an independently unrolled recurrent
+    /// sequence. Gradients never cross this boundary.
+    pub sequence_start: bool,
     pub observation: Observation,
     pub action_sample: Option<PolicyActionSample>,
     pub old_log_probability: Option<f32>,
@@ -75,6 +78,16 @@ pub struct TrainingMetrics {
     pub entropy: f32,
     pub total_loss: f32,
     pub gradient_norm: f32,
+    pub pre_clip_gradient_norm: f32,
+    pub hidden_gradient_norms: Vec<f32>,
+    pub recurrent_gradient_norm: f32,
+    pub gru_update_gradient_norm: Option<f32>,
+    pub gru_reset_gradient_norm: Option<f32>,
+    pub gru_candidate_gradient_norm: Option<f32>,
+    pub actor_gradient_norm: f32,
+    pub critic_gradient_norm: f32,
+    pub gradient_clip_fraction: f32,
+    pub relative_update_norm: f32,
     pub approximate_kl: f32,
     pub clip_fraction: f32,
     pub update_index: u64,
@@ -88,6 +101,16 @@ impl TrainingMetrics {
             entropy: 0.0,
             total_loss: 0.0,
             gradient_norm: 0.0,
+            pre_clip_gradient_norm: 0.0,
+            hidden_gradient_norms: Vec::new(),
+            recurrent_gradient_norm: 0.0,
+            gru_update_gradient_norm: None,
+            gru_reset_gradient_norm: None,
+            gru_candidate_gradient_norm: None,
+            actor_gradient_norm: 0.0,
+            critic_gradient_norm: 0.0,
+            gradient_clip_fraction: 0.0,
+            relative_update_norm: 0.0,
             approximate_kl: 0.0,
             clip_fraction: 0.0,
             update_index: 0,
@@ -275,9 +298,10 @@ impl PpoLearning {
             generalized_advantages_masked(transitions, self.config.gamma, self.config.gae_lambda)?;
         let mut samples = transitions
             .iter()
+            .enumerate()
             .zip(advantages)
             .zip(returns)
-            .filter_map(|((transition, advantage), return_value)| {
+            .filter_map(|(((source_index, transition), advantage), return_value)| {
                 let observation = transition.observation.clone()?;
                 let recurrent_state = transition.recurrent_state_before.clone()?;
                 let actor_sample = transition
@@ -300,18 +324,22 @@ impl PpoLearning {
                 if actor_sample.is_none() && critic_sample.is_none() {
                     return None;
                 }
-                Some(PpoTrainingSample {
-                    observation,
-                    action_sample: actor_sample.as_ref().map(|sample| sample.0.clone()),
-                    old_log_probability: actor_sample.as_ref().map(|sample| sample.1),
-                    advantage: actor_sample.as_ref().map(|sample| sample.3),
-                    return_value: critic_sample.map(|sample| sample.1),
-                    value_estimate: critic_sample.map(|sample| sample.0),
-                    recurrent_state,
-                    tradable: transition.tradable.clone(),
-                    temperature: actor_sample.as_ref().map(|sample| sample.2),
-                    invalid_action: transition.invalid_action,
-                })
+                Some((
+                    source_index,
+                    PpoTrainingSample {
+                        sequence_start: false,
+                        observation,
+                        action_sample: actor_sample.as_ref().map(|sample| sample.0.clone()),
+                        old_log_probability: actor_sample.as_ref().map(|sample| sample.1),
+                        advantage: actor_sample.as_ref().map(|sample| sample.3),
+                        return_value: critic_sample.map(|sample| sample.1),
+                        value_estimate: critic_sample.map(|sample| sample.0),
+                        recurrent_state,
+                        tradable: transition.tradable.clone(),
+                        temperature: actor_sample.as_ref().map(|sample| sample.2),
+                        invalid_action: transition.invalid_action,
+                    },
+                ))
             })
             .collect::<Vec<_>>();
         if samples.is_empty() {
@@ -321,56 +349,55 @@ impl PpoLearning {
         if self.config.normalize_advantages {
             let actor_count = samples
                 .iter()
-                .filter(|sample| sample.advantage.is_some())
+                .filter(|(_, sample)| sample.advantage.is_some())
                 .count();
             let mean = samples
                 .iter()
-                .filter_map(|sample| sample.advantage)
+                .filter_map(|(_, sample)| sample.advantage)
                 .sum::<f32>()
                 / actor_count.max(1) as f32;
             let variance = samples
                 .iter()
-                .filter_map(|sample| sample.advantage)
+                .filter_map(|(_, sample)| sample.advantage)
                 .map(|advantage| (advantage - mean).powi(2))
                 .sum::<f32>()
                 / actor_count.max(1) as f32;
             let standard_deviation = variance.sqrt().max(1e-8);
-            for sample in &mut samples {
+            for (_, sample) in &mut samples {
                 if let Some(advantage) = sample.advantage {
                     sample.advantage = Some((advantage - mean) / standard_deviation);
                 }
             }
         }
-        // Shuffle complete recurrent sequences, never individual timesteps.
-        let sequence = self.config.sequence_length.max(1);
-        let chunk_count = samples.len().div_ceil(sequence);
-        let mut order = (0..chunk_count).collect::<Vec<_>>();
+        // Build explicit recurrent sequences before shuffling. A masked source
+        // transition creates an index gap and therefore a hard BPTT boundary.
+        let maximum_sequence = self.config.sequence_length.max(1);
+        let mut sequences = Vec::<Vec<PpoTrainingSample>>::new();
+        let mut previous_source = None;
+        for (source_index, mut sample) in samples {
+            let starts_sequence = previous_source.is_none_or(|previous| {
+                source_index != previous + 1
+                    || sequences
+                        .last()
+                        .is_none_or(|sequence| sequence.len() >= maximum_sequence)
+            });
+            sample.sequence_start = starts_sequence;
+            if starts_sequence {
+                sequences.push(vec![sample]);
+            } else if let Some(sequence) = sequences.last_mut() {
+                sequence.push(sample);
+            }
+            previous_source = Some(source_index);
+        }
+        let mut order = (0..sequences.len()).collect::<Vec<_>>();
         for index in (1..order.len()).rev() {
             let swap = self.rng.gen_range(0..=index);
             order.swap(index, swap);
         }
-        let shuffled = if transitions
-            .iter()
-            .any(|transition| !transition.actor_eligible || !transition.critic_eligible)
-        {
-            // Masked environment steps are intentionally absent from model
-            // tensors but remain in the rollout chronology. Keep eligible
-            // samples in source order rather than stitching across a masked
-            // recurrent boundary.
-            samples
-        } else {
-            order
-                .into_iter()
-                .flat_map(|chunk| {
-                    samples
-                        .iter()
-                        .skip(chunk * sequence)
-                        .take(sequence)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                })
-                .collect()
-        };
+        let shuffled = order
+            .into_iter()
+            .flat_map(|index| sequences[index].clone())
+            .collect();
         self.pending_update = true;
         Ok(LearningUpdate::Ppo(PpoTrainingBatch {
             samples: shuffled,
@@ -808,5 +835,76 @@ mod tests {
         assert!(learner.rollout().is_empty());
         config.rollout_length = 0;
         assert!(PpoLearning::new(config, 1).is_err());
+    }
+
+    #[test]
+    fn masked_timestep_creates_an_explicit_recurrent_sequence_boundary() {
+        let config = LearningConfig {
+            implementation: crate::config::LearningKind::Ppo,
+            learning_rate: 0.001,
+            gamma: 0.99,
+            gae_lambda: 0.95,
+            ppo_clip: 0.2,
+            critic_coefficient: 0.5,
+            entropy_coefficient: 0.01,
+            gradient_clip: 1.0,
+            rollout_length: 4,
+            minibatch_size: 2,
+            sequence_length: 2,
+            normalize_advantages: false,
+            optimisation_epochs: 1,
+        };
+        let mut learner = PpoLearning::new(config, 19).unwrap();
+        assert!(matches!(
+            learner
+                .observe_transition(transition(1.0, 0.0, 0.0, false))
+                .unwrap(),
+            LearningUpdate::None
+        ));
+        let mut masked = transition(-1.0, 0.0, 0.0, false);
+        masked.observation = None;
+        masked.action_sample = None;
+        masked.value_estimate = None;
+        masked.next_value = None;
+        masked.recurrent_state_before = None;
+        masked.recurrent_state_after = None;
+        masked.actor_eligible = false;
+        masked.critic_eligible = false;
+        assert!(matches!(
+            learner.observe_transition(masked).unwrap(),
+            LearningUpdate::None
+        ));
+        assert!(matches!(
+            learner
+                .observe_transition(transition(2.0, 0.0, 0.0, false))
+                .unwrap(),
+            LearningUpdate::None
+        ));
+        let LearningUpdate::Ppo(batch) = learner
+            .observe_transition(transition(3.0, 0.0, 0.0, true))
+            .unwrap()
+        else {
+            panic!("expected PPO update")
+        };
+        assert_eq!(batch.samples.len(), 3);
+        assert_eq!(
+            batch
+                .samples
+                .iter()
+                .filter(|sample| sample.sequence_start)
+                .count(),
+            2
+        );
+        assert!(batch.samples[0].sequence_start);
+        let mut current_length = 0usize;
+        let mut maximum_length = 0usize;
+        for sample in &batch.samples {
+            if sample.sequence_start {
+                current_length = 0;
+            }
+            current_length += 1;
+            maximum_length = maximum_length.max(current_length);
+        }
+        assert!(maximum_length <= 2);
     }
 }

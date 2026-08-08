@@ -1,4 +1,4 @@
-//! Neural-policy contracts, frozen-encoder runtime, and built-in policies.
+//! Neural-policy contracts, trainable encoder runtime, and built-in policies.
 //!
 //! This facade preserves the stable `midas_core::brain::*` API while keeping
 //! implementation details in focused private modules.
@@ -26,6 +26,7 @@ pub(crate) use model::{ComputeBackend, ComputeDeviceOptions};
 pub use model::{ComputeDevice, NeuralModel, NeuralModelFactory};
 pub use policy::{NeuralPolicy, Policy, PolicyBlueprint, PolicyContext, PolicySnapshot};
 pub use state::{
-    DenseOptimizerState, LifetimeParameters, NeuralInput, NeuralModelState, NeuralOutput,
-    NeuralRuntimeState, OptimizerState, PolicyActionSample, PolicyEvaluation,
+    BpttOptimizerState, DenseOptimizerState, LifetimeParameters, NeuralInput, NeuralModelState,
+    NeuralOutput, NeuralRuntimeState, OptimizerState, PolicyActionSample, PolicyEvaluation,
+    TrainableEncoderOptimizerState,
 };

@@ -152,6 +152,32 @@ fn reset_evaluation_snapshot(
                         optimizer,
                     }
                 }
+                NeuralModelState::BurnTrainableEncoder {
+                    parameters,
+                    mut runtime,
+                    optimizer,
+                } => {
+                    runtime.memory.fill(0.0);
+                    runtime.inference_steps = 0;
+                    NeuralModelState::BurnTrainableEncoder {
+                        parameters,
+                        runtime,
+                        optimizer,
+                    }
+                }
+                NeuralModelState::BurnBptt {
+                    parameters,
+                    mut runtime,
+                    optimizer,
+                } => {
+                    runtime.memory.fill(0.0);
+                    runtime.inference_steps = 0;
+                    NeuralModelState::BurnBptt {
+                        parameters,
+                        runtime,
+                        optimizer,
+                    }
+                }
                 NeuralModelState::External { kind, mut state } => {
                     state.fill(0.0);
                     NeuralModelState::External { kind, state }

@@ -1,5 +1,147 @@
 # Implementation Status
 
+## V3 Phase 3C: gradient health telemetry
+
+Burn PPO updates now measure gradient and parameter-update health without
+changing optimizer behavior or authoritative checkpoint state.
+
+- Report-only PPO traces record the global norm before and after clipping,
+  per-hidden-layer norms, the complete recurrent norm, separate GRU update,
+  reset, and candidate norms, actor and critic norms, gradient-clipping
+  frequency, and update-to-parameter norm ratio.
+- Multi-epoch/minibatch updates aggregate every value deterministically. GRU
+  gate norms are absent rather than fabricated for legacy dense-recurrent
+  checkpoints.
+- `midas-diagnostics` publishes these measurements under
+  `learning.gradient_health`. Report traces remain excluded from checkpoints,
+  so formats 19/20 and legacy resume compatibility are unchanged.
+- A seven-step, three-agent Prompt 2 smoke completed six PPO updates. Gradient
+  clipping occurred in 41.7% of optimizer minibatches; mean pre/post-clip norms
+  were 1.037/0.808, and mean relative update norm was `1.20e-5`.
+- In that smoke, the GRU candidate gradient (0.442) dominated the update and
+  reset gates (0.00253 and 0.00138). This is a diagnostic signal from a very
+  short synthetic run, not yet evidence that gate learning is persistently
+  vanishing.
+
+The next controlled experiment should measure these values over the retained
+127-step baseline and multiple seeds before deciding whether to tune learning
+rates or replace momentum with AdamW.
+
+## V3 Phase 3B: standard GRU replacement
+
+New neural genomes now use a standard update/reset/candidate GRU for inference
+and truncated backpropagation through time. The three gate parameter blocks are
+packed into the existing evolvable recurrent `DenseGenome`, so mutation,
+crossover, genetic distance, immutable birth genomes, and lifetime optimizer
+state continue to cover the complete recurrent cell.
+
+- Inference and Burn autodiff use the same equations, including reset-gated
+  hidden contributions to the candidate state.
+- Hand-calculated inference and finite-difference regressions cover update,
+  reset, candidate-input, and candidate-hidden parameters.
+- Genome format 4 identifies the packed GRU layout. Legacy genome format 3
+  retains the original dense-SiLU recurrence exactly; resumed legacy
+  populations also create legacy-layout replacements.
+- Mixed recurrent layouts are rejected by crossover and genetic-distance
+  operations rather than silently truncating parameter vectors.
+- Baseline checkpoints now use format 19 and awareness checkpoints use format
+  20. Formats 12–18 remain readable; a retained format-17 BPTT checkpoint
+  completed validation evaluation successfully.
+- Two independent 127-step seed-41 runs completed 248 PPO updates and 1,016
+  neural actions with zero invalid actions. Both produced the same
+  1,055,827-byte checkpoint, SHA-256 `2175abd6...ecf3a78`.
+
+Phase 3C subsequently added optimizer and per-component gradient observability.
+Controlled larger-architecture and longer-window experiments remain future
+work.
+
+## V3 Phase 3A: truncated recurrent backpropagation
+
+Burn now unrolls the existing simple recurrent memory for each configured PPO
+sequence and backpropagates through time to hidden, recurrent, actor, and critic
+parameters.
+
+- Rollout assembly marks every recurrent sequence start explicitly. Eligible
+  fragments are capped by `sequence_length`, shuffled only as complete
+  sequences, and kept whole when packed into minibatches.
+- Masked or ineligible environment timesteps create hard sequence boundaries;
+  temporal gradients cannot bridge missing model states.
+- Each sequence begins from its stored pre-action memory as a detached initial
+  condition. Later timesteps consume graph-produced memory, allowing temporal
+  credit assignment within the truncated window.
+- Recurrent weight and bias momentum is persistent in `BpttOptimizerState`.
+  Birth genomes remain immutable. Formats 15/16 migrate with zero recurrent
+  momentum; current baseline and awareness checkpoints use formats 17/18.
+- A focused regression applies loss only at timestep two and proves that the
+  earlier observation receives a gradient only when both timesteps share a
+  sequence. Parallel checkpoint/resume integration remains exact.
+- Two independent 127-step seed-41 runs completed 248 PPO updates with zero
+  invalid actions and produced the same 1,004,137-byte checkpoint, SHA-256
+  `4f96ccc7...8156bb1`. Debug runtime was 21.5–22.3 seconds.
+
+This section records the Phase 3A boundary. Phase 3B subsequently replaced the
+cell for new genomes with a standard GRU while preserving the legacy execution
+path for older checkpoints. Increasing truncation windows and adding per-layer
+gradient telemetry remain future stages.
+
+## V3 Phase 2: trainable hidden encoder
+
+Burn autodiff now spans raw observations, every configured feed-forward hidden
+layer and activation, the fixed recurrent projection, and both PPO heads.
+
+- Hidden weights and biases are optimized with the same clipped momentum rule
+  as the actor and critic. Their momentum is persisted in
+  `TrainableEncoderOptimizerState`.
+- Recurrent weights and sampled recurrent states remain fixed boundaries, but
+  the recurrent projection remains inside the graph so gradients reach the
+  hidden encoder. Birth genomes remain immutable.
+- New Burn neural snapshots retain the legacy frozen-encoder enum layout and
+  add a trainable-encoder variant. Formats 13/14 remain readable, with hidden
+  momentum initialized to zero; new baseline and awareness checkpoints use
+  formats 15 and 16.
+- NdArray autodiff graph construction/backward is serialized within a process
+  because parallel Burn graphs caused small schedule-dependent differences.
+  Inference remains concurrent. Parallel integration tests now preserve exact
+  checkpoint/resume determinism.
+- Two independent 127-step seed-41 runs completed 248 PPO updates with zero
+  invalid actions and produced the same 996,825-byte checkpoint, SHA-256
+  `8c3fc8f6...142a9f8a`. Each debug run took approximately 13.7 seconds.
+
+Phase 3A subsequently added recurrent-parameter training and truncated
+backpropagation through time, and Phase 3B added GRU memory. Larger
+architectures and AdamW remain future V3 stages.
+
+## V3 Phase 1: frozen-encoder Burn autodiff integration
+
+Burn training now uses an explicit `Autodiff<NdArray>` backend for actor and
+critic head gradients while the existing `NdArray` tensors remain the inference
+runtime. The hand-built dense outer-product accumulator has been removed.
+
+- The bounded-Beta distribution still computes its exact log-probability and
+  entropy derivatives at the logits boundary; Burn 0.18 has no differentiable
+  lgamma/digamma tensor operations. Burn owns the complete vector-Jacobian
+  product from those logits through both dense heads.
+- Hidden and simple-recurrent lifetime parameters remain frozen and the genome
+  remains immutable. Existing momentum updates, optimizer serialization,
+  checkpoint format, public neural interfaces, and inference behavior are
+  unchanged.
+- Focused tests prove the Burn graph matches exact dense outer products, actor
+  and critic learning remain state-dependent, clipped gradients remain zero,
+  and encoder/genome parameters stay unchanged.
+- A 127-step combined-senses seed-41 replay produced 248 PPO updates with no
+  deaths or invalid actions. It differed from the captured manual-gradient
+  baseline by at most approximately `1.8e-9` net worth and repeated with a
+  byte-identical Phase 1 checkpoint. Debug runtime increased from 5.94 to 7.42
+  seconds and sampled peak RSS from 43.59 to 45.39 MiB.
+- The complete 1,259-step training split completed 2,522 PPO updates with zero
+  invalid actions in 83.09 seconds and 69.51 MiB sampled peak RSS. Resume from
+  the step-1,152 checkpoint reproduced the uninterrupted result, and an
+  independent replay produced the same 4,977,651-byte final checkpoint with
+  SHA-256 `ce33d416...a09fa374`.
+
+Phase 2 subsequently extended this graph through the feed-forward hidden
+encoder while retaining a fixed recurrent boundary.
+
 ## V2: self-awareness and evolvable traits
 
 The first V2 implementation is complete and opt-in through
@@ -17,9 +159,9 @@ The first V2 implementation is complete and opt-in through
   uses log-space noise; the other traits use bounded mutation. Neural trade
   impulses honor inherited maximum allocation, and risk-adjusted reward uses
   inherited drawdown/turnover sensitivities when they are enabled.
-- Awareness checkpoints use format 14. Existing configurations continue to
-  write format 13, and legacy format-12/13 agent layouts are migrated with
-  zeroed awareness state so existing baselines remain resumable.
+- Current awareness checkpoints use format 20 and baseline checkpoints use
+  format 19. Formats 12–18 remain readable; missing hidden or recurrent
+  optimizer momentum is initialized to zero during migration.
 
 The V2 configuration has been validated and exercised through a one-step PPO
 evolution run, including a format-14 checkpoint write. Experimental comparison
@@ -42,8 +184,8 @@ boundary.
   evaluation entry points preserve the existing built-in APIs.
 - Format-12 checkpoints are decoded through their original envelope and safely
   reconstruct the configured built-in strategy. They retain identical reports
-  and are written as format 13 only when explicitly re-saved; older incompatible
-  formats remain rejected.
+  and are written in the current format only when explicitly re-saved; older
+  incompatible formats remain rejected.
 - A stateful alternating-strategy regression proves byte-identical uninterrupted
   and checkpoint-resumed state, including the automatic pre-commit checkpoint
   path. Configuration hashes and report serialization are unchanged.
@@ -404,7 +546,7 @@ Prompt 4 replaces the neural target-portfolio action with persistent incremental
 
 - `ProposedAction`/`ValidatedAction` carry either benchmark allocations or neural `TradeImpulses`. The central validator checks dimensions, finite bounds, and availability without applying allocation-cap semantics to neural trades.
 - `ExecutionPlanner::plan_action` performs sells first, then fixed/variable-cost-aware common scaling of buys, minimum-trade filtering, and deterministic stable-ID ordering. `ExecutionApplier` remains atomic and rejects negative cash, holdings, leverage, and tampered economics. Impossible requests are broker constraints, not policy failures.
-- PPO continues to use the exact independent Beta latent log probability and entropy; deterministic evaluation uses Beta means and does not consume RNG or decay temperature. Full actor/critic head training, frozen encoder, reward, and evolution are unchanged.
+- PPO continues to use the exact independent Beta latent log probability and entropy; deterministic evaluation uses Beta means and does not consume RNG or decay temperature. At the Prompt 4 stage, actor/critic head training, the frozen encoder, reward, and evolution were unchanged; V3 now trains the feed-forward hidden encoder.
 - Decision traces now include requested/executed impulses, notionals, scaling, rejected notional, cash and holdings before/after, and impulse magnitude/saturation metrics. Portfolio allocation metrics describe the persistent post-execution holdings.
 - Checkpoint format was 11 for Prompt 4 and is now 12 after Prompt 5's schema-identity change. Format 10 and formats 6 through 11 are rejected because their action samples, rollout/policy snapshots, metrics, or observation layouts are incompatible; no unsafe migration is attempted. Birth genomes remain immutable and replacement lifetime state is fresh.
 
@@ -433,7 +575,7 @@ Implemented the transition from the restricted single-asset categorical action s
 - Checkpoint format is now 9. Formats 6, 7, and 8 are rejected explicitly because their optimizer, rollout, or categorical action-sample layouts cannot be migrated safely. Evolution crossover, mutation, genome distance, and genome-only inheritance use the expanded actor matrices through architecture validation.
 - Regression coverage includes the formerly failing two-asset allocation test, masks, caps from `0.01` through `1.0`, no-tradable cash fallback, deterministic RNG behavior, exact log-probability recomputation, finite-difference Beta gradients, full-head PPO updates, frozen encoders, multi-asset execution, and checkpoint rejection.
 
-The previous controlled experiment suite was rerun with the same synthetic data, seeds, survival pressure, costs, reward, fitness, and horizon after implementation. Results are recorded in `reports/PROMPT3A_CONTROLLED_EXPERIMENT.md`; they remain short-horizon CPU evidence rather than profitability evidence. The stable sequential stick-breaking order is a known ordering bias, and full recurrent BPTT, alternate action distributions, GPU execution, and turnover-penalty experiments remain outside this prompt.
+The previous controlled experiment suite was rerun with the same synthetic data, seeds, survival pressure, costs, reward, fitness, and horizon after implementation. Results are recorded in `reports/PROMPT3A_CONTROLLED_EXPERIMENT.md`; they remain short-horizon CPU evidence rather than profitability evidence. The stable sequential stick-breaking order is a known ordering bias. Recurrent BPTT was outside Prompt 3A and was added later in V3 Phase 3A; alternate action distributions, GPU execution, and turnover-penalty experiments remain future work.
 
 ## Prompt 2.5 experimental correctness repair (historical; superseded by Prompt 3A checkpoint v9)
 
@@ -444,7 +586,10 @@ The pre-experiment correctness pass is implemented. Checkpoint format is now 8 b
 - Action validation distinguishes an optional policy cap from an optional universal market cap. Neural and random policies use their configured cap; cash, equal-weight, and buy-and-hold benchmarks do not inherit it. Buy-and-hold makes one fully invested initial purchase and then holds, while equal-weight can remain fully diversified subject only to execution economics.
 - Deterministic/diagnostic/bootstrapped policy evaluation no longer decays exploration temperature. Reset mutation independently covers every weight and bias and reports both reset counts.
 
-Regression coverage is now 25 core unit tests, 48 foundation tests, and 5 Prompt 2 integration tests (78 tests, no failures). Full recurrent BPTT, alternate distributions, GPU, and Lamarckian inheritance remain outside scope.
+At that stage, regression coverage was 25 core unit tests, 48 foundation tests,
+and 5 Prompt 2 integration tests (78 tests, no failures). Recurrent BPTT was
+added later in V3 Phase 3A; alternate distributions, GPU, and Lamarckian
+inheritance remain outside scope.
 
 Files changed in this pass: `src/lib.rs`, `src/action.rs`, `src/agent.rs`, `src/brain.rs`, `src/evolution.rs`, `src/learning.rs`, `src/metrics.rs`, `src/replacement.rs`, `src/simulation.rs`, the foundation and Prompt 2 integration tests, `README.md`, `docs/EXTENDING.md`, and this status document. Verification passed with `cargo fmt --all --check`, workspace check, Clippy with `-D warnings`, the full workspace test suite, all focused recovery/selection/benchmark/temperature/mutation/checkpoint/atomic filters, and the release CLI validation, simulation, benchmark, and evolution-report commands. The synthetic Prompt 2 run completed 7 steps with 6 PPO updates and no deaths; this is a correctness smoke test, not an experiment claim.
 
@@ -458,7 +603,11 @@ State-dependent frozen-encoder PPO head learning is implemented and tested. Burn
 - Checkpoint format was 7 for the full-head repair and is now 8 after the masked-rollout and benchmark-cap schema change. Formats 6 and 7 are rejected with explicit incompatibility messages.
 - Regression coverage includes exact dense outer-product gradients, clipped-gradient suppression, actor/critic head updates with frozen encoders, two-state action/value learning, malformed optimizer restore, and transactional bootstrap-fork failure. The Prompt 2 integration test verifies full-head updates and immutable genomes.
 
-Current test totals are 21 core unit tests, 45 foundation regressions, and 4 Prompt 2 integration tests (70 tests, no failures). Only CPU Burn `NdArray` is implemented. Full recurrent BPTT, hidden-layer training, alternate allocation distributions, GPU, distributed learning, topology evolution, and Lamarckian inheritance remain outside this prompt.
+At that stage, test totals were 21 core unit tests, 45 foundation regressions,
+and 4 Prompt 2 integration tests (70 tests, no failures). Hidden-layer training
+and recurrent BPTT were added later in V3; alternate allocation distributions,
+GPU, distributed learning, topology evolution, and Lamarckian inheritance
+remain unimplemented.
 
 ## Prompt 2: lifetime learning and evolution (historical action-space description; superseded by Prompt 3A)
 
@@ -473,7 +622,12 @@ The Prompt 2 implementation is present and verified at the current foundation bo
 - CLI includes the offline `evolution-report` command. `configs/prompt2.toml` is a short deterministic PPO/evolution example.
 - Prompt 2 coverage includes the Prompt 2.25 tests listed above plus deterministic PPO checkpoint resumption, committed automatic checkpoints, and two-parent replacement integration tests.
 
-Known Prompt 2 limitations are explicit: only CPU Burn NdArray is implemented; PPO is frozen-encoder actor/critic head training rather than hidden/recurrent or full-network optimization; recurrent optimization uses ordered sequence minibatches but does not provide full framework autodiff through recurrent layers; diversity protection is a bounded sharing/distance mechanism rather than species clustering; no GPU, distributed training, topology evolution, Lamarckian inheritance, or profitability claim is provided.
+Known remaining limitations are explicit: only CPU Burn NdArray is implemented;
+PPO trains hidden, GRU, and head parameters through truncated sequences.
+Diversity protection is a
+bounded sharing/distance mechanism rather than species clustering; no GPU,
+distributed training, topology evolution, Lamarckian inheritance, or
+profitability claim is provided.
 
 ## Prompt 1.75 verification and hardening
 
@@ -494,7 +648,7 @@ The Prompt 1.75 audit and regression pass is implemented in the core market, exe
 
 Files changed in this hardening pass include `crates/midas-core/src/{agent,brain,replacement,simulation}.rs`, `crates/midas-core/tests/foundation.rs`, `README.md`, `docs/EXTENDING.md`, and this status document.
 
-Known remaining foundation limitations are deliberate: CPU `NdArray` is the only neural backend; memory is a simple recurrent layer, not a GRU; corporate actions are explicit split/dividend records and are not inferred from providers; and event persistence is in-memory. Prompt 2 adds bounded PPO head updates and genome-only evolution; full-network recurrent autodiff and advanced evolutionary research remain future work.
+Known remaining foundation limitations are deliberate: CPU `NdArray` is the only neural backend; corporate actions are explicit split/dividend records and are not inferred from providers; and event persistence is in-memory. Later V3 phases added full-network recurrent autodiff and GRU memory; advanced evolutionary research remains future work.
 
 ## Prompt 1 implemented
 
