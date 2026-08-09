@@ -44,6 +44,30 @@ fn checkpoint_domain_history_and_completion_are_deterministic() {
 }
 
 #[test]
+fn splitmix_v2_adamw_checkpoint_resume_matches_uninterrupted_run() {
+    let mut c = config();
+    c.simulation.seed_derivation = midas_core::config::SeedDerivation::SplitmixV2;
+    c.optimizer.kind = midas_core::config::OptimizerKind::AdamW;
+    let data = loaded(&c);
+    let mut full = SimulationEngine::new(c.clone(), data.clone(), DatasetSplit::Training).unwrap();
+    full.run().unwrap();
+
+    let mut partial =
+        SimulationEngine::new(c.clone(), data.clone(), DatasetSplit::Training).unwrap();
+    partial.run_steps(3).unwrap();
+    let checkpoint = tempfile::NamedTempFile::new().unwrap();
+    partial.save_checkpoint(checkpoint.path()).unwrap();
+    let mut resumed = SimulationEngine::resume(c, data, checkpoint.path()).unwrap();
+    resumed.run().unwrap();
+
+    assert_eq!(full.domain_events, resumed.domain_events);
+    assert_eq!(
+        full.agents().collect::<Vec<_>>(),
+        resumed.agents().collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn checkpoint_rejects_observation_schema_change() {
     let c = config();
     let data = loaded(&c);

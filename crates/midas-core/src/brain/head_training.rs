@@ -4,7 +4,7 @@ use super::{
 };
 use crate::{
     MidasError, Result,
-    config::{Activation, LearningConfig},
+    config::{Activation, LearningConfig, OptimizerConfig, OptimizerKind},
 };
 use burn::tensor::{Tensor, TensorData, activation};
 use std::{ops::Range, sync::Mutex};
@@ -19,10 +19,12 @@ pub(super) fn train_burn_encoder(
     model: &mut BurnNeuralModel,
     batch: &crate::learning::PpoTrainingBatch,
     config: &LearningConfig,
+    optimizer: &OptimizerConfig,
 ) -> Result<crate::learning::TrainingMetrics> {
     let saved_runtime = model.runtime.clone();
     let saved_lifetime = model.lifetime.clone();
     let saved_optimizer = model.optimizer.clone();
+    let saved_adamw_optimizer = model.adamw_optimizer.clone();
     let saved_cached = model.cached.clone();
     let mut aggregate = crate::learning::TrainingMetrics::empty();
     let epochs = config.optimisation_epochs.max(1);
@@ -35,7 +37,7 @@ pub(super) fn train_burn_encoder(
                     samples: batch.samples[range.clone()].to_vec(),
                     sequence_length: batch.sequence_length,
                 };
-                let metrics = train_burn_encoder_inner(model, &minibatch, config)?;
+                let metrics = train_burn_encoder_inner(model, &minibatch, config, optimizer)?;
                 aggregate.policy_loss += metrics.policy_loss;
                 aggregate.value_loss += metrics.value_loss;
                 aggregate.entropy += metrics.entropy;
@@ -110,6 +112,7 @@ pub(super) fn train_burn_encoder(
     if result.is_err() {
         model.lifetime = saved_lifetime;
         model.optimizer = saved_optimizer;
+        model.adamw_optimizer = saved_adamw_optimizer;
         model.cached = saved_cached;
     }
     result
@@ -173,6 +176,7 @@ fn train_burn_encoder_inner(
     model: &mut BurnNeuralModel,
     batch: &crate::learning::PpoTrainingBatch,
     config: &LearningConfig,
+    optimizer: &OptimizerConfig,
 ) -> Result<crate::learning::TrainingMetrics> {
     if batch.samples.is_empty() {
         return Ok(crate::learning::TrainingMetrics::empty());
@@ -411,139 +415,27 @@ fn train_burn_encoder_inner(
         pre_clip_gradient_norm
     };
 
-    let mut next_optimizer = model.optimizer.clone();
-    next_optimizer.step = next_optimizer.step.saturating_add(1);
-    let momentum = 0.9_f32;
-    for (state, gradient) in next_optimizer.hidden.iter_mut().zip(&hidden) {
-        for (momentum_state, value) in state
-            .weight_momentum
-            .iter_mut()
-            .zip(&gradient.weight_gradient)
-        {
-            *momentum_state = momentum * *momentum_state + (1.0 - momentum) * value;
-        }
-        for (momentum_state, value) in state.bias_momentum.iter_mut().zip(&gradient.bias_gradient) {
-            *momentum_state = momentum * *momentum_state + (1.0 - momentum) * value;
-        }
-    }
-    for (momentum_state, value) in next_optimizer
-        .recurrent
-        .weight_momentum
-        .iter_mut()
-        .zip(&recurrent.weight_gradient)
-    {
-        *momentum_state = momentum * *momentum_state + (1.0 - momentum) * value;
-    }
-    for (momentum_state, value) in next_optimizer
-        .recurrent
-        .bias_momentum
-        .iter_mut()
-        .zip(&recurrent.bias_gradient)
-    {
-        *momentum_state = momentum * *momentum_state + (1.0 - momentum) * value;
-    }
-    for (state, gradient) in next_optimizer
-        .actor
-        .weight_momentum
-        .iter_mut()
-        .zip(&actor_weight_gradient)
-    {
-        *state = momentum * *state + (1.0 - momentum) * gradient;
-    }
-    for (state, gradient) in next_optimizer
-        .actor
-        .bias_momentum
-        .iter_mut()
-        .zip(&actor_bias_gradient)
-    {
-        *state = momentum * *state + (1.0 - momentum) * gradient;
-    }
-    for (state, gradient) in next_optimizer
-        .critic
-        .weight_momentum
-        .iter_mut()
-        .zip(&critic_weight_gradient)
-    {
-        *state = momentum * *state + (1.0 - momentum) * gradient;
-    }
-    for (state, gradient) in next_optimizer
-        .critic
-        .bias_momentum
-        .iter_mut()
-        .zip(&critic_bias_gradient)
-    {
-        *state = momentum * *state + (1.0 - momentum) * gradient;
-    }
-    let relative_update_norm =
-        relative_update_norm(&model.lifetime, &next_optimizer, config.learning_rate);
+    let gradients = BpttGradients {
+        hidden,
+        recurrent,
+        actor_weight_gradient,
+        actor_bias_gradient,
+        critic_weight_gradient,
+        critic_bias_gradient,
+    };
+    let (next_lifetime, relative_update_norm, update_index) = match optimizer.kind {
+        OptimizerKind::Momentum => apply_momentum(model, &gradients, config)?,
+        OptimizerKind::AdamW => apply_adamw(model, &gradients, config, optimizer)?,
+    };
     if !relative_update_norm.is_finite() {
         return Err(MidasError::Policy(
             "non-finite relative parameter update norm".into(),
         ));
     }
-    let mut next_lifetime = model.lifetime.clone();
-    for (layer, state) in next_lifetime.hidden.iter_mut().zip(&next_optimizer.hidden) {
-        for (weight, update) in layer.weights.iter_mut().zip(&state.weight_momentum) {
-            *weight -= config.learning_rate * update;
-        }
-        for (bias, update) in layer.bias.iter_mut().zip(&state.bias_momentum) {
-            *bias -= config.learning_rate * update;
-        }
-    }
-    for (weight, update) in next_lifetime
-        .recurrent
-        .weights
-        .iter_mut()
-        .zip(&next_optimizer.recurrent.weight_momentum)
-    {
-        *weight -= config.learning_rate * update;
-    }
-    for (bias, update) in next_lifetime
-        .recurrent
-        .bias
-        .iter_mut()
-        .zip(&next_optimizer.recurrent.bias_momentum)
-    {
-        *bias -= config.learning_rate * update;
-    }
-    for (weight, update) in next_lifetime
-        .actor
-        .weights
-        .iter_mut()
-        .zip(&next_optimizer.actor.weight_momentum)
-    {
-        *weight -= config.learning_rate * update;
-    }
-    for (bias, update) in next_lifetime
-        .actor
-        .bias
-        .iter_mut()
-        .zip(&next_optimizer.actor.bias_momentum)
-    {
-        *bias -= config.learning_rate * update;
-    }
-    for (weight, update) in next_lifetime
-        .critic
-        .weights
-        .iter_mut()
-        .zip(&next_optimizer.critic.weight_momentum)
-    {
-        *weight -= config.learning_rate * update;
-    }
-    for (bias, update) in next_lifetime
-        .critic
-        .bias
-        .iter_mut()
-        .zip(&next_optimizer.critic.bias_momentum)
-    {
-        *bias -= config.learning_rate * update;
-    }
     next_lifetime.validate(&model.architecture)?;
-    next_optimizer.validate(&model.architecture, next_lifetime.recurrent.outputs)?;
     let device = Default::default();
     model.cached = model.cached.with_updated_trainable(&next_lifetime, &device);
     model.lifetime = next_lifetime;
-    model.optimizer = next_optimizer;
     Ok(crate::learning::TrainingMetrics {
         rollout_size: batch.samples.len(),
         policy_loss: policy_loss / actor_divisor,
@@ -563,7 +455,7 @@ fn train_burn_encoder_inner(
         relative_update_norm,
         approximate_kl: approximate_kl / actor_divisor,
         clip_fraction: clipped_samples as f32 / actor_divisor,
-        update_index: model.optimizer.step,
+        update_index,
     })
 }
 
@@ -622,6 +514,240 @@ fn gru_gate_gradient_norms(
             .sum::<f32>();
     }
     Some(squared.map(f32::sqrt))
+}
+
+fn apply_momentum(
+    model: &mut BurnNeuralModel,
+    gradients: &BpttGradients,
+    config: &LearningConfig,
+) -> Result<(super::LifetimeParameters, f32, u64)> {
+    if model.adamw_optimizer.is_some() {
+        return Err(MidasError::Policy(
+            "cannot change a trained neural model from AdamW to momentum".into(),
+        ));
+    }
+    let mut next_optimizer = model.optimizer.clone();
+    next_optimizer.step = next_optimizer.step.saturating_add(1);
+    let momentum = 0.9_f32;
+    for (state, gradient) in next_optimizer.hidden.iter_mut().zip(&gradients.hidden) {
+        update_momentum_dense(state, gradient, momentum);
+    }
+    update_momentum_dense(
+        &mut next_optimizer.recurrent,
+        &gradients.recurrent,
+        momentum,
+    );
+    update_momentum_values(
+        &mut next_optimizer.actor.weight_momentum,
+        &gradients.actor_weight_gradient,
+        momentum,
+    );
+    update_momentum_values(
+        &mut next_optimizer.actor.bias_momentum,
+        &gradients.actor_bias_gradient,
+        momentum,
+    );
+    update_momentum_values(
+        &mut next_optimizer.critic.weight_momentum,
+        &gradients.critic_weight_gradient,
+        momentum,
+    );
+    update_momentum_values(
+        &mut next_optimizer.critic.bias_momentum,
+        &gradients.critic_bias_gradient,
+        momentum,
+    );
+    let relative_update_norm =
+        relative_update_norm(&model.lifetime, &next_optimizer, config.learning_rate);
+    let mut next_lifetime = model.lifetime.clone();
+    for (layer, state) in next_lifetime.hidden.iter_mut().zip(&next_optimizer.hidden) {
+        apply_momentum_dense(layer, state, config.learning_rate);
+    }
+    apply_momentum_dense(
+        &mut next_lifetime.recurrent,
+        &next_optimizer.recurrent,
+        config.learning_rate,
+    );
+    apply_momentum_dense(
+        &mut next_lifetime.actor,
+        &next_optimizer.actor,
+        config.learning_rate,
+    );
+    apply_momentum_dense(
+        &mut next_lifetime.critic,
+        &next_optimizer.critic,
+        config.learning_rate,
+    );
+    next_optimizer.validate(&model.architecture, next_lifetime.recurrent.outputs)?;
+    let step = next_optimizer.step;
+    model.optimizer = next_optimizer;
+    Ok((next_lifetime, relative_update_norm, step))
+}
+
+fn update_momentum_dense(
+    state: &mut super::DenseOptimizerState,
+    gradient: &DenseGradients,
+    momentum: f32,
+) {
+    update_momentum_values(
+        &mut state.weight_momentum,
+        &gradient.weight_gradient,
+        momentum,
+    );
+    update_momentum_values(&mut state.bias_momentum, &gradient.bias_gradient, momentum);
+}
+
+fn update_momentum_values(state: &mut [f32], gradient: &[f32], momentum: f32) {
+    for (state, gradient) in state.iter_mut().zip(gradient) {
+        *state = momentum * *state + (1.0 - momentum) * gradient;
+    }
+}
+
+fn apply_momentum_dense(
+    layer: &mut super::DenseGenome,
+    state: &super::DenseOptimizerState,
+    learning_rate: f32,
+) {
+    for (parameter, update) in layer.weights.iter_mut().zip(&state.weight_momentum) {
+        *parameter -= learning_rate * update;
+    }
+    for (parameter, update) in layer.bias.iter_mut().zip(&state.bias_momentum) {
+        *parameter -= learning_rate * update;
+    }
+}
+
+fn apply_adamw(
+    model: &mut BurnNeuralModel,
+    gradients: &BpttGradients,
+    config: &LearningConfig,
+    optimizer_config: &OptimizerConfig,
+) -> Result<(super::LifetimeParameters, f32, u64)> {
+    if model.adamw_optimizer.is_none() && model.optimizer.step != 0 {
+        return Err(MidasError::Policy(
+            "cannot change a trained neural model from momentum to AdamW".into(),
+        ));
+    }
+    let recurrent_outputs = model.lifetime.recurrent.outputs;
+    let mut optimizer = model.adamw_optimizer.clone().unwrap_or_else(|| {
+        super::AdamWOptimizerState::empty(&model.architecture, recurrent_outputs)
+    });
+    optimizer.step = optimizer.step.saturating_add(1);
+    let step = optimizer.step;
+    let bias_correction1 = 1.0 - optimizer_config.beta1.powf(step as f32);
+    let bias_correction2 = 1.0 - optimizer_config.beta2.powf(step as f32);
+    let mut next_lifetime = model.lifetime.clone();
+    let mut parameter_squared = 0.0_f32;
+    let mut update_squared = 0.0_f32;
+    for ((layer, state), gradient) in next_lifetime
+        .hidden
+        .iter_mut()
+        .zip(&mut optimizer.hidden)
+        .zip(&gradients.hidden)
+    {
+        apply_adamw_dense(
+            layer,
+            state,
+            gradient,
+            config,
+            optimizer_config,
+            bias_correction1,
+            bias_correction2,
+            &mut parameter_squared,
+            &mut update_squared,
+        );
+    }
+    apply_adamw_dense(
+        &mut next_lifetime.recurrent,
+        &mut optimizer.recurrent,
+        &gradients.recurrent,
+        config,
+        optimizer_config,
+        bias_correction1,
+        bias_correction2,
+        &mut parameter_squared,
+        &mut update_squared,
+    );
+    let actor = DenseGradients {
+        weight_gradient: gradients.actor_weight_gradient.clone(),
+        bias_gradient: gradients.actor_bias_gradient.clone(),
+    };
+    apply_adamw_dense(
+        &mut next_lifetime.actor,
+        &mut optimizer.actor,
+        &actor,
+        config,
+        optimizer_config,
+        bias_correction1,
+        bias_correction2,
+        &mut parameter_squared,
+        &mut update_squared,
+    );
+    let critic = DenseGradients {
+        weight_gradient: gradients.critic_weight_gradient.clone(),
+        bias_gradient: gradients.critic_bias_gradient.clone(),
+    };
+    apply_adamw_dense(
+        &mut next_lifetime.critic,
+        &mut optimizer.critic,
+        &critic,
+        config,
+        optimizer_config,
+        bias_correction1,
+        bias_correction2,
+        &mut parameter_squared,
+        &mut update_squared,
+    );
+    optimizer.validate(&model.architecture, recurrent_outputs)?;
+    let relative_update_norm = update_squared.sqrt() / parameter_squared.sqrt().max(f32::EPSILON);
+    model.adamw_optimizer = Some(optimizer);
+    Ok((next_lifetime, relative_update_norm, step))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_adamw_dense(
+    layer: &mut super::DenseGenome,
+    state: &mut super::AdamWDenseState,
+    gradient: &DenseGradients,
+    config: &LearningConfig,
+    optimizer: &OptimizerConfig,
+    bias_correction1: f32,
+    bias_correction2: f32,
+    parameter_squared: &mut f32,
+    update_squared: &mut f32,
+) {
+    for (((parameter, first), second), gradient) in layer
+        .weights
+        .iter_mut()
+        .zip(&mut state.first_weight_moment)
+        .zip(&mut state.second_weight_moment)
+        .zip(&gradient.weight_gradient)
+    {
+        *parameter_squared += *parameter * *parameter;
+        *first = optimizer.beta1 * *first + (1.0 - optimizer.beta1) * gradient;
+        *second = optimizer.beta2 * *second + (1.0 - optimizer.beta2) * gradient * gradient;
+        let adaptive =
+            (*first / bias_correction1) / ((*second / bias_correction2).sqrt() + optimizer.epsilon);
+        let update = adaptive + optimizer.weight_decay * *parameter;
+        let delta = config.learning_rate * update;
+        *update_squared += delta * delta;
+        *parameter -= delta;
+    }
+    for (((parameter, first), second), gradient) in layer
+        .bias
+        .iter_mut()
+        .zip(&mut state.first_bias_moment)
+        .zip(&mut state.second_bias_moment)
+        .zip(&gradient.bias_gradient)
+    {
+        *parameter_squared += *parameter * *parameter;
+        *first = optimizer.beta1 * *first + (1.0 - optimizer.beta1) * gradient;
+        *second = optimizer.beta2 * *second + (1.0 - optimizer.beta2) * gradient * gradient;
+        let update =
+            (*first / bias_correction1) / ((*second / bias_correction2).sqrt() + optimizer.epsilon);
+        let delta = config.learning_rate * update;
+        *update_squared += delta * delta;
+        *parameter -= delta;
+    }
 }
 
 fn relative_update_norm(

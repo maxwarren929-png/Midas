@@ -99,6 +99,71 @@ fn representative_config_json_and_hash_snapshots_are_exact() {
 }
 
 #[test]
+fn explicit_splitmix_v2_is_part_of_configuration_identity() {
+    let legacy = load("configs/test.toml");
+    let mut splitmix = legacy.clone();
+    splitmix.simulation.seed_derivation = midas_core::config::SeedDerivation::SplitmixV2;
+    let source = fs::read_to_string(root().join("configs/test.toml")).unwrap();
+    let parsed: Config = toml::from_str(
+        &source.replace("seed = 42", "seed = 42\nseed_derivation = \"splitmix_v2\""),
+    )
+    .unwrap();
+
+    assert_eq!(
+        parsed.simulation.seed_derivation,
+        splitmix.simulation.seed_derivation
+    );
+    assert!(
+        serde_json::to_string(&legacy)
+            .unwrap()
+            .contains("\"seed\":")
+    );
+    assert!(
+        !serde_json::to_string(&legacy)
+            .unwrap()
+            .contains("seed_derivation")
+    );
+    assert!(
+        serde_json::to_string(&splitmix)
+            .unwrap()
+            .contains("\"seed_derivation\":\"splitmix_v2\"")
+    );
+    assert_ne!(legacy.hash().unwrap(), splitmix.hash().unwrap());
+}
+
+#[test]
+fn explicit_adamw_is_parsed_and_changes_configuration_identity() {
+    let legacy = load("configs/test.toml");
+    let source = fs::read_to_string(root().join("configs/test.toml")).unwrap();
+    let source = source.replace(
+        "optimisation_epochs = 4",
+        "optimisation_epochs = 4\n\n[optimizer]\nkind = \"adamw\"\nweight_decay = 0.02",
+    );
+    let adamw: Config = toml::from_str(&source).unwrap();
+
+    assert_eq!(
+        adamw.optimizer.kind,
+        midas_core::config::OptimizerKind::AdamW
+    );
+    assert_eq!(adamw.optimizer.weight_decay, 0.02);
+    assert_ne!(legacy.hash().unwrap(), adamw.hash().unwrap());
+}
+
+#[test]
+fn invalid_adamw_hyperparameters_are_rejected() {
+    let mut config = load("configs/test.toml");
+    config.optimizer.kind = midas_core::config::OptimizerKind::AdamW;
+    config.optimizer.beta1 = 1.0;
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("optimizer")
+    );
+}
+
+#[test]
 fn serialization_preserves_field_map_and_option_ordering() {
     let mut config = load("configs/default.toml");
     let rule = || ObservationNormalizationConfig {

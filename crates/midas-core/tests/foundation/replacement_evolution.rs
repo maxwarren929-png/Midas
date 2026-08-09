@@ -305,6 +305,7 @@ fn replacement_context_supports_deterministic_read_only_selection() {
             compute_device: &device,
             observation_schema: &schema,
             deterministic_seed: 7,
+            seed_derivation: Default::default(),
             completed_lives: &[],
             genome_registry: &std::collections::BTreeMap::new(),
         })

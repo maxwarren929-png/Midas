@@ -22,6 +22,78 @@ pub struct LearningConfig {
     pub optimisation_epochs: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OptimizerConfig {
+    #[serde(default)]
+    pub kind: OptimizerKind,
+    #[serde(default = "default_beta1")]
+    pub beta1: f32,
+    #[serde(default = "default_beta2")]
+    pub beta2: f32,
+    #[serde(default = "default_epsilon")]
+    pub epsilon: f32,
+    #[serde(default = "default_weight_decay")]
+    pub weight_decay: f32,
+}
+
+impl Default for OptimizerConfig {
+    fn default() -> Self {
+        Self {
+            kind: OptimizerKind::Momentum,
+            beta1: default_beta1(),
+            beta2: default_beta2(),
+            epsilon: default_epsilon(),
+            weight_decay: default_weight_decay(),
+        }
+    }
+}
+
+impl OptimizerConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        if !self.beta1.is_finite()
+            || !(0.0..1.0).contains(&self.beta1)
+            || !self.beta2.is_finite()
+            || !(0.0..1.0).contains(&self.beta2)
+            || !self.epsilon.is_finite()
+            || self.epsilon <= 0.0
+            || !self.weight_decay.is_finite()
+            || self.weight_decay < 0.0
+        {
+            return Err(MidasError::Config(
+                "learning optimizer configuration values are invalid".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptimizerKind {
+    #[default]
+    Momentum,
+    #[serde(rename = "adamw")]
+    AdamW,
+}
+
+fn default_beta1() -> f32 {
+    0.9
+}
+fn default_beta2() -> f32 {
+    0.999
+}
+fn default_epsilon() -> f32 {
+    1.0e-8
+}
+fn default_weight_decay() -> f32 {
+    0.01
+}
+
 fn default_minibatch_size() -> usize {
     32
 }
@@ -40,7 +112,7 @@ pub enum LearningKind {
 }
 
 impl LearningConfig {
-    pub(super) fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if !self.learning_rate.is_finite()
             || self.learning_rate <= 0.0
             || !self.gamma.is_finite()

@@ -5,13 +5,12 @@ use serde::{Deserialize, Serialize};
 // impulses. Version 12 records the modular observation-registry schema and can
 // be migrated because built-in replacement strategies had no persisted state.
 // Earlier checkpoints contain incompatible action samples or state layouts.
-/// Format 19 replaces newly generated simple recurrent genomes with packed GRU
-/// parameters. Formats 13 through 18 remain readable and retain their original
-/// recurrent-cell implementation.
-pub const CHECKPOINT_VERSION: u32 = 19;
-/// Format 20 combines GRU genome/state with persistent agent self-awareness
-/// statistics.
-pub const AWARENESS_CHECKPOINT_VERSION: u32 = 20;
+/// Format 21 adds serialized AdamW first/second moments for explicitly opted-in
+/// runs. Formats 12 through 20 remain readable.
+pub const CHECKPOINT_VERSION: u32 = 21;
+/// Format 22 combines AdamW-capable neural state with persistent agent
+/// self-awareness statistics.
+pub const AWARENESS_CHECKPOINT_VERSION: u32 = 22;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum DatasetSplit {

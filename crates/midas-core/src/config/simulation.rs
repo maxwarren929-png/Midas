@@ -1,4 +1,4 @@
-use crate::{MidasError, Result};
+use crate::{MidasError, Result, seed::SeedDerivation};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -10,6 +10,8 @@ pub struct SimulationConfig {
     pub daily_survival_cost: f64,
     pub minimum_trade_value: f64,
     pub seed: u64,
+    #[serde(default, skip_serializing_if = "SeedDerivation::is_legacy")]
+    pub seed_derivation: SeedDerivation,
     #[serde(default)]
     pub forced_liquidation: bool,
     #[serde(default)]

@@ -14,6 +14,7 @@ use crate::{
     observation::{ObservationBuilder, ObservationSchema, SchemaObservationBuilder},
     replacement::{NonEvolutionaryRandomGenomeReplacement, ReplacementStrategy},
     reward::{RewardFunction, configured_reward},
+    seed::SeedDomain,
 };
 use chrono::NaiveDate;
 
@@ -89,7 +90,10 @@ impl SimulationEngine {
         let first = features[0].date;
         let blueprint = configured_blueprint(&config)?;
         let mut agents = Vec::new();
-        let mut evolution = EvolutionState::new(config.simulation.seed ^ 0x243f6a8885a308d3);
+        let seed_derivation = config.simulation.seed_derivation;
+        let root_seed = config.simulation.seed;
+        let mut evolution =
+            EvolutionState::new(seed_derivation.derive(root_seed, SeedDomain::Evolution, 0));
         let mut metrics = MetricsCollector::default();
         let mut domain_events = Vec::new();
         for i in 0..config.simulation.population_size {
@@ -98,7 +102,7 @@ impl SimulationEngine {
                 Some(BrainGenome::random(
                     &architecture,
                     &config.brain.traits,
-                    config.simulation.seed ^ id.0,
+                    seed_derivation.derive(root_seed, SeedDomain::InitialGenome, id.0),
                 )?)
             } else {
                 None

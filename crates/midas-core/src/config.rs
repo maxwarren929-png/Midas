@@ -17,6 +17,7 @@ mod simulation;
 mod splits;
 mod validation;
 
+pub use crate::seed::SeedDerivation;
 pub use backend::{BackendConfig, BackendKind};
 pub use brain::{
     ActionDistributionConfig, ActionDistributionKind, Activation, AssetOrder, BrainConfig,
@@ -29,7 +30,7 @@ pub use evolution::{
     InheritanceMode, SelectionMethod,
 };
 pub use execution::ExecutionConfig;
-pub use learning::{LearningConfig, LearningKind};
+pub use learning::{LearningConfig, LearningKind, OptimizerConfig, OptimizerKind};
 pub use market::{
     CorporateActionConfig, CorporateActionMode, DataConfig, DataFormat, FeatureConfig, FeatureKind,
     MarketConfig,
@@ -63,6 +64,8 @@ pub struct Config {
     pub policy_failures: PolicyFailureConfig,
     pub brain: BrainConfig,
     pub learning: LearningConfig,
+    #[serde(default, skip_serializing_if = "OptimizerConfig::is_default")]
+    pub optimizer: OptimizerConfig,
     pub backend: BackendConfig,
     pub replacement: ReplacementConfig,
     #[serde(default)]

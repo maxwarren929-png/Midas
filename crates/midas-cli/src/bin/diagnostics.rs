@@ -2,13 +2,13 @@ use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use midas_core::{
     brain::{DenseGenome, NeuralModelState, PolicySnapshot},
-    config::Config,
+    config::{Config, OptimizerKind, SeedDerivation},
     learning::{LearningStrategyState, TrainingMetrics},
     market::{MarketDataSource, PolarsDataSource},
     simulation::{DatasetSplit, DomainEvent, PpoUpdateTrace, ReportTrace, SimulationEngine},
 };
 use serde_json::json;
-use std::{fs, io::Write, path::PathBuf};
+use std::{fs, io::Write, path::PathBuf, time::Instant};
 
 #[derive(Parser)]
 #[command(name = "midas-diagnostics", about = "Offline experiment diagnostics")]
@@ -20,6 +20,33 @@ struct Args {
     /// Optional directory for transactionally committed decision/PPO traces.
     #[arg(long)]
     trace_dir: Option<PathBuf>,
+    /// Stop after this many committed simulation steps instead of completing the split.
+    #[arg(long)]
+    steps: Option<usize>,
+    /// Override the configured population size for a controlled diagnostic run.
+    #[arg(long)]
+    population_size: Option<usize>,
+    /// Override the configured deterministic simulation seed.
+    #[arg(long)]
+    seed: Option<u64>,
+    /// Override deterministic seed derivation while preserving legacy defaults.
+    #[arg(long, value_enum)]
+    seed_derivation: Option<SeedDerivationArg>,
+    /// Override the configured global gradient clipping norm.
+    #[arg(long)]
+    gradient_clip: Option<f32>,
+    /// Override the lifetime neural optimizer.
+    #[arg(long, value_enum)]
+    optimizer: Option<OptimizerArg>,
+    /// Override AdamW decoupled weight decay.
+    #[arg(long)]
+    weight_decay: Option<f32>,
+    /// Write the JSON summary to this path instead of standard output.
+    #[arg(long)]
+    output: Option<PathBuf>,
+    /// Optionally save the authoritative state reached by this diagnostic run.
+    #[arg(long)]
+    checkpoint: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -27,6 +54,36 @@ enum SplitArg {
     Training,
     Validation,
     Test,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum SeedDerivationArg {
+    LegacyXor,
+    SplitmixV2,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum OptimizerArg {
+    Momentum,
+    Adamw,
+}
+
+impl From<OptimizerArg> for OptimizerKind {
+    fn from(value: OptimizerArg) -> Self {
+        match value {
+            OptimizerArg::Momentum => Self::Momentum,
+            OptimizerArg::Adamw => Self::AdamW,
+        }
+    }
+}
+
+impl From<SeedDerivationArg> for SeedDerivation {
+    fn from(value: SeedDerivationArg) -> Self {
+        match value {
+            SeedDerivationArg::LegacyXor => Self::LegacyXor,
+            SeedDerivationArg::SplitmixV2 => Self::SplitmixV2,
+        }
+    }
 }
 
 impl From<SplitArg> for DatasetSplit {
@@ -50,12 +107,65 @@ fn dense_delta(lifetime: &DenseGenome, genome: &DenseGenome) -> f64 {
         .sqrt()
 }
 
+fn linux_peak_rss_kib() -> Option<u64> {
+    fs::read_to_string("/proc/self/status")
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            let value = line.strip_prefix("VmHWM:")?.trim();
+            value.strip_suffix(" kB")?.trim().parse().ok()
+        })
+}
+
 fn main() -> Result<()> {
+    let started = Instant::now();
     let args = Args::parse();
-    let config = Config::load(&args.config)?;
+    let mut config = Config::load(&args.config)?;
+    if let Some(population_size) = args.population_size {
+        config.simulation.population_size = population_size;
+    }
+    if let Some(seed) = args.seed {
+        config.simulation.seed = seed;
+    }
+    if let Some(seed_derivation) = args.seed_derivation {
+        config.simulation.seed_derivation = seed_derivation.into();
+    }
+    if let Some(gradient_clip) = args.gradient_clip {
+        config.learning.gradient_clip = gradient_clip;
+    }
+    if let Some(optimizer) = args.optimizer {
+        config.optimizer.kind = optimizer.into();
+    }
+    if let Some(weight_decay) = args.weight_decay {
+        config.optimizer.weight_decay = weight_decay;
+    }
+    let experiment = json!({
+        "requested_steps": args.steps,
+        "population_size": config.simulation.population_size,
+        "seed": config.simulation.seed,
+        "seed_derivation": config.simulation.seed_derivation,
+        "gradient_clip": config.learning.gradient_clip,
+        "optimizer": config.optimizer.kind,
+        "weight_decay": config.optimizer.weight_decay,
+    });
     let data = PolarsDataSource.load(&config)?;
     let mut engine = SimulationEngine::new(config, data, args.split.into())?;
-    let report = engine.run()?;
+    let report = if let Some(steps) = args.steps {
+        engine.run_steps(steps)?;
+        engine.report()
+    } else {
+        engine.run()?
+    };
+
+    if let Some(checkpoint) = &args.checkpoint {
+        if let Some(parent) = checkpoint
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+        engine.save_checkpoint(checkpoint)?;
+    }
 
     if let Some(trace_dir) = &args.trace_dir {
         fs::create_dir_all(trace_dir)?;
@@ -152,6 +262,7 @@ fn main() -> Result<()> {
                     NeuralModelState::Burn { optimizer, .. } => optimizer.step,
                     NeuralModelState::BurnTrainableEncoder { optimizer, .. } => optimizer.step,
                     NeuralModelState::BurnBptt { optimizer, .. } => optimizer.step,
+                    NeuralModelState::BurnAdamW { optimizer, .. } => optimizer.step,
                     NeuralModelState::External { .. } => 0,
                 };
                 optimizer_steps = optimizer_steps.saturating_add(optimizer_step);
@@ -219,102 +330,165 @@ fn main() -> Result<()> {
         }
     };
 
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({
-            "report": report,
-            "mechanics": {
-                "policy_failures": engine.metrics.policy_failures,
-                "recoverable_fallbacks": engine.metrics.invalid_actions,
-                "masked_rollout_entries": masked,
-                "actor_ineligible_entries": engine.metrics.actor_ineligible_transitions,
-                "critic_ineligible_entries": engine.metrics.critic_ineligible_transitions,
-                "invalid_action_penalty_total": engine.metrics.invalid_action_penalty_total,
-                "deaths": engine.metrics.deaths,
-                "births": engine.metrics.births,
-                "reproductions": engine.metrics.reproductions,
-                "evolution_fallbacks": engine.metrics.evolution_fallbacks,
-                "neural_action_count": engine.metrics.neural_action_count,
-                "neural_multi_asset_action_fraction": if engine.metrics.neural_action_count > 0 {
-                    engine.metrics.neural_multi_asset_actions as f64
-                        / engine.metrics.neural_action_count as f64
-                } else {
-                    0.0
-                },
-                "neural_mean_active_positions": if engine.metrics.neural_action_count > 0 {
-                    engine.metrics.neural_active_position_total
-                        / engine.metrics.neural_action_count as f64
-                } else {
-                    0.0
-                },
-                "neural_mean_concentration": if engine.metrics.neural_action_count > 0 {
-                    engine.metrics.neural_concentration_total
-                        / engine.metrics.neural_action_count as f64
-                } else {
-                    0.0
-                },
-                "neural_mean_cash_allocation": if engine.metrics.neural_action_count > 0 {
-                    engine.metrics.neural_cash_allocation_total
-                        / engine.metrics.neural_action_count as f64
-                } else {
-                    0.0
-                },
-                "mean_abs_trade_impulse": if engine.metrics.neural_impulse_count > 0 {
-                    engine.metrics.neural_abs_impulse_total / engine.metrics.neural_impulse_count as f64
-                } else { 0.0 },
-                "small_trade_impulse_fraction": if engine.metrics.neural_impulse_count > 0 {
-                    engine.metrics.neural_small_impulse_count as f64 / engine.metrics.neural_impulse_count as f64
-                } else { 0.0 },
-                "saturated_trade_impulse_fraction": if engine.metrics.neural_impulse_count > 0 {
-                    engine.metrics.neural_saturated_impulse_count as f64 / engine.metrics.neural_impulse_count as f64
-                } else { 0.0 },
+    let summary = serde_json::to_string_pretty(&json!({
+            "experiment": experiment,
+            "resources": {
+                "wall_seconds": started.elapsed().as_secs_f64(),
+                "peak_rss_kib": linux_peak_rss_kib(),
+                "available_parallelism": std::thread::available_parallelism().ok().map(|count| count.get()),
             },
-            "learning": {
-                "ppo_updates": updates.len(),
-                "optimizer_steps": optimizer_steps,
-                "rollout_entries_at_end": rollout_entries,
-                "mean_policy_loss": mean(|m| f64::from(m.policy_loss)),
-                "mean_value_loss": mean(|m| f64::from(m.value_loss)),
-                "mean_entropy": mean(|m| f64::from(m.entropy)),
-                "mean_gradient_norm": mean(|m| f64::from(m.gradient_norm)),
-                "gradient_health": {
-                    "mean_pre_clip_global_norm": mean_ppo(|trace| f64::from(trace.pre_clip_gradient_norm)),
-                    "mean_post_clip_global_norm": mean_ppo(|trace| f64::from(trace.gradient_norm)),
-                    "mean_hidden_layer_norms": mean_hidden_gradient_norms,
-                    "mean_recurrent_norm": mean_ppo(|trace| f64::from(trace.recurrent_gradient_norm)),
-                    "mean_gru_update_gate_norm": mean_optional_ppo(|trace| trace.gru_update_gradient_norm),
-                    "mean_gru_reset_gate_norm": mean_optional_ppo(|trace| trace.gru_reset_gradient_norm),
-                    "mean_gru_candidate_norm": mean_optional_ppo(|trace| trace.gru_candidate_gradient_norm),
-                    "mean_actor_norm": mean_ppo(|trace| f64::from(trace.actor_gradient_norm)),
-                    "mean_critic_norm": mean_ppo(|trace| f64::from(trace.critic_gradient_norm)),
-                    "gradient_clip_frequency": mean_ppo(|trace| f64::from(trace.gradient_clip_fraction)),
-                    "mean_relative_update_norm": mean_ppo(|trace| f64::from(trace.relative_update_norm)),
-                },
-                "mean_approximate_kl": if ppo_traces.is_empty() { 0.0 } else {
-                    ppo_traces.iter().map(|trace| f64::from(trace.approximate_kl)).sum::<f64>()
-                        / ppo_traces.len() as f64
-                },
-                "mean_clip_fraction": if ppo_traces.is_empty() { 0.0 } else {
-                    ppo_traces.iter().map(|trace| f64::from(trace.clip_fraction)).sum::<f64>()
-                        / ppo_traces.len() as f64
-                },
-                "actor_head_delta_norm": actor_delta,
-                "critic_head_delta_norm": critic_delta,
-                "hidden_delta_norm": hidden_delta,
-                "recurrent_delta_norm": recurrent_delta,
-                "birth_genome_matches_policy": birth_genome_matches,
-                "neural_agents_inspected": neural_agents,
-                "mean_temperature": temperature,
+        "report": report,
+        "mechanics": {
+            "policy_failures": engine.metrics.policy_failures,
+            "recoverable_fallbacks": engine.metrics.invalid_actions,
+            "masked_rollout_entries": masked,
+            "actor_ineligible_entries": engine.metrics.actor_ineligible_transitions,
+            "critic_ineligible_entries": engine.metrics.critic_ineligible_transitions,
+            "invalid_action_penalty_total": engine.metrics.invalid_action_penalty_total,
+            "deaths": engine.metrics.deaths,
+            "births": engine.metrics.births,
+            "reproductions": engine.metrics.reproductions,
+            "evolution_fallbacks": engine.metrics.evolution_fallbacks,
+            "neural_action_count": engine.metrics.neural_action_count,
+            "neural_multi_asset_action_fraction": if engine.metrics.neural_action_count > 0 {
+                engine.metrics.neural_multi_asset_actions as f64
+                    / engine.metrics.neural_action_count as f64
+            } else {
+                0.0
             },
-            "evolution": {
-                "crossovers_observed": crossover,
-                "mutations_observed": mutation,
-                "maximum_generation_depth": engine.evolution_state().metrics.maximum_generation_depth,
-                "active_lineages": engine.evolution_state().metrics.active_lineages,
-                "mean_genetic_distance": engine.evolution_state().metrics.mean_genetic_distance,
-                "minimum_genetic_distance": engine.evolution_state().metrics.minimum_genetic_distance,
-            }
-        }))?
-    );
+            "neural_mean_active_positions": if engine.metrics.neural_action_count > 0 {
+                engine.metrics.neural_active_position_total
+                    / engine.metrics.neural_action_count as f64
+            } else {
+                0.0
+            },
+            "neural_mean_concentration": if engine.metrics.neural_action_count > 0 {
+                engine.metrics.neural_concentration_total
+                    / engine.metrics.neural_action_count as f64
+            } else {
+                0.0
+            },
+            "neural_mean_cash_allocation": if engine.metrics.neural_action_count > 0 {
+                engine.metrics.neural_cash_allocation_total
+                    / engine.metrics.neural_action_count as f64
+            } else {
+                0.0
+            },
+            "mean_abs_trade_impulse": if engine.metrics.neural_impulse_count > 0 {
+                engine.metrics.neural_abs_impulse_total / engine.metrics.neural_impulse_count as f64
+            } else { 0.0 },
+            "small_trade_impulse_fraction": if engine.metrics.neural_impulse_count > 0 {
+                engine.metrics.neural_small_impulse_count as f64 / engine.metrics.neural_impulse_count as f64
+            } else { 0.0 },
+            "saturated_trade_impulse_fraction": if engine.metrics.neural_impulse_count > 0 {
+                engine.metrics.neural_saturated_impulse_count as f64 / engine.metrics.neural_impulse_count as f64
+            } else { 0.0 },
+        },
+        "learning": {
+            "ppo_updates": updates.len(),
+            "optimizer_steps": optimizer_steps,
+            "rollout_entries_at_end": rollout_entries,
+            "mean_policy_loss": mean(|m| f64::from(m.policy_loss)),
+            "mean_value_loss": mean(|m| f64::from(m.value_loss)),
+            "mean_entropy": mean(|m| f64::from(m.entropy)),
+            "mean_gradient_norm": mean(|m| f64::from(m.gradient_norm)),
+            "gradient_health": {
+                "mean_pre_clip_global_norm": mean_ppo(|trace| f64::from(trace.pre_clip_gradient_norm)),
+                "mean_post_clip_global_norm": mean_ppo(|trace| f64::from(trace.gradient_norm)),
+                "mean_hidden_layer_norms": mean_hidden_gradient_norms,
+                "mean_recurrent_norm": mean_ppo(|trace| f64::from(trace.recurrent_gradient_norm)),
+                "mean_gru_update_gate_norm": mean_optional_ppo(|trace| trace.gru_update_gradient_norm),
+                "mean_gru_reset_gate_norm": mean_optional_ppo(|trace| trace.gru_reset_gradient_norm),
+                "mean_gru_candidate_norm": mean_optional_ppo(|trace| trace.gru_candidate_gradient_norm),
+                "mean_actor_norm": mean_ppo(|trace| f64::from(trace.actor_gradient_norm)),
+                "mean_critic_norm": mean_ppo(|trace| f64::from(trace.critic_gradient_norm)),
+                "gradient_clip_frequency": mean_ppo(|trace| f64::from(trace.gradient_clip_fraction)),
+                "mean_relative_update_norm": mean_ppo(|trace| f64::from(trace.relative_update_norm)),
+            },
+            "mean_approximate_kl": if ppo_traces.is_empty() { 0.0 } else {
+                ppo_traces.iter().map(|trace| f64::from(trace.approximate_kl)).sum::<f64>()
+                    / ppo_traces.len() as f64
+            },
+            "mean_clip_fraction": if ppo_traces.is_empty() { 0.0 } else {
+                ppo_traces.iter().map(|trace| f64::from(trace.clip_fraction)).sum::<f64>()
+                    / ppo_traces.len() as f64
+            },
+            "actor_head_delta_norm": actor_delta,
+            "critic_head_delta_norm": critic_delta,
+            "hidden_delta_norm": hidden_delta,
+            "recurrent_delta_norm": recurrent_delta,
+            "birth_genome_matches_policy": birth_genome_matches,
+            "neural_agents_inspected": neural_agents,
+            "mean_temperature": temperature,
+        },
+        "evolution": {
+            "crossovers_observed": crossover,
+            "mutations_observed": mutation,
+            "maximum_generation_depth": engine.evolution_state().metrics.maximum_generation_depth,
+            "active_lineages": engine.evolution_state().metrics.active_lineages,
+            "mean_genetic_distance": engine.evolution_state().metrics.mean_genetic_distance,
+            "minimum_genetic_distance": engine.evolution_state().metrics.minimum_genetic_distance,
+        }
+    }))?;
+    if let Some(output) = &args.output {
+        if let Some(parent) = output
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(output, summary)?;
+    } else {
+        println!("{summary}");
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn controlled_run_overrides_parse_together() {
+        let args = Args::try_parse_from([
+            "diagnostics",
+            "--config",
+            "configs/prompt6/combined-ppo.toml",
+            "--split",
+            "training",
+            "--steps",
+            "127",
+            "--population-size",
+            "10",
+            "--seed",
+            "43",
+            "--seed-derivation",
+            "splitmix-v2",
+            "--gradient-clip",
+            "2.0",
+            "--optimizer",
+            "adamw",
+            "--weight-decay",
+            "0.01",
+            "--output",
+            "summary.json",
+            "--checkpoint",
+            "state.bin",
+        ])
+        .unwrap();
+
+        assert!(matches!(args.split, SplitArg::Training));
+        assert_eq!(args.steps, Some(127));
+        assert_eq!(args.population_size, Some(10));
+        assert_eq!(args.seed, Some(43));
+        assert!(matches!(
+            args.seed_derivation,
+            Some(SeedDerivationArg::SplitmixV2)
+        ));
+        assert_eq!(args.gradient_clip, Some(2.0));
+        assert!(matches!(args.optimizer, Some(OptimizerArg::Adamw)));
+        assert_eq!(args.weight_decay, Some(0.01));
+        assert_eq!(args.output, Some(PathBuf::from("summary.json")));
+        assert_eq!(args.checkpoint, Some(PathBuf::from("state.bin")));
+    }
 }

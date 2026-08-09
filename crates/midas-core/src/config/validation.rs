@@ -17,6 +17,7 @@ impl Config {
         self.policy_failures.validate()?;
         self.splits.validate()?;
         self.learning.validate()?;
+        self.optimizer.validate()?;
         self.reward.validate()?;
         self.evolution.validate()?;
         crate::brain::ComputeDevice::from_options(self.backend.compute_device_options())?;

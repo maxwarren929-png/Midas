@@ -4,7 +4,7 @@ use super::{
 };
 use crate::{
     MidasError, Result,
-    config::{ActionDistributionConfig, LearningConfig},
+    config::{ActionDistributionConfig, LearningConfig, OptimizerConfig},
 };
 
 pub trait NeuralModel: Send {
@@ -25,6 +25,7 @@ pub trait NeuralModel: Send {
         &mut self,
         _batch: &crate::learning::PpoTrainingBatch,
         _config: &LearningConfig,
+        _optimizer: &OptimizerConfig,
     ) -> Result<crate::learning::TrainingMetrics> {
         Err(MidasError::Policy(
             "neural model is inference-only and cannot train".into(),

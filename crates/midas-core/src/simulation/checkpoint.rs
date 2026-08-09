@@ -326,7 +326,17 @@ fn deserialize_checkpoint(bytes: &[u8], operation: &str) -> Result<Checkpoint> {
 fn validate_resume_version(checkpoint: &Checkpoint) -> Result<()> {
     if !matches!(
         checkpoint.version,
-        CHECKPOINT_VERSION | AWARENESS_CHECKPOINT_VERSION | 12 | 13 | 14 | 15 | 16 | 17 | 18
+        CHECKPOINT_VERSION
+            | AWARENESS_CHECKPOINT_VERSION
+            | 12
+            | 13
+            | 14
+            | 15
+            | 16
+            | 17
+            | 18
+            | 19
+            | 20
     ) {
         let detail = if checkpoint.version == 11 {
             "; checkpoint 11 predates the modular observation registry and cannot be migrated safely"
@@ -348,7 +358,17 @@ fn validate_resume_version(checkpoint: &Checkpoint) -> Result<()> {
 fn validate_evaluation_version(checkpoint: &Checkpoint) -> Result<()> {
     if !matches!(
         checkpoint.version,
-        CHECKPOINT_VERSION | AWARENESS_CHECKPOINT_VERSION | 12 | 13 | 14 | 15 | 16 | 17 | 18
+        CHECKPOINT_VERSION
+            | AWARENESS_CHECKPOINT_VERSION
+            | 12
+            | 13
+            | 14
+            | 15
+            | 16
+            | 17
+            | 18
+            | 19
+            | 20
     ) {
         return Err(MidasError::Checkpoint(format!(
             "checkpoint version {} is incompatible with {CHECKPOINT_VERSION}; observation-registry and neural action distribution layouts are not migrated",
@@ -571,7 +591,7 @@ impl SimulationEngine {
                         compute_device: &compute_device,
                     },
                 )?;
-                agent.restore_learning(a.learning)?;
+                agent.restore_learning(a.learning, &config.optimizer)?;
                 Ok(agent)
             })
             .collect::<Result<_>>()?;

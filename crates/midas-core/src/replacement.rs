@@ -9,6 +9,7 @@ use crate::{
         RankWeightedSelection, SelectionPopulation, TournamentSelection, crossover,
     },
     observation::ObservationSchema,
+    seed::{SeedDerivation, SeedDomain},
 };
 use serde::{Deserialize, Serialize};
 
@@ -103,6 +104,7 @@ pub struct ReplacementContext<'a> {
     pub compute_device: &'a ComputeDevice,
     pub observation_schema: &'a ObservationSchema,
     pub deterministic_seed: u64,
+    pub seed_derivation: SeedDerivation,
     pub completed_lives: &'a [CompletedLifeSummary],
     pub genome_registry: &'a std::collections::BTreeMap<crate::evolution::GenomeId, GenomeRecord>,
 }
@@ -163,7 +165,11 @@ fn random_replacement_genome(c: &ReplacementContext<'_>) -> Result<BrainGenome> 
     BrainGenome::random_with_format(
         c.architecture,
         c.evolvable_traits,
-        c.deterministic_seed,
+        c.seed_derivation.derive(
+            c.deterministic_seed,
+            SeedDomain::ReplacementGenome,
+            c.dead_agent.id.0,
+        ),
         genome_format_version,
     )
 }
@@ -246,10 +252,21 @@ impl ReplacementStrategy for EvolutionaryReplacementStrategy {
             }
         }
         let population = SelectionPopulation { candidates };
-        let stream_seed = c.deterministic_seed ^ 0x9e3779b97f4a7c15;
-        let mut selection_rng = EvolutionRng::seed(stream_seed ^ 0x53454c454354_u64);
-        let mut crossover_rng = EvolutionRng::seed(stream_seed ^ 0x43524f53534f_u64);
-        let mut mutation_rng = EvolutionRng::seed(stream_seed ^ 0x4d5554415445_u64);
+        let mut selection_rng = EvolutionRng::seed(c.seed_derivation.derive(
+            c.deterministic_seed,
+            SeedDomain::Selection,
+            c.dead_agent.id.0,
+        ));
+        let mut crossover_rng = EvolutionRng::seed(c.seed_derivation.derive(
+            c.deterministic_seed,
+            SeedDomain::Crossover,
+            c.dead_agent.id.0,
+        ));
+        let mut mutation_rng = EvolutionRng::seed(c.seed_derivation.derive(
+            c.deterministic_seed,
+            SeedDomain::Mutation,
+            c.dead_agent.id.0,
+        ));
         let selection_config = c.evolution.selection.clone();
         let mut selector: Box<dyn ParentSelector> = match selection_config.method {
             crate::config::SelectionMethod::Tournament => Box::new(TournamentSelection {

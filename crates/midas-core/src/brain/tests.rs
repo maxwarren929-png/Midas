@@ -10,6 +10,7 @@ use crate::{
     action::{ActionValidationContext, ActionValidator, LongOnlyActionValidator, ProposedAction},
     config::{
         ActionDistributionConfig, Activation, EvolvableTraitsConfig, LearningConfig, LearningKind,
+        OptimizerConfig,
     },
     learning::{PpoTrainingBatch, PpoTrainingSample},
     observation::Observation,
@@ -48,6 +49,10 @@ fn learning_config() -> LearningConfig {
         normalize_advantages: false,
         optimisation_epochs: 1,
     }
+}
+
+fn optimizer_config() -> OptimizerConfig {
+    OptimizerConfig::default()
 }
 
 fn ppo_sample(
@@ -127,6 +132,7 @@ fn deterministic_head_model() -> BurnNeuralModel {
             inference_steps: 0,
         },
         optimizer: BpttOptimizerState::empty(&genome.architecture, recurrent_outputs),
+        adamw_optimizer: None,
     }
 }
 
@@ -205,7 +211,9 @@ fn burn_training_changes_lifetime_parameters_without_changing_genome() {
         }],
         sequence_length: 1,
     };
-    let metrics = model.train_batch(&batch, &learning_config()).unwrap();
+    let metrics = model
+        .train_batch(&batch, &learning_config(), &optimizer_config())
+        .unwrap();
     assert!(metrics.rollout_size > 0);
     assert!(metrics.gradient_norm <= 1.0 + 1e-6);
     assert!(metrics.pre_clip_gradient_norm + 1e-6 >= metrics.gradient_norm);
@@ -317,7 +325,9 @@ fn ppo_head_learning_changes_actor_weights_regression() {
         sequence_length: 1,
     };
 
-    model.train_batch(&batch, &learning_config()).unwrap();
+    model
+        .train_batch(&batch, &learning_config(), &optimizer_config())
+        .unwrap();
     let after = model.lifetime_parameters().unwrap();
     assert_ne!(
         before.actor.weights, after.actor.weights,
@@ -340,7 +350,9 @@ fn bptt_training_updates_hidden_recurrent_and_heads_but_freezes_genome() {
         samples: vec![ppo_sample(vec![0.6, -0.2], 1, 1.0, 2.0, -0.7)],
         sequence_length: 1,
     };
-    model.train_batch(&batch, &learning_config()).unwrap();
+    model
+        .train_batch(&batch, &learning_config(), &optimizer_config())
+        .unwrap();
     let after = model.lifetime_parameters().unwrap();
     assert_ne!(before.actor.weights, after.actor.weights);
     assert_ne!(before.actor.bias, after.actor.bias);
@@ -377,6 +389,112 @@ fn bptt_training_updates_hidden_recurrent_and_heads_but_freezes_genome() {
         architecture.critic_output_size
     );
     assert_eq!(model.runtime_parameter_builds(), builds_before + 1);
+}
+
+#[test]
+fn adamw_uses_bias_corrected_moments_decoupled_weight_decay_and_restores() {
+    let mut model = deterministic_head_model();
+    model.lifetime.actor.weights = vec![0.3, -0.2];
+    model.cached = BurnRuntimeParameters::from_lifetime(&model.lifetime, &Default::default());
+    let before = model.lifetime_parameters().unwrap();
+    let mut config = learning_config();
+    let mut optimizer_config = optimizer_config();
+    optimizer_config.kind = crate::config::OptimizerKind::AdamW;
+    optimizer_config.weight_decay = 0.01;
+    config.ppo_clip = 10.0;
+    config.gradient_clip = 100.0;
+    let batch = PpoTrainingBatch {
+        samples: vec![ppo_sample(vec![0.6, -0.2], 1, 1.0, 2.0, -0.7)],
+        sequence_length: 1,
+    };
+    model
+        .train_batch(&batch, &config, &optimizer_config)
+        .unwrap();
+    let snapshot = model.snapshot_state().unwrap();
+    let NeuralModelState::BurnAdamW {
+        parameters,
+        optimizer,
+        ..
+    } = &snapshot
+    else {
+        panic!("expected AdamW Burn state")
+    };
+    assert_eq!(optimizer.step, 1);
+    for index in 0..before.actor.weights.len() {
+        let first = optimizer.actor.first_weight_moment[index];
+        let second = optimizer.actor.second_weight_moment[index];
+        let adaptive = (first / (1.0 - optimizer_config.beta1))
+            / ((second / (1.0 - optimizer_config.beta2)).sqrt() + optimizer_config.epsilon);
+        let expected = before.actor.weights[index]
+            - config.learning_rate
+                * (adaptive + optimizer_config.weight_decay * before.actor.weights[index]);
+        assert!((parameters.actor.weights[index] - expected).abs() < 1e-6);
+    }
+    for index in 0..before.actor.bias.len() {
+        let first = optimizer.actor.first_bias_moment[index];
+        let second = optimizer.actor.second_bias_moment[index];
+        let adaptive = (first / (1.0 - optimizer_config.beta1))
+            / ((second / (1.0 - optimizer_config.beta2)).sqrt() + optimizer_config.epsilon);
+        let expected = before.actor.bias[index] - config.learning_rate * adaptive;
+        assert!((parameters.actor.bias[index] - expected).abs() < 1e-6);
+    }
+
+    let architecture = model.architecture.clone();
+    let genome = BrainGenome::random(&architecture, &EvolvableTraitsConfig::default(), 91).unwrap();
+    let device = ComputeDevice::CpuNdArray {
+        device: "default".into(),
+    };
+    let mut malformed = snapshot.clone();
+    let NeuralModelState::BurnAdamW { optimizer, .. } = &mut malformed else {
+        unreachable!()
+    };
+    optimizer.recurrent.second_weight_moment.pop();
+    let error = match BurnNeuralModelFactory.restore(&genome, &architecture, malformed, &device) {
+        Ok(_) => panic!("shape-invalid AdamW state was accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("AdamW"));
+
+    let mut negative_second_moment = snapshot.clone();
+    let NeuralModelState::BurnAdamW { optimizer, .. } = &mut negative_second_moment else {
+        unreachable!()
+    };
+    optimizer.actor.second_weight_moment[0] = -1.0;
+    let error = match BurnNeuralModelFactory.restore(
+        &genome,
+        &architecture,
+        negative_second_moment,
+        &device,
+    ) {
+        Ok(_) => panic!("negative AdamW second moment was accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("AdamW"));
+
+    let mut zero_step = snapshot.clone();
+    let NeuralModelState::BurnAdamW { optimizer, .. } = &mut zero_step else {
+        unreachable!()
+    };
+    optimizer.step = 0;
+    let error = match BurnNeuralModelFactory.restore(&genome, &architecture, zero_step, &device) {
+        Ok(_) => panic!("zero-step persisted AdamW state was accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("step must be positive"));
+
+    let mut restored = BurnNeuralModelFactory
+        .restore(&genome, &architecture, snapshot, &device)
+        .unwrap();
+    model
+        .train_batch(&batch, &config, &optimizer_config)
+        .unwrap();
+    restored
+        .train_batch(&batch, &config, &optimizer_config)
+        .unwrap();
+    assert_eq!(
+        model.snapshot_state().unwrap(),
+        restored.snapshot_state().unwrap()
+    );
 }
 
 #[test]
@@ -555,6 +673,7 @@ fn clipped_policy_gradient_suppresses_head_update_but_keeps_objective_valid() {
                 sequence_length: 1,
             },
             &config,
+            &optimizer_config(),
         )
         .unwrap();
     let after = model.lifetime_parameters().unwrap();
@@ -581,7 +700,9 @@ fn actor_learning_is_state_dependent_for_two_encoded_states() {
         ],
         sequence_length: 1,
     };
-    model.train_batch(&batch, &config).unwrap();
+    model
+        .train_batch(&batch, &config, &optimizer_config())
+        .unwrap();
     let zero = NeuralRuntimeState {
         memory: vec![0.0],
         inference_steps: 0,
@@ -661,7 +782,9 @@ fn critic_learning_is_state_dependent_for_two_encoded_states() {
         ],
         sequence_length: 1,
     };
-    model.train_batch(&batch, &config).unwrap();
+    model
+        .train_batch(&batch, &config, &optimizer_config())
+        .unwrap();
     let zero = NeuralRuntimeState {
         memory: vec![0.0],
         inference_steps: 0,

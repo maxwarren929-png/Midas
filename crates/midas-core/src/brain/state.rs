@@ -107,6 +107,11 @@ pub enum NeuralModelState {
         runtime: NeuralRuntimeState,
         optimizer: BpttOptimizerState,
     },
+    BurnAdamW {
+        parameters: Box<LifetimeParameters>,
+        runtime: NeuralRuntimeState,
+        optimizer: AdamWOptimizerState,
+    },
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct DenseOptimizerState {
@@ -230,6 +235,128 @@ pub struct BpttOptimizerState {
     pub recurrent: DenseOptimizerState,
     pub actor: DenseOptimizerState,
     pub critic: DenseOptimizerState,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AdamWDenseState {
+    pub first_weight_moment: Vec<f32>,
+    pub first_bias_moment: Vec<f32>,
+    pub second_weight_moment: Vec<f32>,
+    pub second_bias_moment: Vec<f32>,
+}
+
+impl AdamWDenseState {
+    fn empty(inputs: usize, outputs: usize) -> Self {
+        Self {
+            first_weight_moment: vec![0.0; inputs * outputs],
+            first_bias_moment: vec![0.0; outputs],
+            second_weight_moment: vec![0.0; inputs * outputs],
+            second_bias_moment: vec![0.0; outputs],
+        }
+    }
+
+    fn validate(&self, inputs: usize, outputs: usize, label: &str) -> Result<()> {
+        let weights = inputs * outputs;
+        if self.first_weight_moment.len() != weights
+            || self.first_bias_moment.len() != outputs
+            || self.second_weight_moment.len() != weights
+            || self.second_bias_moment.len() != outputs
+            || self
+                .first_weight_moment
+                .iter()
+                .chain(&self.first_bias_moment)
+                .chain(&self.second_weight_moment)
+                .chain(&self.second_bias_moment)
+                .any(|value| !value.is_finite())
+            || self
+                .second_weight_moment
+                .iter()
+                .chain(&self.second_bias_moment)
+                .any(|value| *value < 0.0)
+        {
+            return Err(MidasError::Checkpoint(format!(
+                "neural AdamW {label} state shape, finiteness, or second-moment mismatch"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AdamWOptimizerState {
+    pub step: u64,
+    pub hidden: Vec<AdamWDenseState>,
+    pub recurrent: AdamWDenseState,
+    pub actor: AdamWDenseState,
+    pub critic: AdamWDenseState,
+}
+
+impl AdamWOptimizerState {
+    pub fn empty(architecture: &BrainArchitecture, recurrent_outputs: usize) -> Self {
+        let mut inputs = architecture.observation_size;
+        let hidden = architecture
+            .hidden_layers
+            .iter()
+            .map(|outputs| {
+                let state = AdamWDenseState::empty(inputs, *outputs);
+                inputs = *outputs;
+                state
+            })
+            .collect();
+        let recurrent_inputs = inputs + architecture.memory.size;
+        Self {
+            step: 0,
+            hidden,
+            recurrent: AdamWDenseState::empty(recurrent_inputs, recurrent_outputs),
+            actor: AdamWDenseState::empty(architecture.memory.size, architecture.actor_output_size),
+            critic: AdamWDenseState::empty(
+                architecture.memory.size,
+                architecture.critic_output_size,
+            ),
+        }
+    }
+
+    pub(super) fn validate(
+        &self,
+        architecture: &BrainArchitecture,
+        recurrent_outputs: usize,
+    ) -> Result<()> {
+        if self.step == 0 {
+            return Err(MidasError::Checkpoint(
+                "persisted neural AdamW optimizer step must be positive".into(),
+            ));
+        }
+        if self.hidden.len() != architecture.hidden_layers.len() {
+            return Err(MidasError::Checkpoint(
+                "neural AdamW hidden-layer state count mismatch".into(),
+            ));
+        }
+        let mut inputs = architecture.observation_size;
+        for (index, (state, outputs)) in self
+            .hidden
+            .iter()
+            .zip(&architecture.hidden_layers)
+            .enumerate()
+        {
+            state.validate(inputs, *outputs, &format!("hidden layer {index}"))?;
+            inputs = *outputs;
+        }
+        self.recurrent.validate(
+            inputs + architecture.memory.size,
+            recurrent_outputs,
+            "recurrent",
+        )?;
+        self.actor.validate(
+            architecture.memory.size,
+            architecture.actor_output_size,
+            "actor",
+        )?;
+        self.critic.validate(
+            architecture.memory.size,
+            architecture.critic_output_size,
+            "critic",
+        )
+    }
 }
 impl BpttOptimizerState {
     pub fn empty(architecture: &BrainArchitecture, recurrent_outputs: usize) -> Self {

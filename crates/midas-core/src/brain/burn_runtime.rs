@@ -1,11 +1,11 @@
 use super::{
-    BpttOptimizerState, BrainArchitecture, BrainGenome, ComputeDevice, DenseGenome,
-    LifetimeParameters, NeuralInput, NeuralModel, NeuralModelFactory, NeuralModelState,
-    NeuralOutput, NeuralRuntimeState,
+    AdamWOptimizerState, BpttOptimizerState, BrainArchitecture, BrainGenome, ComputeDevice,
+    DenseGenome, LifetimeParameters, NeuralInput, NeuralModel, NeuralModelFactory,
+    NeuralModelState, NeuralOutput, NeuralRuntimeState,
 };
 use crate::{
     MidasError, Result,
-    config::{ActionDistributionConfig, Activation, LearningConfig},
+    config::{ActionDistributionConfig, Activation, LearningConfig, OptimizerConfig},
     observation::Observation,
 };
 use burn::{
@@ -22,6 +22,7 @@ pub struct BurnNeuralModel {
     pub(super) runtime: NeuralRuntimeState,
     pub(super) cached: BurnRuntimeParameters,
     pub(super) optimizer: BpttOptimizerState,
+    pub(super) adamw_optimizer: Option<AdamWOptimizerState>,
 }
 #[derive(Clone)]
 struct BurnRuntimeDense {
@@ -191,6 +192,7 @@ impl NeuralModelFactory for BurnNeuralModelFactory {
                 inference_steps: 0,
             },
             optimizer: BpttOptimizerState::empty(a, recurrent_outputs),
+            adamw_optimizer: None,
         }))
     }
     fn restore(
@@ -204,7 +206,7 @@ impl NeuralModelFactory for BurnNeuralModelFactory {
             MidasError::Checkpoint(format!("checkpoint backend is unsupported: {error}"))
         })?;
         g.validate(a)?;
-        let (parameters, runtime, optimizer) = match state {
+        let (parameters, runtime, optimizer, adamw_optimizer) = match state {
             NeuralModelState::Burn {
                 parameters,
                 runtime,
@@ -213,6 +215,7 @@ impl NeuralModelFactory for BurnNeuralModelFactory {
                 parameters,
                 runtime,
                 BpttOptimizerState::from_frozen_encoder(optimizer, a)?,
+                None,
             ),
             NeuralModelState::BurnTrainableEncoder {
                 parameters,
@@ -222,12 +225,27 @@ impl NeuralModelFactory for BurnNeuralModelFactory {
                 parameters,
                 runtime,
                 BpttOptimizerState::from_trainable_encoder(optimizer, a)?,
+                None,
             ),
             NeuralModelState::BurnBptt {
                 parameters,
                 runtime,
                 optimizer,
-            } => (parameters, runtime, optimizer),
+            } => (parameters, runtime, optimizer, None),
+            NeuralModelState::BurnAdamW {
+                parameters,
+                runtime,
+                optimizer,
+            } => {
+                let recurrent_outputs = parameters.recurrent.outputs;
+                optimizer.validate(a, recurrent_outputs)?;
+                (
+                    parameters,
+                    runtime,
+                    BpttOptimizerState::empty(a, recurrent_outputs),
+                    Some(optimizer),
+                )
+            }
             NeuralModelState::External { .. } => {
                 return Err(MidasError::Checkpoint("expected Burn neural state".into()));
             }
@@ -249,6 +267,7 @@ impl NeuralModelFactory for BurnNeuralModelFactory {
             lifetime,
             runtime,
             optimizer,
+            adamw_optimizer,
         }))
     }
 }
@@ -267,10 +286,18 @@ impl NeuralModel for BurnNeuralModel {
         self.runtime.memory.fill(0.0)
     }
     fn snapshot_state(&self) -> Result<NeuralModelState> {
-        Ok(NeuralModelState::BurnBptt {
-            parameters: Box::new(self.lifetime.clone()),
-            runtime: self.runtime.clone(),
-            optimizer: self.optimizer.clone(),
+        Ok(if let Some(optimizer) = &self.adamw_optimizer {
+            NeuralModelState::BurnAdamW {
+                parameters: Box::new(self.lifetime.clone()),
+                runtime: self.runtime.clone(),
+                optimizer: optimizer.clone(),
+            }
+        } else {
+            NeuralModelState::BurnBptt {
+                parameters: Box::new(self.lifetime.clone()),
+                runtime: self.runtime.clone(),
+                optimizer: self.optimizer.clone(),
+            }
         })
     }
     fn fork(&self) -> Result<Box<dyn NeuralModel>> {
@@ -280,6 +307,7 @@ impl NeuralModel for BurnNeuralModel {
             runtime: self.runtime.clone(),
             cached: self.cached.clone(),
             optimizer: self.optimizer.clone(),
+            adamw_optimizer: self.adamw_optimizer.clone(),
         }))
     }
     fn runtime_parameter_builds(&self) -> u64 {
@@ -289,10 +317,16 @@ impl NeuralModel for BurnNeuralModel {
         &mut self,
         batch: &crate::learning::PpoTrainingBatch,
         config: &LearningConfig,
+        optimizer: &OptimizerConfig,
     ) -> Result<crate::learning::TrainingMetrics> {
-        super::head_training::train_burn_encoder(self, batch, config)
+        super::head_training::train_burn_encoder(self, batch, config, optimizer)
     }
     fn optimizer_state(&self) -> Result<BpttOptimizerState> {
+        if self.adamw_optimizer.is_some() {
+            return Err(MidasError::Policy(
+                "AdamW state is not representable as momentum optimizer state".into(),
+            ));
+        }
         Ok(self.optimizer.clone())
     }
     fn lifetime_parameters(&self) -> Result<LifetimeParameters> {

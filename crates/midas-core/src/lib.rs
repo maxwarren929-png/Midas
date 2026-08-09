@@ -10,6 +10,7 @@ pub mod metrics;
 pub mod observation;
 pub mod replacement;
 pub mod reward;
+pub mod seed;
 pub mod simulation;
 
 use serde::{Deserialize, Serialize};

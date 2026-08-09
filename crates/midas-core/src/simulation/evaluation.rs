@@ -9,7 +9,10 @@ use crate::{
     market::MarketDataset,
     metrics::{EventSink, MetricsCollector},
     replacement::{BuiltInReplacementStrategyFactory, ReplacementStrategyFactory},
+    seed::SeedDomain,
 };
+use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
 use std::path::Path;
 
 use super::{DatasetSplit, DomainEvent, SimulationEngine, SimulationLifecycle, checkpoint};
@@ -85,6 +88,11 @@ impl SimulationEngine {
             let snapshot = reset_evaluation_snapshot(
                 checkpoint_agent.policy,
                 engine.config.brain.trading.maximum_trade_fraction,
+                engine
+                    .config
+                    .simulation
+                    .seed_derivation
+                    .then_evaluation_seed(engine.config.simulation.seed, agent_id.0),
             )?;
             let mut agent = factory.restore(
                 state,
@@ -97,14 +105,18 @@ impl SimulationEngine {
                     compute_device: &engine.compute_device,
                 },
             )?;
-            agent.restore_learning(LearningStrategyState::NoLearning)?;
+            agent.restore_learning(LearningStrategyState::NoLearning, &engine.config.optimizer)?;
             restored.push(agent);
         }
         engine.factory = factory;
         engine.agents = restored;
         engine.metrics = MetricsCollector::default();
         engine.domain_events.clear();
-        engine.evolution = EvolutionState::new(engine.config.simulation.seed ^ 0x243f6a8885a308d3);
+        engine.evolution = EvolutionState::new(engine.config.simulation.seed_derivation.derive(
+            engine.config.simulation.seed,
+            SeedDomain::EvaluationEvolution,
+            0,
+        ));
         engine.next_agent_id = engine
             .agents
             .iter()
@@ -133,6 +145,7 @@ impl SimulationEngine {
 fn reset_evaluation_snapshot(
     snapshot: PolicySnapshot,
     maximum_trade_fraction: f64,
+    evaluation_seed: Option<u64>,
 ) -> Result<PolicySnapshot> {
     match snapshot {
         PolicySnapshot::Neural {
@@ -178,6 +191,19 @@ fn reset_evaluation_snapshot(
                         optimizer,
                     }
                 }
+                NeuralModelState::BurnAdamW {
+                    parameters,
+                    mut runtime,
+                    optimizer,
+                } => {
+                    runtime.memory.fill(0.0);
+                    runtime.inference_steps = 0;
+                    NeuralModelState::BurnAdamW {
+                        parameters,
+                        runtime,
+                        optimizer,
+                    }
+                }
                 NeuralModelState::External { kind, mut state } => {
                     state.fill(0.0);
                     NeuralModelState::External { kind, state }
@@ -187,7 +213,7 @@ fn reset_evaluation_snapshot(
                 temperature: genome.traits.action_temperature,
                 genome,
                 state: Box::new(state),
-                rng,
+                rng: evaluation_seed.map_or(rng, ChaCha8Rng::seed_from_u64),
                 maximum_trade_fraction,
             })
         }

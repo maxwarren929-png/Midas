@@ -203,9 +203,17 @@ impl SimulationEngine {
                         architecture: &self.architecture,
                         compute_device: &self.compute_device,
                         observation_schema: &self.observation_schema,
-                        deterministic_seed: transaction.evolution.rng.next_u64()
-                            ^ self.config.simulation.seed
-                            ^ new_id.0.wrapping_mul(0x9e3779b97f4a7c15),
+                        deterministic_seed: self
+                            .config
+                            .simulation
+                            .seed_derivation
+                            .derive_with_entropy(
+                                self.config.simulation.seed,
+                                crate::seed::SeedDomain::Replacement,
+                                new_id.0,
+                                transaction.evolution.rng.next_u64(),
+                            ),
+                        seed_derivation: self.config.simulation.seed_derivation,
                         completed_lives: &transaction.evolution.completed_lives,
                         genome_registry: &transaction.evolution.genome_registry,
                     })?;

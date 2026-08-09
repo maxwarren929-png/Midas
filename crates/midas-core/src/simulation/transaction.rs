@@ -59,7 +59,7 @@ impl SimulationEngine {
                                 "transactional policy fork failed: {fork_error}; restore failed: {restore_error}"
                             ))
                         })?;
-                    restored.restore_learning(learning)?;
+                    restored.restore_learning(learning, &self.config.optimizer)?;
                     Ok(restored)
                 }
             })

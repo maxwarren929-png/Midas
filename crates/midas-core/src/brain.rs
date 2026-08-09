@@ -26,7 +26,7 @@ pub(crate) use model::{ComputeBackend, ComputeDeviceOptions};
 pub use model::{ComputeDevice, NeuralModel, NeuralModelFactory};
 pub use policy::{NeuralPolicy, Policy, PolicyBlueprint, PolicyContext, PolicySnapshot};
 pub use state::{
-    BpttOptimizerState, DenseOptimizerState, LifetimeParameters, NeuralInput, NeuralModelState,
-    NeuralOutput, NeuralRuntimeState, OptimizerState, PolicyActionSample, PolicyEvaluation,
-    TrainableEncoderOptimizerState,
+    AdamWDenseState, AdamWOptimizerState, BpttOptimizerState, DenseOptimizerState,
+    LifetimeParameters, NeuralInput, NeuralModelState, NeuralOutput, NeuralRuntimeState,
+    OptimizerState, PolicyActionSample, PolicyEvaluation, TrainableEncoderOptimizerState,
 };

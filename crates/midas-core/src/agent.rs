@@ -11,6 +11,7 @@ use crate::{
     learning::{
         LearningStrategy, LearningStrategyState, NoLearning, PpoLearning, learning_from_state,
     },
+    seed::SeedDomain,
 };
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
@@ -79,8 +80,12 @@ impl Agent {
     pub fn learning_snapshot(&self) -> Result<LearningStrategyState> {
         self.learning.snapshot()
     }
-    pub fn restore_learning(&mut self, state: LearningStrategyState) -> Result<()> {
-        self.learning = learning_from_state(state)?;
+    pub fn restore_learning(
+        &mut self,
+        state: LearningStrategyState,
+        optimizer: &crate::config::OptimizerConfig,
+    ) -> Result<()> {
+        self.learning = learning_from_state(state, optimizer)?;
         Ok(())
     }
 }
@@ -183,7 +188,11 @@ impl StandardAgentFactory {
             learning_config.learning_rate = genome.traits.learning_rate;
             learning_config.entropy_coefficient = genome.traits.entropy_coefficient;
         }
-        Ok(Box::new(PpoLearning::new(learning_config, seed)?))
+        Ok(Box::new(PpoLearning::new_with_optimizer(
+            learning_config,
+            config.optimizer.clone(),
+            seed,
+        )?))
     }
 }
 impl AgentFactory for StandardAgentFactory {
@@ -195,7 +204,11 @@ impl AgentFactory for StandardAgentFactory {
             &r.policy_blueprint,
             r.genome.as_ref(),
             c.architecture,
-            c.config.simulation.seed ^ c.agent_id.0,
+            c.config.simulation.seed_derivation.derive(
+                c.config.simulation.seed,
+                SeedDomain::Policy,
+                c.agent_id.0,
+            ),
             c.compute_device,
             c.config.brain.trading.maximum_trade_fraction,
         )?;
@@ -203,7 +216,11 @@ impl AgentFactory for StandardAgentFactory {
             &r.policy_blueprint,
             r.genome.as_ref(),
             c.config,
-            c.config.simulation.seed ^ c.agent_id.0.wrapping_add(0x517cc1b727220a95),
+            c.config.simulation.seed_derivation.derive(
+                c.config.simulation.seed,
+                SeedDomain::Learning,
+                c.agent_id.0,
+            ),
         )?;
         Ok(Agent {
             state: AgentState {
@@ -307,7 +324,11 @@ impl AgentFactory for StandardAgentFactory {
             &policy.policy_blueprint(),
             state.genome.as_ref(),
             c.config,
-            c.config.simulation.seed ^ state.id.0.wrapping_add(0x517cc1b727220a95),
+            c.config.simulation.seed_derivation.derive(
+                c.config.simulation.seed,
+                SeedDomain::Learning,
+                state.id.0,
+            ),
         )?;
         Ok(Agent {
             state,

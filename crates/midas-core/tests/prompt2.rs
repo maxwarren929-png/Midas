@@ -277,6 +277,7 @@ fn evolutionary_replacement_selects_two_parents_and_reports_mutation() {
             compute_device: &device,
             observation_schema: &schema,
             deterministic_seed: 9,
+            seed_derivation: Default::default(),
             completed_lives: &[],
             genome_registry: &std::collections::BTreeMap::new(),
         })
@@ -348,6 +349,7 @@ fn evolutionary_fallbacks_report_typed_outcomes_and_correct_parentage() {
             compute_device: &device,
             observation_schema: &schema,
             deterministic_seed: 23,
+            seed_derivation: Default::default(),
             completed_lives: &[],
             genome_registry: &registry,
         })
@@ -376,6 +378,7 @@ fn evolutionary_fallbacks_report_typed_outcomes_and_correct_parentage() {
                 compute_device: &device,
                 observation_schema: &schema,
                 deterministic_seed: 23,
+                seed_derivation: Default::default(),
                 completed_lives: &[],
                 genome_registry: &registry,
             })
@@ -429,6 +432,7 @@ fn evolutionary_fallbacks_report_typed_outcomes_and_correct_parentage() {
             compute_device: &device,
             observation_schema: &schema,
             deterministic_seed: 23,
+            seed_derivation: Default::default(),
             completed_lives: &[],
             genome_registry: &registry,
         })
@@ -511,6 +515,7 @@ fn evolutionary_replacement_uses_selection_fitness_not_raw_net_worth() {
             compute_device: &device,
             observation_schema: &schema,
             deterministic_seed: 31,
+            seed_derivation: Default::default(),
             completed_lives: &[],
             genome_registry: &registry,
         })
@@ -564,6 +569,7 @@ fn mating_distance_preserves_configured_selection_pressure() {
         compute_device: &device,
         observation_schema: &schema,
         deterministic_seed: 19,
+        seed_derivation: Default::default(),
         completed_lives: &[],
         genome_registry: &registry,
     };
@@ -583,6 +589,7 @@ fn mating_distance_preserves_configured_selection_pressure() {
         compute_device: &device,
         observation_schema: &schema,
         deterministic_seed: 19,
+        seed_derivation: Default::default(),
         completed_lives: &[],
         genome_registry: &registry,
     };

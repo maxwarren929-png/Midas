@@ -2,7 +2,7 @@ use crate::{
     MidasError, PolicyFailureCategory, Result,
     action::ValidatedAction,
     brain::{NeuralRuntimeState, PolicyActionSample},
-    config::LearningConfig,
+    config::{LearningConfig, OptimizerConfig},
     observation::Observation,
 };
 use chrono::NaiveDate;
@@ -135,6 +135,9 @@ pub trait LearningStrategy: Send {
     fn training_config(&self) -> Option<LearningConfig> {
         None
     }
+    fn training_optimizer(&self) -> Option<OptimizerConfig> {
+        None
+    }
 }
 
 pub struct NoLearning;
@@ -194,30 +197,35 @@ impl RolloutBuffer {
                 "rollout buffer capacity exceeded".into(),
             ));
         }
-        if !transition.reward.is_finite()
-            || transition
-                .value_estimate
-                .is_some_and(|value| !value.is_finite())
-            || transition
-                .next_value
-                .is_some_and(|value| !value.is_finite())
-            || transition
-                .log_probability
-                .is_some_and(|value| !value.is_finite())
-            || transition
-                .temperature
-                .is_some_and(|value| !value.is_finite())
-        {
-            return Err(MidasError::Policy(
-                "rollout transition is non-finite".into(),
-            ));
-        }
+        validate_transition(&transition)?;
         self.transitions.push(transition);
         Ok(())
     }
     pub fn clear(&mut self) {
         self.transitions.clear();
     }
+}
+
+fn validate_transition(transition: &Transition) -> Result<()> {
+    if !transition.reward.is_finite()
+        || transition
+            .value_estimate
+            .is_some_and(|value| !value.is_finite())
+        || transition
+            .next_value
+            .is_some_and(|value| !value.is_finite())
+        || transition
+            .log_probability
+            .is_some_and(|value| !value.is_finite())
+        || transition
+            .temperature
+            .is_some_and(|value| !value.is_finite())
+    {
+        return Err(MidasError::Policy(
+            "rollout transition is non-finite".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -235,6 +243,7 @@ pub enum LearningStrategyState {
 
 pub struct PpoLearning {
     config: LearningConfig,
+    optimizer: OptimizerConfig,
     rollout: RolloutBuffer,
     rng: ChaCha8Rng,
     update_index: u64,
@@ -242,39 +251,24 @@ pub struct PpoLearning {
 }
 impl PpoLearning {
     pub fn new(config: LearningConfig, seed: u64) -> Result<Self> {
+        Self::new_with_optimizer(config, OptimizerConfig::default(), seed)
+    }
+    pub fn new_with_optimizer(
+        config: LearningConfig,
+        optimizer: OptimizerConfig,
+        seed: u64,
+    ) -> Result<Self> {
+        optimizer.validate()?;
         if config.implementation != crate::config::LearningKind::Ppo {
             return Err(MidasError::Config(
                 "PpoLearning requires learning.implementation = ppo".into(),
             ));
         }
-        if !config.learning_rate.is_finite()
-            || config.learning_rate <= 0.0
-            || !config.gamma.is_finite()
-            || !(0.0..=1.0).contains(&config.gamma)
-            || !config.gae_lambda.is_finite()
-            || !(0.0..=1.0).contains(&config.gae_lambda)
-            || !config.ppo_clip.is_finite()
-            || config.ppo_clip < 0.0
-            || !config.critic_coefficient.is_finite()
-            || config.critic_coefficient < 0.0
-            || !config.entropy_coefficient.is_finite()
-            || config.entropy_coefficient < 0.0
-            || !config.gradient_clip.is_finite()
-            || config.gradient_clip <= 0.0
-            || config.rollout_length == 0
-            || config.minibatch_size == 0
-            || config.minibatch_size > config.rollout_length
-            || config.sequence_length == 0
-            || config.sequence_length > config.rollout_length
-            || config.optimisation_epochs == 0
-        {
-            return Err(MidasError::Config(
-                "invalid PPO learning configuration".into(),
-            ));
-        }
+        config.validate()?;
         Ok(Self {
             rollout: RolloutBuffer::new(config.rollout_length)?,
             config,
+            optimizer,
             rng: ChaCha8Rng::seed_from_u64(seed),
             update_index: 0,
             pending_update: false,
@@ -447,6 +441,7 @@ impl LearningStrategy for PpoLearning {
     fn fork(&self) -> Result<Box<dyn LearningStrategy>> {
         Ok(Box::new(Self {
             config: self.config.clone(),
+            optimizer: self.optimizer.clone(),
             rollout: self.rollout.clone(),
             rng: self.rng.clone(),
             update_index: self.update_index,
@@ -459,9 +454,15 @@ impl LearningStrategy for PpoLearning {
     fn training_config(&self) -> Option<LearningConfig> {
         Some(self.config.clone())
     }
+    fn training_optimizer(&self) -> Option<OptimizerConfig> {
+        Some(self.optimizer.clone())
+    }
 }
 
-pub fn learning_from_state(state: LearningStrategyState) -> Result<Box<dyn LearningStrategy>> {
+pub fn learning_from_state(
+    state: LearningStrategyState,
+    optimizer: &crate::config::OptimizerConfig,
+) -> Result<Box<dyn LearningStrategy>> {
     match state {
         LearningStrategyState::NoLearning => Ok(Box::new(NoLearning)),
         LearningStrategyState::Ppo {
@@ -470,13 +471,38 @@ pub fn learning_from_state(state: LearningStrategyState) -> Result<Box<dyn Learn
             rng,
             update_index,
             pending_update,
-        } => Ok(Box::new(PpoLearning {
-            config,
-            rollout,
-            rng,
-            update_index,
-            pending_update,
-        })),
+        } => {
+            optimizer.validate()?;
+            if config.implementation != crate::config::LearningKind::Ppo {
+                return Err(MidasError::Checkpoint(
+                    "restored PPO state has a non-PPO implementation".into(),
+                ));
+            }
+            config.validate()?;
+            if rollout.capacity != config.rollout_length
+                || rollout.transitions.len() > rollout.capacity
+            {
+                return Err(MidasError::Checkpoint(
+                    "restored PPO rollout capacity does not match its configuration".into(),
+                ));
+            }
+            for transition in &rollout.transitions {
+                validate_transition(transition)?;
+            }
+            if pending_update && rollout.transitions.is_empty() {
+                return Err(MidasError::Checkpoint(
+                    "restored PPO update is pending with an empty rollout".into(),
+                ));
+            }
+            Ok(Box::new(PpoLearning {
+                config,
+                optimizer: optimizer.clone(),
+                rollout,
+                rng,
+                update_index,
+                pending_update,
+            }))
+        }
     }
 }
 
@@ -835,6 +861,43 @@ mod tests {
         assert!(learner.rollout().is_empty());
         config.rollout_length = 0;
         assert!(PpoLearning::new(config, 1).is_err());
+    }
+
+    #[test]
+    fn restored_ppo_state_is_validated_before_use() {
+        let config = LearningConfig {
+            implementation: crate::config::LearningKind::Ppo,
+            learning_rate: 0.001,
+            gamma: 0.99,
+            gae_lambda: 0.95,
+            ppo_clip: 0.2,
+            critic_coefficient: 0.5,
+            entropy_coefficient: 0.01,
+            gradient_clip: 1.0,
+            rollout_length: 2,
+            minibatch_size: 1,
+            sequence_length: 1,
+            normalize_advantages: true,
+            optimisation_epochs: 1,
+        };
+        let learner = PpoLearning::new(config, 7).unwrap();
+        let mut invalid_config = learner.snapshot().unwrap();
+        let LearningStrategyState::Ppo { config, .. } = &mut invalid_config else {
+            unreachable!()
+        };
+        config.learning_rate = f32::NAN;
+        assert!(learning_from_state(invalid_config, &Default::default()).is_err());
+
+        let mut invalid_rollout = learner.snapshot().unwrap();
+        let LearningStrategyState::Ppo { rollout, .. } = &mut invalid_rollout else {
+            unreachable!()
+        };
+        rollout.capacity += 1;
+        let error = match learning_from_state(invalid_rollout, &Default::default()) {
+            Ok(_) => panic!("mismatched PPO rollout capacity was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("rollout capacity"));
     }
 
     #[test]

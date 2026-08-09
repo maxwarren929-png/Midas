@@ -4,7 +4,10 @@ use super::{
     NeuralRuntimeState, PolicyEvaluation,
 };
 use crate::{
-    MidasError, Result, action::ProposedAction, config::LearningConfig, observation::Observation,
+    MidasError, Result,
+    action::ProposedAction,
+    config::{LearningConfig, OptimizerConfig},
+    observation::Observation,
 };
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -64,6 +67,7 @@ pub trait Policy: Send {
         &mut self,
         _batch: &crate::learning::PpoTrainingBatch,
         _config: &LearningConfig,
+        _optimizer: &OptimizerConfig,
     ) -> Result<crate::learning::TrainingMetrics> {
         Err(MidasError::Policy(
             "policy does not expose trainable lifetime parameters".into(),
@@ -200,8 +204,9 @@ impl Policy for NeuralPolicy {
         &mut self,
         batch: &crate::learning::PpoTrainingBatch,
         config: &LearningConfig,
+        optimizer: &OptimizerConfig,
     ) -> Result<crate::learning::TrainingMetrics> {
-        self.model.train_batch(batch, config)
+        self.model.train_batch(batch, config, optimizer)
     }
     fn runtime_state(&self) -> Option<NeuralRuntimeState> {
         self.model.runtime_state()

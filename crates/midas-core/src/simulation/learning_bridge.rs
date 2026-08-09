@@ -180,8 +180,14 @@ impl SimulationEngine {
                 .learning
                 .training_config()
                 .unwrap_or_else(|| self.config.learning.clone());
+            let optimizer = agent
+                .learning
+                .training_optimizer()
+                .unwrap_or_else(|| self.config.optimizer.clone());
             let lifetime_before = agent.policy.lifetime_parameters()?;
-            let metrics = agent.policy.apply_learning(&batch, &learning_config)?;
+            let metrics = agent
+                .policy
+                .apply_learning(&batch, &learning_config, &optimizer)?;
             let lifetime_after = agent.policy.lifetime_parameters()?;
             agent.learning.commit_update()?;
             let (actor_delta_norm, critic_delta_norm) = match (lifetime_before, lifetime_after) {

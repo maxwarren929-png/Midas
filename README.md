@@ -29,7 +29,7 @@ An optional `data.corporate_actions_path` CSV uses `date,asset,kind,value`, wher
 
 At close on day `t`, a policy sees features and availability known through `t`; its proposal is validated centrally and executes at open on `t+1`. Missing `t+1` bars reject that asset's order. Holdings in unavailable assets use the latest known close for valuation. Each step is transactional: policy state, neural memory, portfolios, counters, events, metrics, replacement state, RNG state, and `next_step` are committed together only after the full step succeeds.
 
-Feature rows are calculated from current and earlier bars only. The modular observation registry has read-only market, portfolio, and agent-state providers that publish named raw values. Optional `rolling_market_stats` and `agent_awareness` providers add past-only market senses and persistent reward/exploration self-awareness only when explicitly selected in `[observations]`; the default schema remains Prompt 5-equivalent. A complete versioned schema, rather than provider registration order, maps those names to neural indices and applies the configured normalisation. Its stable hash is part of `BrainArchitecture` and checkpoint compatibility. Use `midas observations list`, `schema`, `describe <name>`, or `validate` with `--config` for offline introspection. Baseline checkpoint format version 19 persists packed-GRU parameters and optimizer state; awareness schemas use format 20. Formats 12–18 remain readable, and formats 13–18 retain their original dense-recurrent execution path. Format 11 remains incompatible because its positional observation-schema identity cannot establish compatibility with the provider registry. An enabled rolling or awareness schema also rejects a default-schema checkpoint rather than silently misaligning inputs.
+Feature rows are calculated from current and earlier bars only. The modular observation registry has read-only market, portfolio, and agent-state providers that publish named raw values. Optional `rolling_market_stats` and `agent_awareness` providers add past-only market senses and persistent reward/exploration self-awareness only when explicitly selected in `[observations]`; the default schema remains Prompt 5-equivalent. A complete versioned schema, rather than provider registration order, maps those names to neural indices and applies the configured normalisation. Its stable hash is part of `BrainArchitecture` and checkpoint compatibility. Use `midas observations list`, `schema`, `describe <name>`, or `validate` with `--config` for offline introspection. Baseline checkpoint format version 21 persists packed-GRU parameters and either momentum or AdamW optimizer state; awareness schemas use format 22. Formats 12–20 remain readable, formats 13–18 retain their original dense-recurrent execution path, and formats 19–20 retain packed-GRU momentum state. Format 11 remains incompatible because its positional observation-schema identity cannot establish compatibility with the provider registry. An enabled rolling or awareness schema also rejects a default-schema checkpoint rather than silently misaligning inputs.
 
 ## Architecture
 
@@ -60,6 +60,32 @@ V3 gradient-health diagnostics additionally expose global pre/post-clip norms,
 per-hidden-layer and per-GRU-gate norms, actor/critic norms, gradient-clipping
 frequency, and relative parameter-update size under `learning.gradient_health`.
 They are report-only and do not alter checkpoint state or training behavior.
+
+Momentum remains the default lifetime optimizer. AdamW is available for
+controlled experiments through an optional top-level section:
+
+```toml
+[optimizer]
+kind = "adamw"
+beta1 = 0.9
+beta2 = 0.999
+epsilon = 1e-8
+weight_decay = 0.01
+```
+
+AdamW checkpoints include complete first and second moments. The initial
+same-learning-rate comparison showed substantially larger AdamW updates, so it
+is implemented but not yet the default. See
+[V3 Phase 3H](reports/V3_PHASE3H_ADAMW_IMPLEMENTATION.md).
+
+Deterministic seed derivation is versioned. Existing configurations omit
+`simulation.seed_derivation` and retain the exact `legacy_xor` behavior and
+configuration hashes. New controlled experiments should set
+`seed_derivation = "splitmix_v2"` in `[simulation]`; V2 separates genome,
+policy, learning, evolution, replacement, and evaluation streams and avoids
+the adjacent-seed ensemble aliases discovered in Phase 3F. The implementation
+and recaptured baseline are documented in
+[V3 Phase 3G](reports/V3_PHASE3G_VERSIONED_SEED_DERIVATION.md).
 
 ## Data layout
 

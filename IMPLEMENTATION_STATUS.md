@@ -1,5 +1,134 @@
 # Implementation Status
 
+## V3 Phase 3H: fully checkpointed AdamW
+
+AdamW is implemented across the hidden encoder, packed GRU, actor, and critic.
+It uses clipped gradients, bias-corrected first and second moments, configurable
+epsilon, and decoupled weight decay on weights but not biases. Momentum remains
+the serialization-compatible default; AdamW is selected through the optional
+top-level `[optimizer]` configuration.
+
+- AdamW moment tensors are shape/finiteness validated and serialized in a new
+  neural-state variant. Baseline/awareness checkpoint formats are now 21/22,
+  with formats 12–20 still readable.
+- Numerical coverage reconstructs first-step weight and bias updates from the
+  saved moments. Malformed state is rejected, and checkpoint/resume matches an
+  uninterrupted AdamW run.
+- The prior momentum baseline remains exact: the new trace hash is unchanged,
+  and checkpoint bytes differ only in the four-byte format version.
+- A paired 10-agent, 127-step V2 run completed with zero invalid actions and
+  deaths. AdamW raised mean return by 0.105 percentage points and reduced
+  turnover/fees by 5.72%, but increased mean drawdown by 0.214 percentage
+  points.
+- At the inherited `0.0003` learning rate, AdamW relative updates were about
+  86 times larger than momentum, with correspondingly large hidden, recurrent,
+  and head deltas. This setting is mechanically stable but not calibrated.
+
+Momentum remains the default. The next optimizer experiment should tune AdamW
+learning rate to the retained update scale before any multi-seed adoption
+decision.
+
+## V3 Phase 3G: versioned domain-separated seed derivation
+
+All simulation-owned random streams now pass through a single versioned seed
+derivation API. Existing configurations default to `legacy_xor`, which is
+omitted from serialization so retained JSON hashes and old checkpoints remain
+compatible. New experiments opt into `splitmix_v2`; that explicit choice is
+part of configuration identity and checkpoint validation.
+
+- V2 separates initial genome, policy, PPO learning, evolution, replacement,
+  selection, crossover, mutation, and evaluation streams with stable tags and
+  SplitMix64 finalization.
+- Adjacent roots 41–45 produce disjoint initial-genome seed sets for agents
+  0–9, eliminating the Phase 3F reordered-ensemble alias.
+- A V2 checkpoint/resume regression matches uninterrupted domain history and
+  agent state. Legacy configuration snapshots and version-12 migration tests
+  remain exact; checkpoint formats stay at 19/20.
+- Two concurrent 10-agent, 127-step V2 captures produced byte-identical
+  checkpoints (`d4cf38b5...ecc15ad`) and traces (`d014e369...33bb9`), with zero
+  invalid actions or deaths and roughly 46 MiB peak RSS each.
+
+The V2 seed-41 clip-1 baseline returned 1.881% on average with 66.77% gradient
+clipping. Because the new seed protocol intentionally changes the population,
+it replaces rather than extends the legacy seed-41 artifact. The next isolated
+experiment is a paired V2 momentum-versus-AdamW comparison.
+
+## V3 Phase 3F: disjoint multi-seed clipping decision
+
+The clip-1/clip-2 comparison was extended to five paired 10-agent runs using
+disjoint seed ensembles 41, 73, 105, 137, and 169.
+
+- An initial adjacent-seed protocol was rejected during analysis: initial
+  genome and policy seeds use `simulation.seed ^ agent_id`, so adjacent seeds
+  can produce the same 10 seed values in a different order. Seeds 42/43 and
+  44/45 were therefore excluded rather than counted as independent evidence.
+- Clip 2.0 won mean return in three of five valid pairs. Its across-seed mean
+  return was 2.091% versus 1.988% for clip 1.0, but its median was lower
+  (2.209% versus 2.254%) and sample variability was higher.
+- Clip 2.0 increased average turnover and fees by 0.28% and mean drawdown by
+  0.0206 percentage points. These are small changes, but there was no
+  consistent economic improvement to offset them.
+- Mechanically, clip 2.0 remained healthy across every seed: zero deaths,
+  invalid actions, and PPO policy-ratio clipping; mean absolute KL remained
+  below `0.000020`; gradient clipping fell from 70.9% to 22.6%; and relative
+  updates increased by about 52.2%.
+- Peak RSS and concurrent runtime were unchanged in practical terms at about
+  45 MiB per process and 35 seconds per paired run.
+
+The configured default remains clip 1.0. Before an AdamW comparison, seed
+derivation should be hardened with a deterministic mixing function so ordinary
+adjacent experiment seeds produce distinct agent ensembles. That change must
+be versioned because it intentionally changes seeded baselines.
+
+## V3 Phase 3E: global gradient-clip comparison
+
+The 10-agent, 127-step Phase 3D protocol was repeated concurrently with global
+gradient clipping thresholds 1.0 and 2.0. All other inputs were identical.
+
+- Raising the threshold reduced clipping frequency from 72.6% to 23.4% and
+  increased mean relative parameter-update size from `1.52e-5` to `2.32e-5`.
+- PPO remained mechanically stable: both runs had zero invalid actions, zero
+  deaths, zero policy-ratio clipping, and approximate KL near zero.
+- Pre-clip hidden, recurrent, GRU-gate, actor, and critic norms were nearly
+  unchanged. The relaxed threshold changes how much gradient is applied, not
+  the raw backpropagated signal.
+- Hidden, recurrent, actor, and critic lifetime deltas all increased under 2.0,
+  while memory use and runtime remained effectively unchanged.
+- The single seed did not show a performance benefit: clip 2.0 ended about
+  0.15% lower in mean net worth and generated about 1.04% more turnover and
+  fees. This short synthetic result is not sufficient to select a default.
+- The clip-1 checkpoint exactly reproduced the Phase 3D 10-agent artifact,
+  SHA-256 `4aecbd56...cc9ad3`, providing an independent deterministic control.
+
+Clip 2.0 passes the stability gate but remains experimental. The next step is a
+paired multi-seed clip-1/clip-2 comparison before either changing the default or
+introducing AdamW.
+
+## V3 Phase 3D: paired population gradient baseline
+
+The retained 127-step combined-senses protocol was run concurrently with 10
+and 20 agents using the same seed, architecture, learning configuration, and
+market data.
+
+- Both runs completed with zero deaths and zero invalid actions. The 10-agent
+  run produced 310 PPO updates and the 20-agent run produced 620.
+- Peak RSS was 46,668 KiB and 51,748 KiB respectively. Contended wall time was
+  36.3 and 64.7 seconds on the reported eight-way host.
+- Mean pre-clip norms were 1.585 and 1.596; gradient clipping occurred in 72.6%
+  and 73.1% of optimizer minibatches. PPO policy clipping remained zero and
+  approximate KL remained near zero.
+- The candidate path remained the largest GRU component, but the reset-gate
+  norm increased more than threefold between the first and second halves in
+  both runs. Update-gate norms also increased. The gates are small, not frozen.
+- Canonically filtered traces for shared agents 0–9 were byte-identical across
+  populations, SHA-256 `226b01f2...62399`. Population size therefore did not
+  perturb common-agent execution or learning.
+
+The 20-agent run doubled checkpoint and trace volume while adding only about
+5 MiB peak RSS. It did not materially change normalized gradient health. The
+next isolated experiment should retain the 10-agent population and compare the
+current global gradient clip of 1.0 against 2.0 before considering AdamW.
+
 ## V3 Phase 3C: gradient health telemetry
 
 Burn PPO updates now measure gradient and parameter-update health without

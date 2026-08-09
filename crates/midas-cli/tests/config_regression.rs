@@ -13,6 +13,12 @@ fn config_paths(directory: &Path, root: &Path, output: &mut Vec<String>) {
     for entry in fs::read_dir(directory).unwrap() {
         let path = entry.unwrap().path();
         if path.is_dir() {
+            // Prompt 9 run configs are generated experiment inputs and are
+            // intentionally gitignored. They are not shipped compatibility
+            // fixtures and must not make this test depend on local artifacts.
+            if path == root.join("configs/prompt9/runs") {
+                continue;
+            }
             config_paths(&path, root, output);
         } else if path
             .extension()
