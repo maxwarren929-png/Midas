@@ -35,6 +35,9 @@ struct Args {
     /// Override the configured global gradient clipping norm.
     #[arg(long)]
     gradient_clip: Option<f32>,
+    /// Override the configured PPO learning rate.
+    #[arg(long)]
+    learning_rate: Option<f32>,
     /// Override the lifetime neural optimizer.
     #[arg(long, value_enum)]
     optimizer: Option<OptimizerArg>,
@@ -117,6 +120,16 @@ fn linux_peak_rss_kib() -> Option<u64> {
         })
 }
 
+fn force_learning_rate(config: &mut Config, learning_rate: f32) {
+    config.learning.learning_rate = learning_rate;
+    let trait_config = &mut config.brain.traits.learning_rate;
+    trait_config.initial = learning_rate;
+    trait_config.minimum = learning_rate;
+    trait_config.maximum = learning_rate;
+    trait_config.mutation_scale = 0.0;
+    trait_config.evolvable = false;
+}
+
 fn main() -> Result<()> {
     let started = Instant::now();
     let args = Args::parse();
@@ -133,6 +146,9 @@ fn main() -> Result<()> {
     if let Some(gradient_clip) = args.gradient_clip {
         config.learning.gradient_clip = gradient_clip;
     }
+    if let Some(learning_rate) = args.learning_rate {
+        force_learning_rate(&mut config, learning_rate);
+    }
     if let Some(optimizer) = args.optimizer {
         config.optimizer.kind = optimizer.into();
     }
@@ -145,6 +161,7 @@ fn main() -> Result<()> {
         "seed": config.simulation.seed,
         "seed_derivation": config.simulation.seed_derivation,
         "gradient_clip": config.learning.gradient_clip,
+        "learning_rate": config.learning.learning_rate,
         "optimizer": config.optimizer.kind,
         "weight_decay": config.optimizer.weight_decay,
     });
@@ -466,6 +483,8 @@ mod tests {
             "splitmix-v2",
             "--gradient-clip",
             "2.0",
+            "--learning-rate",
+            "0.000003",
             "--optimizer",
             "adamw",
             "--weight-decay",
@@ -486,9 +505,24 @@ mod tests {
             Some(SeedDerivationArg::SplitmixV2)
         ));
         assert_eq!(args.gradient_clip, Some(2.0));
+        assert_eq!(args.learning_rate, Some(0.000003));
         assert!(matches!(args.optimizer, Some(OptimizerArg::Adamw)));
         assert_eq!(args.weight_decay, Some(0.01));
         assert_eq!(args.output, Some(PathBuf::from("summary.json")));
         assert_eq!(args.checkpoint, Some(PathBuf::from("state.bin")));
+    }
+
+    #[test]
+    fn learning_rate_override_controls_root_and_genome_trait() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut config = Config::load(root.join("configs/prompt6/combined-ppo.toml")).unwrap();
+        force_learning_rate(&mut config, 0.000003);
+
+        assert_eq!(config.learning.learning_rate, 0.000003);
+        assert_eq!(config.brain.traits.learning_rate.initial, 0.000003);
+        assert_eq!(config.brain.traits.learning_rate.minimum, 0.000003);
+        assert_eq!(config.brain.traits.learning_rate.maximum, 0.000003);
+        assert!(!config.brain.traits.learning_rate.evolvable);
+        config.validate().unwrap();
     }
 }

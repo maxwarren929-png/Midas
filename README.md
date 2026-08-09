@@ -73,10 +73,11 @@ epsilon = 1e-8
 weight_decay = 0.01
 ```
 
-AdamW checkpoints include complete first and second moments. The initial
-same-learning-rate comparison showed substantially larger AdamW updates, so it
-is implemented but not yet the default. See
-[V3 Phase 3H](reports/V3_PHASE3H_ADAMW_IMPLEMENTATION.md).
+AdamW checkpoints include complete first and second moments. Momentum remains
+the default; controlled experiments use the update-scale-calibrated AdamW rate
+`3.5e-6` before any multi-seed adoption decision. See
+[V3 Phase 3H](reports/V3_PHASE3H_ADAMW_IMPLEMENTATION.md) and
+[V3 Phase 3I](reports/V3_PHASE3I_ADAMW_RATE_CALIBRATION.md).
 
 Deterministic seed derivation is versioned. Existing configurations omit
 `simulation.seed_derivation` and retain the exact `legacy_xor` behavior and

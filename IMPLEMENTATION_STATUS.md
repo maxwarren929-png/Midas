@@ -1,5 +1,26 @@
 # Implementation Status
 
+## V3 Phase 3I: AdamW learning-rate calibration
+
+AdamW was calibrated against the retained SplitMix V2 momentum baseline using
+four 10-agent, 127-step candidates. The diagnostics runner now supports a
+fixed `--learning-rate` override across both root PPO configuration and the
+genome trait; a regression prevents the trait from silently superseding the
+requested experiment value.
+
+- AdamW `3.5e-6` produced a mean relative update of `1.43999e-5`, within 2.1%
+  of momentum's `1.47088e-5`. Rates `3e-6`, `4e-6`, and `1e-5` were 16.0%
+  below, 11.6% above, and 179.3% above the momentum scale respectively.
+- All four candidates completed 310 PPO updates with zero invalid actions,
+  policy failures, deaths, or policy-ratio clipping.
+- Equal global update scale did not imply equal component movement: calibrated
+  AdamW moved hidden and critic parameters more, but actor parameters less,
+  than momentum.
+
+Momentum remains the default. AdamW `3.5e-6` is the retained candidate for a
+paired multi-seed optimizer comparison. Full evidence is in
+`reports/V3_PHASE3I_ADAMW_RATE_CALIBRATION.md`.
+
 ## V3 Phase 3H: fully checkpointed AdamW
 
 AdamW is implemented across the hidden encoder, packed GRU, actor, and critic.
