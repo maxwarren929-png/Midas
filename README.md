@@ -75,9 +75,13 @@ weight_decay = 0.01
 
 AdamW checkpoints include complete first and second moments. Momentum remains
 the default; controlled experiments use the update-scale-calibrated AdamW rate
-`3.5e-6` before any multi-seed adoption decision. See
+`3.5e-6`. A five-seed comparison found promising but insufficient evidence to
+replace momentum, and frozen held-out evaluation did not establish a robust
+test advantage. See
 [V3 Phase 3H](reports/V3_PHASE3H_ADAMW_IMPLEMENTATION.md) and
-[V3 Phase 3I](reports/V3_PHASE3I_ADAMW_RATE_CALIBRATION.md).
+[V3 Phase 3I](reports/V3_PHASE3I_ADAMW_RATE_CALIBRATION.md), and
+[V3 Phase 3J](reports/V3_PHASE3J_MULTI_SEED_OPTIMIZER_COMPARISON.md), and
+[V3 Phase 3K](reports/V3_PHASE3K_FROZEN_OPTIMIZER_EVALUATION.md).
 
 Deterministic seed derivation is versioned. Existing configurations omit
 `simulation.seed_derivation` and retain the exact `legacy_xor` behavior and

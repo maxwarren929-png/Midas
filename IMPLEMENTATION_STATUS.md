@@ -1,5 +1,46 @@
 # Implementation Status
 
+## V3 Phase 3K: frozen held-out optimizer evaluation
+
+The five paired Phase 3J checkpoints were evaluated with learning disabled on
+269-step validation and test splits. Diagnostics now exposes the existing
+frozen checkpoint-evaluation path while reconstructing the exact overridden
+training configuration hash.
+
+- Validation favored calibrated AdamW: it won mean return and drawdown in four
+  of five pairs, improved mean return by 0.200 percentage points, reduced mean
+  drawdown by 0.160 points, and reduced aggregate turnover by about 2.8%.
+- The untouched test split did not confirm the advantage. AdamW won mean return
+  in two of five pairs; its mean advantage shrank to 0.030 percentage points,
+  while median-agent return was 0.361 points worse and drawdown 0.097 points
+  worse.
+- Every evaluation had zero learning updates, invalid actions, failures, or
+  deaths. Rates remained frozen at momentum `3e-4` and AdamW `3.5e-6`.
+
+Momentum remains the default. AdamW remains an experimental option because its
+short training/validation advantage did not generalize robustly to test. Full
+evidence is in `reports/V3_PHASE3K_FROZEN_OPTIMIZER_EVALUATION.md`.
+
+## V3 Phase 3J: paired multi-seed optimizer comparison
+
+Momentum `3e-4` and calibrated AdamW `3.5e-6` were compared across five paired
+10-agent, 127-step runs using disjoint SplitMix V2 seeds 41–45.
+
+- AdamW won mean return in four of five pairs. Its across-seed mean was 2.045%
+  versus momentum's 1.932%, a mean paired advantage of 0.113 percentage points.
+- The paired-difference sample standard deviation was 0.176 percentage points,
+  and AdamW won within-population median return in only two of five seeds. Its
+  average median return was 0.050 percentage points lower.
+- Mean drawdown, turnover, fees, clipping frequency, and global relative update
+  were nearly matched. All ten runs had zero invalid actions, failures, deaths,
+  or policy-ratio clipping.
+- Adaptive preconditioning still redistributed updates: AdamW moved hidden and
+  critic parameters more and the actor head less than momentum.
+
+Momentum remains the default. AdamW is retained at `3.5e-6` for a frozen-rate,
+longer-horizon or held-out comparison. Full evidence is in
+`reports/V3_PHASE3J_MULTI_SEED_OPTIMIZER_COMPARISON.md`.
+
 ## V3 Phase 3I: AdamW learning-rate calibration
 
 AdamW was calibrated against the retained SplitMix V2 momentum baseline using

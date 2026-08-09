@@ -50,6 +50,9 @@ struct Args {
     /// Optionally save the authoritative state reached by this diagnostic run.
     #[arg(long)]
     checkpoint: Option<PathBuf>,
+    /// Evaluate a training checkpoint with learning disabled instead of starting a new run.
+    #[arg(long)]
+    evaluate_checkpoint: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -164,9 +167,14 @@ fn main() -> Result<()> {
         "learning_rate": config.learning.learning_rate,
         "optimizer": config.optimizer.kind,
         "weight_decay": config.optimizer.weight_decay,
+        "evaluation_checkpoint": args.evaluate_checkpoint,
     });
     let data = PolarsDataSource.load(&config)?;
-    let mut engine = SimulationEngine::new(config, data, args.split.into())?;
+    let mut engine = if let Some(checkpoint) = &args.evaluate_checkpoint {
+        SimulationEngine::evaluate_checkpoint(config, data, checkpoint, args.split.into())?
+    } else {
+        SimulationEngine::new(config, data, args.split.into())?
+    };
     let report = if let Some(steps) = args.steps {
         engine.run_steps(steps)?;
         engine.report()
@@ -493,6 +501,8 @@ mod tests {
             "summary.json",
             "--checkpoint",
             "state.bin",
+            "--evaluate-checkpoint",
+            "trained.bin",
         ])
         .unwrap();
 
@@ -510,6 +520,7 @@ mod tests {
         assert_eq!(args.weight_decay, Some(0.01));
         assert_eq!(args.output, Some(PathBuf::from("summary.json")));
         assert_eq!(args.checkpoint, Some(PathBuf::from("state.bin")));
+        assert_eq!(args.evaluate_checkpoint, Some(PathBuf::from("trained.bin")));
     }
 
     #[test]
