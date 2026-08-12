@@ -121,6 +121,14 @@ turnover-first constrained PPO objective with a separate cost critic and
 checkpointed Lagrange multiplier. See
 [V3 Phase 3P](reports/V3_PHASE3P_ACTOR_GRADIENT_ATTRIBUTION.md).
 
+An opt-in turnover-constrained PPO path now provides a separate turnover-cost
+critic, independently normalized cost advantage, and bounded checkpointed
+Lagrange multiplier. Mechanical and legacy-checkpoint gates pass, but two
+training/validation seeds failed to reduce held-out turnover under either a
+loose or strong dual calibration. It remains research-only and was not promoted
+to five seeds or made a default. See
+[V3 Phase 3Q](reports/V3_PHASE3Q_TURNOVER_CONSTRAINED_PPO.md).
+
 Deterministic seed derivation is versioned. Existing configurations omit
 `simulation.seed_derivation` and retain the exact `legacy_xor` behavior and
 configuration hashes. New controlled experiments should set

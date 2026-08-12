@@ -835,6 +835,16 @@ validation return, 4.531% drawdown, and 31,140 population turnover versus
 not defaults. Details and raw artifacts are in
 [V3 Phase 3M](reports/V3_PHASE3M_PENALIZED_REWARD_COMPARISON.md).
 
+V3 Phase 3Q implements opt-in turnover-constrained PPO with a separate cost
+critic, independently normalized cost advantage, and projected checkpointed
+dual variable. Existing PPO remains one-critic and legacy checkpoints/config
+hashes remain readable. Mechanical gates and all 164 workspace tests pass.
+Two two-seed training/validation calibrations failed the primary held-out
+turnover gate, including a stronger controller whose mean multiplier reached
+3.01. The mode remains experimental, drawdown remains diagnostic-only, no
+five-seed promotion was run, and the test split was untouched. Results are in
+[V3 Phase 3Q](reports/V3_PHASE3Q_TURNOVER_CONSTRAINED_PPO.md).
+
 Prompt 3B adds report-only observability and a frozen, long-horizon experimental protocol. The implementation commit tested for the suite is `c692101`. The generated market contains 1,800 business dates, four assets, 1,259 training steps, and frozen validation/test splits; its SHA-256 is recorded in `reports/PROMPT3B_DIAGNOSTIC_EXPERIMENT.md`.
 
 - `RewardBreakdown`, transactional `DecisionTrace`, and `PpoUpdateTrace` expose return components, costs, turnover, allocations, asset-order positions, PPO KL/clipping, gradients, and head deltas without changing the reward scalar or checkpointed simulation state. The diagnostics binary writes compact JSONL/CSV traces.

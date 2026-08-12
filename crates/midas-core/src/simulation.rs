@@ -19,5 +19,6 @@ pub use engine::SimulationEngine;
 pub use events::{DomainEvent, OperationalEvent};
 pub use report::SimulationReport;
 pub use types::{
-    AWARENESS_CHECKPOINT_VERSION, CHECKPOINT_VERSION, DatasetSplit, DeathCause, SimulationLifecycle,
+    AWARENESS_CHECKPOINT_VERSION, CHECKPOINT_VERSION, CONSTRAINED_PPO_CHECKPOINT_VERSION,
+    DatasetSplit, DeathCause, SimulationLifecycle,
 };

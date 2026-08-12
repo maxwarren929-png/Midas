@@ -2,7 +2,7 @@ use crate::{
     MidasError, PolicyFailureCategory, Result,
     action::ValidatedAction,
     brain::{NeuralRuntimeState, PolicyActionSample},
-    config::{LearningConfig, OptimizerConfig},
+    config::{LearningConfig, OptimizerConfig, TurnoverConstraintConfig},
     observation::Observation,
     reward::RewardBreakdown,
 };
@@ -52,6 +52,10 @@ pub struct PpoTrainingSample {
     /// Report-only centered component contributions in the same normalized
     /// units as `advantage`. Training ignores this field.
     pub counterfactual_advantages: Option<CounterfactualAdvantages>,
+    /// Discounted normalized-turnover cost target for constrained PPO.
+    pub turnover_cost_return: Option<f32>,
+    /// Fixed, independently normalized turnover-cost advantage.
+    pub turnover_cost_advantage: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -68,6 +72,15 @@ pub struct PpoTrainingBatch {
     pub sequence_length: usize,
     /// Report-only attribution computed before samples are shuffled.
     pub advantage_diagnostics: Option<Box<PpoAdvantageDiagnostics>>,
+    pub turnover_constraint: Option<TurnoverConstraintBatch>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct TurnoverConstraintBatch {
+    pub multiplier: f32,
+    pub budget: f32,
+    pub critic_coefficient: f32,
+    pub mean_step_cost: f32,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -182,6 +195,10 @@ pub struct TrainingMetrics {
     pub gru_candidate_gradient_norm: Option<f32>,
     pub actor_gradient_norm: f32,
     pub critic_gradient_norm: f32,
+    pub turnover_critic_loss: f32,
+    pub turnover_critic_gradient_norm: f32,
+    pub turnover_constraint_multiplier: Option<f32>,
+    pub mean_turnover_cost: Option<f32>,
     pub gradient_clip_fraction: f32,
     pub relative_update_norm: f32,
     pub approximate_kl: f32,
@@ -206,6 +223,10 @@ impl TrainingMetrics {
             gru_candidate_gradient_norm: None,
             actor_gradient_norm: 0.0,
             critic_gradient_norm: 0.0,
+            turnover_critic_loss: 0.0,
+            turnover_critic_gradient_norm: 0.0,
+            turnover_constraint_multiplier: None,
+            mean_turnover_cost: None,
             gradient_clip_fraction: 0.0,
             relative_update_norm: 0.0,
             approximate_kl: 0.0,
@@ -344,6 +365,15 @@ pub enum LearningStrategyState {
         update_index: u64,
         pending_update: bool,
     },
+    ConstrainedPpo {
+        config: LearningConfig,
+        constraint: TurnoverConstraintConfig,
+        rollout: RolloutBuffer,
+        rng: ChaCha8Rng,
+        update_index: u64,
+        pending_update: bool,
+        multiplier: f32,
+    },
 }
 
 pub struct PpoLearning {
@@ -353,6 +383,8 @@ pub struct PpoLearning {
     rng: ChaCha8Rng,
     update_index: u64,
     pending_update: bool,
+    turnover_multiplier: Option<f32>,
+    turnover_constraint: Option<TurnoverConstraintConfig>,
     diagnostic_rewards: Vec<RewardBreakdown>,
     diagnostic_rewards_complete: bool,
 }
@@ -365,6 +397,14 @@ impl PpoLearning {
         optimizer: OptimizerConfig,
         seed: u64,
     ) -> Result<Self> {
+        Self::new_with_constraint(config, optimizer, None, seed)
+    }
+    pub fn new_with_constraint(
+        config: LearningConfig,
+        optimizer: OptimizerConfig,
+        turnover_constraint: Option<TurnoverConstraintConfig>,
+        seed: u64,
+    ) -> Result<Self> {
         optimizer.validate()?;
         if config.implementation != crate::config::LearningKind::Ppo {
             return Err(MidasError::Config(
@@ -372,7 +412,13 @@ impl PpoLearning {
             ));
         }
         config.validate()?;
+        if let Some(constraint) = &turnover_constraint {
+            constraint.validate(&config)?;
+        }
         let rollout_length = config.rollout_length;
+        let turnover_multiplier = turnover_constraint
+            .as_ref()
+            .map(|constraint| constraint.initial_multiplier);
         Ok(Self {
             rollout: RolloutBuffer::new(rollout_length)?,
             config,
@@ -380,6 +426,8 @@ impl PpoLearning {
             rng: ChaCha8Rng::seed_from_u64(seed),
             update_index: 0,
             pending_update: false,
+            turnover_multiplier,
+            turnover_constraint,
             diagnostic_rewards: Vec::with_capacity(rollout_length),
             diagnostic_rewards_complete: true,
         })
@@ -401,6 +449,27 @@ impl PpoLearning {
         let (advantages, returns) =
             generalized_advantages_masked(transitions, self.config.gamma, self.config.gae_lambda)?;
         let pre_normalization_advantages = advantages.clone();
+        let turnover_cost_returns = if self.turnover_constraint.is_some() {
+            if !self.diagnostic_rewards_complete
+                || self.diagnostic_rewards.len() != transitions.len()
+            {
+                return Err(MidasError::Policy(
+                    "constrained PPO requires complete turnover diagnostics".into(),
+                ));
+            }
+            Some(reward_signal_returns(
+                transitions,
+                &self
+                    .diagnostic_rewards
+                    .iter()
+                    .map(|breakdown| breakdown.turnover_basis)
+                    .collect::<Vec<_>>(),
+                self.config.gamma,
+                1.0,
+            )?)
+        } else {
+            None
+        };
         let mut samples = transitions
             .iter()
             .enumerate()
@@ -444,6 +513,10 @@ impl PpoLearning {
                         temperature: actor_sample.as_ref().map(|sample| sample.2),
                         invalid_action: transition.invalid_action,
                         counterfactual_advantages: None,
+                        turnover_cost_return: turnover_cost_returns
+                            .as_ref()
+                            .map(|costs| costs[source_index] as f32),
+                        turnover_cost_advantage: None,
                     },
                 ))
             })
@@ -521,10 +594,27 @@ impl PpoLearning {
             .flat_map(|index| sequences[index].clone())
             .collect();
         self.pending_update = true;
+        let turnover_constraint = self.turnover_constraint.as_ref().map(|constraint| {
+            let mean_step_cost = self
+                .diagnostic_rewards
+                .iter()
+                .map(|breakdown| breakdown.turnover_basis as f32)
+                .sum::<f32>()
+                / self.diagnostic_rewards.len().max(1) as f32;
+            TurnoverConstraintBatch {
+                multiplier: self
+                    .turnover_multiplier
+                    .unwrap_or(constraint.initial_multiplier),
+                budget: constraint.budget,
+                critic_coefficient: constraint.critic_coefficient,
+                mean_step_cost,
+            }
+        });
         Ok(LearningUpdate::Ppo(PpoTrainingBatch {
             samples: shuffled,
             sequence_length: self.config.sequence_length,
             advantage_diagnostics: Some(Box::new(advantage_diagnostics)),
+            turnover_constraint,
         }))
     }
 
@@ -575,6 +665,20 @@ impl LearningStrategy for PpoLearning {
     }
     fn commit_update(&mut self) -> Result<()> {
         if self.pending_update {
+            if let (Some(constraint), Some(multiplier)) = (
+                self.turnover_constraint.as_ref(),
+                self.turnover_multiplier.as_mut(),
+            ) {
+                let mean_cost = self
+                    .diagnostic_rewards
+                    .iter()
+                    .map(|breakdown| breakdown.turnover_basis as f32)
+                    .sum::<f32>()
+                    / self.diagnostic_rewards.len().max(1) as f32;
+                *multiplier = (*multiplier
+                    + constraint.dual_learning_rate * (mean_cost - constraint.budget))
+                    .clamp(0.0, constraint.maximum_multiplier);
+            }
             self.rollout.clear();
             self.diagnostic_rewards.clear();
             self.diagnostic_rewards_complete = true;
@@ -584,6 +688,20 @@ impl LearningStrategy for PpoLearning {
         Ok(())
     }
     fn snapshot(&self) -> Result<LearningStrategyState> {
+        if let Some(multiplier) = self.turnover_multiplier {
+            let constraint = self.turnover_constraint.clone().ok_or_else(|| {
+                MidasError::Checkpoint("constrained PPO is missing its configuration".into())
+            })?;
+            return Ok(LearningStrategyState::ConstrainedPpo {
+                config: self.config.clone(),
+                constraint,
+                rollout: self.rollout.clone(),
+                rng: self.rng.clone(),
+                update_index: self.update_index,
+                pending_update: self.pending_update,
+                multiplier,
+            });
+        }
         Ok(LearningStrategyState::Ppo {
             config: self.config.clone(),
             rollout: self.rollout.clone(),
@@ -600,6 +718,8 @@ impl LearningStrategy for PpoLearning {
             rng: self.rng.clone(),
             update_index: self.update_index,
             pending_update: self.pending_update,
+            turnover_multiplier: self.turnover_multiplier,
+            turnover_constraint: self.turnover_constraint.clone(),
             diagnostic_rewards: self.diagnostic_rewards.clone(),
             diagnostic_rewards_complete: self.diagnostic_rewards_complete,
         }))
@@ -627,41 +747,90 @@ pub fn learning_from_state(
             rng,
             update_index,
             pending_update,
-        } => {
-            optimizer.validate()?;
-            if config.implementation != crate::config::LearningKind::Ppo {
-                return Err(MidasError::Checkpoint(
-                    "restored PPO state has a non-PPO implementation".into(),
-                ));
-            }
-            config.validate()?;
-            if rollout.capacity != config.rollout_length
-                || rollout.transitions.len() > rollout.capacity
-            {
-                return Err(MidasError::Checkpoint(
-                    "restored PPO rollout capacity does not match its configuration".into(),
-                ));
-            }
-            for transition in &rollout.transitions {
-                validate_transition(transition)?;
-            }
-            if pending_update && rollout.transitions.is_empty() {
-                return Err(MidasError::Checkpoint(
-                    "restored PPO update is pending with an empty rollout".into(),
-                ));
-            }
-            Ok(Box::new(PpoLearning {
-                config,
-                optimizer: optimizer.clone(),
-                diagnostic_rewards: vec![RewardBreakdown::default(); rollout.len()],
-                diagnostic_rewards_complete: rollout.is_empty(),
-                rollout,
-                rng,
-                update_index,
-                pending_update,
-            }))
+        } => restore_ppo(
+            config,
+            rollout,
+            rng,
+            update_index,
+            pending_update,
+            None,
+            None,
+            optimizer,
+        ),
+        LearningStrategyState::ConstrainedPpo {
+            config,
+            constraint,
+            rollout,
+            rng,
+            update_index,
+            pending_update,
+            multiplier,
+        } => restore_ppo(
+            config,
+            rollout,
+            rng,
+            update_index,
+            pending_update,
+            Some(multiplier),
+            Some(constraint),
+            optimizer,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_ppo(
+    config: LearningConfig,
+    rollout: RolloutBuffer,
+    rng: ChaCha8Rng,
+    update_index: u64,
+    pending_update: bool,
+    multiplier: Option<f32>,
+    turnover_constraint: Option<TurnoverConstraintConfig>,
+    optimizer: &OptimizerConfig,
+) -> Result<Box<dyn LearningStrategy>> {
+    optimizer.validate()?;
+    if config.implementation != crate::config::LearningKind::Ppo {
+        return Err(MidasError::Checkpoint(
+            "restored PPO state has a non-PPO implementation".into(),
+        ));
+    }
+    config.validate()?;
+    if rollout.capacity != config.rollout_length || rollout.transitions.len() > rollout.capacity {
+        return Err(MidasError::Checkpoint(
+            "restored PPO rollout capacity does not match its configuration".into(),
+        ));
+    }
+    for transition in &rollout.transitions {
+        validate_transition(transition)?;
+    }
+    if pending_update && rollout.transitions.is_empty() {
+        return Err(MidasError::Checkpoint(
+            "restored PPO update is pending with an empty rollout".into(),
+        ));
+    }
+    match (&turnover_constraint, multiplier) {
+        (None, None) => {}
+        (Some(constraint), Some(value))
+            if value.is_finite() && value >= 0.0 && value <= constraint.maximum_multiplier => {}
+        _ => {
+            return Err(MidasError::Checkpoint(
+                "restored PPO turnover multiplier does not match configuration".into(),
+            ));
         }
     }
+    Ok(Box::new(PpoLearning {
+        config,
+        optimizer: optimizer.clone(),
+        diagnostic_rewards: vec![RewardBreakdown::default(); rollout.len()],
+        diagnostic_rewards_complete: rollout.is_empty(),
+        rollout,
+        rng,
+        update_index,
+        pending_update,
+        turnover_multiplier: multiplier,
+        turnover_constraint,
+    }))
 }
 
 fn reward_signal_returns(
@@ -1254,6 +1423,81 @@ mod tests {
         assert!(learner.rollout().is_empty());
         config.rollout_length = 0;
         assert!(PpoLearning::new(config, 1).is_err());
+    }
+
+    #[test]
+    fn constrained_ppo_builds_cost_targets_updates_dual_and_restores_it() {
+        let config = LearningConfig {
+            implementation: crate::config::LearningKind::Ppo,
+            learning_rate: 0.001,
+            gamma: 1.0,
+            gae_lambda: 0.95,
+            ppo_clip: 0.2,
+            critic_coefficient: 0.5,
+            entropy_coefficient: 0.01,
+            gradient_clip: 1.0,
+            rollout_length: 2,
+            minibatch_size: 2,
+            sequence_length: 1,
+            normalize_advantages: true,
+            optimisation_epochs: 1,
+        };
+        let constraint = crate::config::TurnoverConstraintConfig {
+            budget: 0.1,
+            dual_learning_rate: 0.1,
+            initial_multiplier: 0.5,
+            maximum_multiplier: 1.0,
+            critic_coefficient: 0.5,
+        };
+        let mut learner = PpoLearning::new_with_constraint(
+            config,
+            OptimizerConfig::default(),
+            Some(constraint.clone()),
+            7,
+        )
+        .unwrap();
+        assert!(matches!(
+            learner
+                .observe_transition_with_diagnostics(
+                    transition(0.1, 0.0, 0.0, false),
+                    RewardBreakdown {
+                        turnover_basis: 0.2,
+                        ..RewardBreakdown::default()
+                    },
+                )
+                .unwrap(),
+            LearningUpdate::None
+        ));
+        let LearningUpdate::Ppo(batch) = learner
+            .observe_transition_with_diagnostics(
+                transition(0.2, 0.0, 0.0, true),
+                RewardBreakdown {
+                    turnover_basis: 0.4,
+                    ..RewardBreakdown::default()
+                },
+            )
+            .unwrap()
+        else {
+            panic!("expected constrained PPO batch")
+        };
+        let batch_constraint = batch.turnover_constraint.unwrap();
+        assert!((batch_constraint.multiplier - 0.5).abs() < 1e-6);
+        assert!((batch_constraint.mean_step_cost - 0.3).abs() < 1e-6);
+        assert!(
+            batch
+                .samples
+                .iter()
+                .all(|sample| sample.turnover_cost_return.is_some())
+        );
+
+        learner.commit_update().unwrap();
+        let state = learner.snapshot().unwrap();
+        let LearningStrategyState::ConstrainedPpo { multiplier, .. } = &state else {
+            panic!("expected checkpointed constrained PPO state")
+        };
+        assert!((*multiplier - 0.52).abs() < 1e-6);
+        let restored = learning_from_state(state, &OptimizerConfig::default()).unwrap();
+        assert_eq!(restored.snapshot().unwrap(), learner.snapshot().unwrap());
     }
 
     #[test]

@@ -202,6 +202,11 @@ impl SimulationEngine {
                         validated,
                         advanced.reward,
                         advanced.reward_breakdown,
+                        if advanced.previous_net_worth > 0.0 {
+                            advanced.trade.turnover / advanced.previous_net_worth
+                        } else {
+                            0.0
+                        },
                         next_value,
                         advanced.death.is_some(),
                         observation_date,
@@ -309,6 +314,11 @@ impl SimulationEngine {
                         fallback,
                         advanced.reward,
                         advanced.reward_breakdown,
+                        if advanced.previous_net_worth > 0.0 {
+                            advanced.trade.turnover / advanced.previous_net_worth
+                        } else {
+                            0.0
+                        },
                         next_value,
                         advanced.death.is_some(),
                         observation_date,

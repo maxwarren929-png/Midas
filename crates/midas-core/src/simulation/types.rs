@@ -11,6 +11,9 @@ pub const CHECKPOINT_VERSION: u32 = 21;
 /// Format 22 combines AdamW-capable neural state with persistent agent
 /// self-awareness statistics.
 pub const AWARENESS_CHECKPOINT_VERSION: u32 = 22;
+/// Format 23 adds the authoritative constrained-PPO dual state and two-output
+/// reward/turnover critic architecture.
+pub const CONSTRAINED_PPO_CHECKPOINT_VERSION: u32 = 23;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum DatasetSplit {

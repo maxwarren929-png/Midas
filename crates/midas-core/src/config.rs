@@ -30,7 +30,9 @@ pub use evolution::{
     InheritanceMode, SelectionMethod,
 };
 pub use execution::ExecutionConfig;
-pub use learning::{LearningConfig, LearningKind, OptimizerConfig, OptimizerKind};
+pub use learning::{
+    LearningConfig, LearningKind, OptimizerConfig, OptimizerKind, TurnoverConstraintConfig,
+};
 pub use market::{
     CorporateActionConfig, CorporateActionMode, DataConfig, DataFormat, FeatureConfig, FeatureKind,
     MarketConfig,
@@ -66,6 +68,8 @@ pub struct Config {
     pub learning: LearningConfig,
     #[serde(default, skip_serializing_if = "OptimizerConfig::is_default")]
     pub optimizer: OptimizerConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turnover_constraint: Option<TurnoverConstraintConfig>,
     pub backend: BackendConfig,
     pub replacement: ReplacementConfig,
     #[serde(default)]

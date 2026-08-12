@@ -65,6 +65,7 @@ pub struct NeuralInput<'a> {
 pub struct NeuralOutput {
     pub logits: Vec<f32>,
     pub value: f32,
+    pub turnover_cost_value: Option<f32>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PolicyActionSample {

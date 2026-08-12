@@ -81,12 +81,17 @@ impl SimulationEngine {
             config.observation_builder_options(),
             Some(&data),
         )?;
-        let architecture = BrainArchitecture::from_config(
+        let mut architecture = BrainArchitecture::from_config(
             &config.brain,
             schema_hash,
             observation_schema.dimension(data.assets.len()),
             data.assets.len(),
         );
+        if config.turnover_constraint.is_some() {
+            // Output zero remains the reward critic. Output one is an
+            // independently trained turnover-cost critic.
+            architecture.critic_output_size = 2;
+        }
         let first = features[0].date;
         let blueprint = configured_blueprint(&config)?;
         let mut agents = Vec::new();

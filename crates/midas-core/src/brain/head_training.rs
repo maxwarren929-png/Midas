@@ -27,16 +27,19 @@ pub(super) fn train_burn_encoder(
     let saved_adamw_optimizer = model.adamw_optimizer.clone();
     let saved_cached = model.cached.clone();
     let mut aggregate = crate::learning::TrainingMetrics::empty();
+    let prepared_batch = prepare_turnover_advantages(model, batch)?;
     let epochs = config.optimisation_epochs.max(1);
-    let minibatches = recurrent_minibatch_ranges(&batch.samples, config.minibatch_size.max(1))?;
+    let minibatches =
+        recurrent_minibatch_ranges(&prepared_batch.samples, config.minibatch_size.max(1))?;
     let mut updates = 0usize;
     let result = (|| {
         for _ in 0..epochs {
             for range in &minibatches {
                 let minibatch = crate::learning::PpoTrainingBatch {
-                    samples: batch.samples[range.clone()].to_vec(),
-                    sequence_length: batch.sequence_length,
+                    samples: prepared_batch.samples[range.clone()].to_vec(),
+                    sequence_length: prepared_batch.sequence_length,
                     advantage_diagnostics: None,
+                    turnover_constraint: prepared_batch.turnover_constraint,
                 };
                 let metrics = train_burn_encoder_inner(model, &minibatch, config, optimizer)?;
                 aggregate.policy_loss += metrics.policy_loss;
@@ -76,6 +79,10 @@ pub(super) fn train_burn_encoder(
                 );
                 aggregate.actor_gradient_norm += metrics.actor_gradient_norm;
                 aggregate.critic_gradient_norm += metrics.critic_gradient_norm;
+                aggregate.turnover_critic_loss += metrics.turnover_critic_loss;
+                aggregate.turnover_critic_gradient_norm += metrics.turnover_critic_gradient_norm;
+                aggregate.turnover_constraint_multiplier = metrics.turnover_constraint_multiplier;
+                aggregate.mean_turnover_cost = metrics.mean_turnover_cost;
                 aggregate.gradient_clip_fraction += metrics.gradient_clip_fraction;
                 aggregate.relative_update_norm += metrics.relative_update_norm;
                 aggregate.approximate_kl += metrics.approximate_kl;
@@ -91,7 +98,7 @@ pub(super) fn train_burn_encoder(
             }
         }
         if updates > 0 {
-            aggregate.rollout_size = batch.samples.len();
+            aggregate.rollout_size = prepared_batch.samples.len();
             let divisor = updates as f32;
             aggregate.policy_loss /= divisor;
             aggregate.value_loss /= divisor;
@@ -108,6 +115,8 @@ pub(super) fn train_burn_encoder(
             divide_optional_norm(&mut aggregate.gru_candidate_gradient_norm, divisor);
             aggregate.actor_gradient_norm /= divisor;
             aggregate.critic_gradient_norm /= divisor;
+            aggregate.turnover_critic_loss /= divisor;
+            aggregate.turnover_critic_gradient_norm /= divisor;
             aggregate.gradient_clip_fraction /= divisor;
             aggregate.relative_update_norm /= divisor;
             aggregate.approximate_kl /= divisor;
@@ -126,6 +135,52 @@ pub(super) fn train_burn_encoder(
         model.cached = saved_cached;
     }
     result
+}
+
+fn prepare_turnover_advantages(
+    model: &BurnNeuralModel,
+    batch: &crate::learning::PpoTrainingBatch,
+) -> Result<crate::learning::PpoTrainingBatch> {
+    let Some(_) = batch.turnover_constraint else {
+        return Ok(batch.clone());
+    };
+    let mut prepared = batch.clone();
+    let mut residuals = vec![None; prepared.samples.len()];
+    let mut actor_residuals = Vec::new();
+    let mut recurrent_state = None;
+    for (index, sample) in prepared.samples.iter().enumerate() {
+        if sample.sequence_start {
+            recurrent_state = Some(sample.recurrent_state.clone());
+        }
+        let current_state = recurrent_state.as_ref().ok_or_else(|| {
+            MidasError::Policy("PPO sample crosses an unmarked recurrent boundary".into())
+        })?;
+        let encoded = model.encode_observation(&sample.observation, current_state)?;
+        let output = model.evaluate_representation(&encoded.representation)?;
+        recurrent_state = Some(encoded.next_runtime_state);
+        if sample.action_sample.is_some() {
+            let target = sample.turnover_cost_return.ok_or_else(|| {
+                MidasError::Policy("constrained actor sample is missing turnover target".into())
+            })?;
+            let estimate = output.turnover_cost_value.ok_or_else(|| {
+                MidasError::Policy("constrained model is missing turnover critic".into())
+            })?;
+            let residual = target - estimate;
+            residuals[index] = Some(residual);
+            actor_residuals.push(residual);
+        }
+    }
+    let mean = actor_residuals.iter().sum::<f32>() / actor_residuals.len().max(1) as f32;
+    let variance = actor_residuals
+        .iter()
+        .map(|value| (*value - mean).powi(2))
+        .sum::<f32>()
+        / actor_residuals.len().max(1) as f32;
+    let standard_deviation = variance.sqrt().max(1.0e-8);
+    for (sample, residual) in prepared.samples.iter_mut().zip(residuals) {
+        sample.turnover_cost_advantage = residual.map(|value| (value - mean) / standard_deviation);
+    }
+    Ok(prepared)
 }
 
 fn accumulate_optional_norm(total: &mut Option<f32>, value: Option<f32>) {
@@ -209,9 +264,12 @@ fn train_burn_encoder_inner(
     let actor_inputs = model.architecture.memory.size;
     let actor_outputs = model.architecture.actor_output_size;
     let critic_outputs = model.architecture.critic_output_size;
-    if critic_outputs != 1 {
+    let constrained = batch.turnover_constraint;
+    if (constrained.is_some() && critic_outputs != 2)
+        || (constrained.is_none() && critic_outputs != 1)
+    {
         return Err(MidasError::Policy(
-            "PPO encoder training requires a one-output critic".into(),
+            "PPO critic layout does not match turnover-constraint mode".into(),
         ));
     }
     let mut observations =
@@ -228,6 +286,7 @@ fn train_burn_encoder_inner(
     let mut critic_output_gradients = Vec::with_capacity(batch.samples.len() * critic_outputs);
     let mut policy_loss = 0.0_f32;
     let mut value_loss = 0.0_f32;
+    let mut turnover_critic_loss = 0.0_f32;
     let mut entropy = 0.0_f32;
     let mut total_loss = 0.0_f32;
     let mut actor_count = 0usize;
@@ -265,9 +324,21 @@ fn train_burn_encoder_inner(
             let old_log_probability = sample.old_log_probability.ok_or_else(|| {
                 MidasError::Policy("actor sample is missing its old log probability".into())
             })?;
-            let advantage = sample
+            let reward_advantage = sample
                 .advantage
                 .ok_or_else(|| MidasError::Policy("actor sample is missing advantage".into()))?;
+            let advantage = if let Some(constraint) = constrained {
+                reward_advantage
+                    - constraint.multiplier
+                        * sample.turnover_cost_advantage.ok_or_else(|| {
+                            MidasError::Policy(
+                                "constrained actor sample is missing normalized cost advantage"
+                                    .into(),
+                            )
+                        })?
+            } else {
+                reward_advantage
+            };
             let temperature = sample
                 .temperature
                 .ok_or_else(|| MidasError::Policy("actor sample is missing temperature".into()))?;
@@ -364,6 +435,22 @@ fn train_burn_encoder_inner(
             total_loss += config.critic_coefficient * critic_loss;
             critic_count += 1;
         }
+        if let Some(constraint) = constrained {
+            let target_cost = sample.turnover_cost_return.ok_or_else(|| {
+                MidasError::Policy("constrained critic sample is missing turnover target".into())
+            })?;
+            let estimate = output.turnover_cost_value.ok_or_else(|| {
+                MidasError::Policy("constrained model is missing turnover critic".into())
+            })?;
+            critic_output_gradient[1] =
+                2.0 * constraint.critic_coefficient * (estimate - target_cost);
+            let loss = (estimate - target_cost).powi(2);
+            if !loss.is_finite() {
+                return Err(MidasError::Policy("non-finite turnover critic loss".into()));
+            }
+            turnover_critic_loss += loss;
+            total_loss += constraint.critic_coefficient * loss;
+        }
         critic_output_gradients.extend_from_slice(&critic_output_gradient);
     }
 
@@ -432,6 +519,17 @@ fn train_burn_encoder_inner(
     let recurrent_gradient_norm = dense_gradient_norm(&recurrent);
     let actor_gradient_norm = vector_pair_norm(&actor_weight_gradient, &actor_bias_gradient);
     let critic_gradient_norm = vector_pair_norm(&critic_weight_gradient, &critic_bias_gradient);
+    let turnover_critic_gradient_norm = if critic_outputs == 2 {
+        critic_column_gradient_norm(
+            &critic_weight_gradient,
+            &critic_bias_gradient,
+            actor_inputs,
+            critic_outputs,
+            1,
+        )
+    } else {
+        0.0
+    };
     let gru_gate_norms = gru_gate_gradient_norms(
         &recurrent,
         model.lifetime.recurrent.inputs,
@@ -526,6 +624,10 @@ fn train_burn_encoder_inner(
         gru_candidate_gradient_norm: gru_gate_norms.map(|norms| norms[2]),
         actor_gradient_norm,
         critic_gradient_norm,
+        turnover_critic_loss: turnover_critic_loss / critic_divisor,
+        turnover_critic_gradient_norm,
+        turnover_constraint_multiplier: constrained.map(|constraint| constraint.multiplier),
+        mean_turnover_cost: constrained.map(|constraint| constraint.mean_step_cost),
         gradient_clip_fraction: if gradient_clip_applied { 1.0 } else { 0.0 },
         relative_update_norm,
         approximate_kl: approximate_kl / actor_divisor,
@@ -533,6 +635,22 @@ fn train_burn_encoder_inner(
         update_index,
         actor_gradient_attribution,
     })
+}
+
+fn critic_column_gradient_norm(
+    weights: &[f32],
+    bias: &[f32],
+    inputs: usize,
+    outputs: usize,
+    column: usize,
+) -> f32 {
+    weights
+        .chunks_exact(outputs)
+        .take(inputs)
+        .map(|row| row[column] * row[column])
+        .chain(std::iter::once(bias[column] * bias[column]))
+        .sum::<f32>()
+        .sqrt()
 }
 
 pub(super) struct DenseGradients {

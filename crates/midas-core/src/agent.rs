@@ -188,9 +188,10 @@ impl StandardAgentFactory {
             learning_config.learning_rate = genome.traits.learning_rate;
             learning_config.entropy_coefficient = genome.traits.entropy_coefficient;
         }
-        Ok(Box::new(PpoLearning::new_with_optimizer(
+        Ok(Box::new(PpoLearning::new_with_constraint(
             learning_config,
             config.optimizer.clone(),
+            config.turnover_constraint.clone(),
             seed,
         )?))
     }

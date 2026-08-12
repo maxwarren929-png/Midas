@@ -2,7 +2,9 @@ use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use midas_core::{
     brain::{DenseGenome, NeuralModelState, PolicySnapshot},
-    config::{Config, OptimizerKind, PolicyKind, RewardKind, SeedDerivation},
+    config::{
+        Config, OptimizerKind, PolicyKind, RewardKind, SeedDerivation, TurnoverConstraintConfig,
+    },
     learning::{
         ActorGradientAttribution, LearningStrategyState, PpoAdvantageDiagnostics, TrainingMetrics,
     },
@@ -61,6 +63,21 @@ struct Args {
     /// Override the raw-notional turnover penalty weight.
     #[arg(long)]
     turnover_penalty_weight: Option<f32>,
+    /// Enable constrained PPO with this mean daily turnover/net-worth budget.
+    #[arg(long)]
+    turnover_budget: Option<f32>,
+    /// Projected dual-ascent learning rate (requires --turnover-budget).
+    #[arg(long, requires = "turnover_budget", default_value_t = 0.01)]
+    turnover_dual_learning_rate: f32,
+    /// Initial Lagrange multiplier (requires --turnover-budget).
+    #[arg(long, requires = "turnover_budget", default_value_t = 0.0)]
+    turnover_initial_multiplier: f32,
+    /// Maximum projected Lagrange multiplier (requires --turnover-budget).
+    #[arg(long, requires = "turnover_budget", default_value_t = 10.0)]
+    turnover_maximum_multiplier: f32,
+    /// Turnover-cost critic loss coefficient (requires --turnover-budget).
+    #[arg(long, requires = "turnover_budget", default_value_t = 0.5)]
+    turnover_critic_coefficient: f32,
     /// Write the JSON summary to this path instead of standard output.
     #[arg(long)]
     output: Option<PathBuf>,
@@ -234,6 +251,15 @@ fn main() -> Result<()> {
     if let Some(weight) = args.turnover_penalty_weight {
         config.reward.turnover_penalty_weight = weight;
     }
+    if let Some(budget) = args.turnover_budget {
+        config.turnover_constraint = Some(TurnoverConstraintConfig {
+            budget,
+            dual_learning_rate: args.turnover_dual_learning_rate,
+            initial_multiplier: args.turnover_initial_multiplier,
+            maximum_multiplier: args.turnover_maximum_multiplier,
+            critic_coefficient: args.turnover_critic_coefficient,
+        });
+    }
     let experiment = json!({
         "requested_steps": args.steps,
         "population_size": config.simulation.population_size,
@@ -248,6 +274,7 @@ fn main() -> Result<()> {
         "reward_kind": config.reward.kind,
         "drawdown_penalty_weight": config.reward.drawdown_penalty_weight,
         "turnover_penalty_weight": config.reward.turnover_penalty_weight,
+        "turnover_constraint": config.turnover_constraint,
         "evaluation_checkpoint": args.evaluate_checkpoint,
         "genome_baseline": args.genome_baseline,
     });
@@ -321,6 +348,10 @@ fn main() -> Result<()> {
                 gru_candidate_gradient_norm: None,
                 actor_gradient_norm: 0.0,
                 critic_gradient_norm: 0.0,
+                turnover_critic_loss: 0.0,
+                turnover_critic_gradient_norm: 0.0,
+                turnover_constraint_multiplier: None,
+                mean_turnover_cost: None,
                 gradient_clip_fraction: 0.0,
                 relative_update_norm: 0.0,
                 approximate_kl: 0.0,
@@ -641,6 +672,10 @@ fn main() -> Result<()> {
                 "mean_gru_candidate_norm": mean_optional_ppo(|trace| trace.gru_candidate_gradient_norm),
                 "mean_actor_norm": mean_ppo(|trace| f64::from(trace.actor_gradient_norm)),
                 "mean_critic_norm": mean_ppo(|trace| f64::from(trace.critic_gradient_norm)),
+                "mean_turnover_critic_loss": mean_ppo(|trace| f64::from(trace.turnover_critic_loss)),
+                "mean_turnover_critic_norm": mean_ppo(|trace| f64::from(trace.turnover_critic_gradient_norm)),
+                "mean_turnover_constraint_multiplier": mean_optional_ppo(|trace| trace.turnover_constraint_multiplier),
+                "mean_turnover_cost": mean_optional_ppo(|trace| trace.mean_turnover_cost),
                 "gradient_clip_frequency": mean_ppo(|trace| f64::from(trace.gradient_clip_fraction)),
                 "mean_relative_update_norm": mean_ppo(|trace| f64::from(trace.relative_update_norm)),
             },
@@ -721,6 +756,16 @@ mod tests {
             "0.0005",
             "--turnover-penalty-weight",
             "0.00000005",
+            "--turnover-budget",
+            "0.02",
+            "--turnover-dual-learning-rate",
+            "0.1",
+            "--turnover-initial-multiplier",
+            "0.25",
+            "--turnover-maximum-multiplier",
+            "5.0",
+            "--turnover-critic-coefficient",
+            "0.75",
             "--output",
             "summary.json",
             "--checkpoint",
@@ -748,6 +793,11 @@ mod tests {
         assert!(matches!(args.reward_kind, Some(RewardArg::RiskAdjusted)));
         assert_eq!(args.drawdown_penalty_weight, Some(0.0005));
         assert_eq!(args.turnover_penalty_weight, Some(0.00000005));
+        assert_eq!(args.turnover_budget, Some(0.02));
+        assert_eq!(args.turnover_dual_learning_rate, 0.1);
+        assert_eq!(args.turnover_initial_multiplier, 0.25);
+        assert_eq!(args.turnover_maximum_multiplier, 5.0);
+        assert_eq!(args.turnover_critic_coefficient, 0.75);
         assert_eq!(args.output, Some(PathBuf::from("summary.json")));
         assert_eq!(args.checkpoint, Some(PathBuf::from("state.bin")));
         assert_eq!(args.evaluate_checkpoint, Some(PathBuf::from("trained.bin")));

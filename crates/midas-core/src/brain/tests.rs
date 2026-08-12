@@ -88,6 +88,8 @@ fn ppo_sample(
         temperature: Some(1.0),
         invalid_action: false,
         counterfactual_advantages: None,
+        turnover_cost_return: None,
+        turnover_cost_advantage: None,
     }
 }
 
@@ -210,9 +212,12 @@ fn burn_training_changes_lifetime_parameters_without_changing_genome() {
             temperature: Some(1.0),
             invalid_action: false,
             counterfactual_advantages: None,
+            turnover_cost_return: None,
+            turnover_cost_advantage: None,
         }],
         sequence_length: 1,
         advantage_diagnostics: None,
+        turnover_constraint: None,
     };
     let metrics = model
         .train_batch(&batch, &learning_config(), &optimizer_config())
@@ -327,6 +332,7 @@ fn ppo_head_learning_changes_actor_weights_regression() {
         samples: vec![ppo_sample(vec![0.8, 0.3], 1, 1.0, 0.5, -0.7)],
         sequence_length: 1,
         advantage_diagnostics: None,
+        turnover_constraint: None,
     };
 
     model
@@ -336,6 +342,87 @@ fn ppo_head_learning_changes_actor_weights_regression() {
     assert_ne!(
         before.actor.weights, after.actor.weights,
         "PPO must update the actor output weight matrix, not only its bias"
+    );
+}
+
+#[test]
+fn constrained_ppo_updates_separate_turnover_critic_and_changes_actor_gradient() {
+    let mut constrained_architecture = architecture();
+    constrained_architecture.critic_output_size = 2;
+    let genome = BrainGenome::random(
+        &constrained_architecture,
+        &EvolvableTraitsConfig::default(),
+        91,
+    )
+    .unwrap();
+    let baseline_genome =
+        BrainGenome::random(&architecture(), &EvolvableTraitsConfig::default(), 91).unwrap();
+    assert_eq!(genome.hidden, baseline_genome.hidden);
+    assert_eq!(genome.recurrent, baseline_genome.recurrent);
+    assert_eq!(genome.actor, baseline_genome.actor);
+    assert_eq!(
+        genome
+            .critic
+            .weights
+            .chunks_exact(2)
+            .map(|row| row[0])
+            .collect::<Vec<_>>(),
+        baseline_genome.critic.weights
+    );
+    let device = ComputeDevice::CpuNdArray {
+        device: "default".into(),
+    };
+    let mut constrained = BurnNeuralModelFactory
+        .build(&genome, &constrained_architecture, &device)
+        .unwrap();
+    let mut unconstrained_actor = BurnNeuralModelFactory
+        .build(&genome, &constrained_architecture, &device)
+        .unwrap();
+    let before = constrained.lifetime_parameters().unwrap();
+    let mut first = ppo_sample(vec![0.8, 0.3], 1, 0.0, 0.5, -0.7);
+    first.turnover_cost_return = Some(0.0);
+    let mut second = ppo_sample(vec![-0.8, 0.3], 1, 0.0, 0.5, -0.7);
+    second.turnover_cost_return = Some(1.0);
+    let constraint = crate::learning::TurnoverConstraintBatch {
+        multiplier: 1.0,
+        budget: 0.1,
+        critic_coefficient: 0.5,
+        mean_step_cost: 0.5,
+    };
+    let batch = PpoTrainingBatch {
+        samples: vec![first, second],
+        sequence_length: 1,
+        advantage_diagnostics: None,
+        turnover_constraint: Some(constraint),
+    };
+    let mut config = learning_config();
+    config.minibatch_size = 2;
+    config.rollout_length = 2;
+    config.gradient_clip = 100.0;
+    config.entropy_coefficient = 0.0;
+    config.ppo_clip = 10.0;
+    let metrics = constrained
+        .train_batch(&batch, &config, &optimizer_config())
+        .unwrap();
+    let after = constrained.lifetime_parameters().unwrap();
+    assert!(metrics.turnover_critic_loss > 0.0);
+    assert!(metrics.turnover_critic_gradient_norm > 0.0);
+    assert_eq!(metrics.turnover_constraint_multiplier, Some(1.0));
+    assert_ne!(before.critic, after.critic);
+
+    let mut no_dual_batch = batch;
+    no_dual_batch
+        .turnover_constraint
+        .as_mut()
+        .unwrap()
+        .multiplier = 0.0;
+    unconstrained_actor
+        .train_batch(&no_dual_batch, &config, &optimizer_config())
+        .unwrap();
+    assert_ne!(
+        after.actor,
+        unconstrained_actor.lifetime_parameters().unwrap().actor,
+        "the Lagrange multiplier must alter the actor update"
     );
 }
 
@@ -354,6 +441,7 @@ fn bptt_training_updates_hidden_recurrent_and_heads_but_freezes_genome() {
         samples: vec![ppo_sample(vec![0.6, -0.2], 1, 1.0, 2.0, -0.7)],
         sequence_length: 1,
         advantage_diagnostics: None,
+        turnover_constraint: None,
     };
     model
         .train_batch(&batch, &learning_config(), &optimizer_config())
@@ -412,6 +500,7 @@ fn adamw_uses_bias_corrected_moments_decoupled_weight_decay_and_restores() {
         samples: vec![ppo_sample(vec![0.6, -0.2], 1, 1.0, 2.0, -0.7)],
         sequence_length: 1,
         advantage_diagnostics: None,
+        turnover_constraint: None,
     };
     model
         .train_batch(&batch, &config, &optimizer_config)
@@ -678,6 +767,7 @@ fn clipped_policy_gradient_suppresses_head_update_but_keeps_objective_valid() {
                 samples: vec![sample],
                 sequence_length: 1,
                 advantage_diagnostics: None,
+                turnover_constraint: None,
             },
             &config,
             &optimizer_config(),
@@ -708,6 +798,7 @@ fn actor_gradient_attribution_reuses_exact_policy_gradient_geometry() {
                 samples: vec![sample],
                 sequence_length: 1,
                 advantage_diagnostics: None,
+                turnover_constraint: None,
             },
             &config,
             &optimizer_config(),
@@ -741,6 +832,7 @@ fn actor_learning_is_state_dependent_for_two_encoded_states() {
         ],
         sequence_length: 1,
         advantage_diagnostics: None,
+        turnover_constraint: None,
     };
     model
         .train_batch(&batch, &config, &optimizer_config())
@@ -824,6 +916,7 @@ fn critic_learning_is_state_dependent_for_two_encoded_states() {
         ],
         sequence_length: 1,
         advantage_diagnostics: None,
+        turnover_constraint: None,
     };
     model
         .train_batch(&batch, &config, &optimizer_config())
@@ -1024,6 +1117,7 @@ fn bounded_impulse_beta_is_masked_and_seed_reproducible() {
     let output = NeuralOutput {
         logits: vec![0.0, 2.0, 0.0, 1.0],
         value: 0.0,
+        turnover_cost_value: None,
     };
     let mut deterministic_rng = ChaCha8Rng::seed_from_u64(1);
     let deterministic = bounded_impulse_beta_evaluation(
@@ -1072,6 +1166,7 @@ fn neural_policy_can_request_two_asset_impulses() {
     let output = NeuralOutput {
         logits: vec![0.0, 0.0, 0.0, 0.0],
         value: 0.0,
+        turnover_cost_value: None,
     };
     let mut rng = ChaCha8Rng::seed_from_u64(9);
     let evaluation = bounded_impulse_beta_evaluation(
@@ -1104,6 +1199,7 @@ fn bounded_impulse_beta_distribution_is_valid_across_masks_caps_and_seeds() {
             let output = NeuralOutput {
                 logits: vec![0.3, -0.2, 1.0, -1.0, -0.7, 0.8],
                 value: 0.0,
+                turnover_cost_value: None,
             };
             let evaluation = bounded_impulse_beta_evaluation(
                 output,
@@ -1139,6 +1235,7 @@ fn bounded_impulse_beta_log_probability_recomputes_exactly() {
     let output = NeuralOutput {
         logits: vec![0.3, -0.2, 1.0, -1.0, -0.7, 0.8],
         value: 0.0,
+        turnover_cost_value: None,
     };
     let config = ActionDistributionConfig::default();
     let evaluation = bounded_impulse_beta_evaluation(
@@ -1164,6 +1261,7 @@ fn deterministic_impulse_evaluation_does_not_consume_rng() {
     let output = NeuralOutput {
         logits: vec![0.0, 0.0, 0.0, 0.0],
         value: 0.0,
+        turnover_cost_value: None,
     };
     let mut rng = ChaCha8Rng::seed_from_u64(77);
     let mut expected = rng.clone();
@@ -1186,6 +1284,7 @@ fn sampled_valid_impulses_survive_central_validation_unchanged() {
         NeuralOutput {
             logits: vec![0.2, -0.3, 0.4, 0.1],
             value: 0.0,
+            turnover_cost_value: None,
         },
         &[true, true],
         0.5,

@@ -77,6 +77,7 @@ impl SimulationEngine {
         action: ValidatedAction,
         reward: f32,
         reward_breakdown: RewardBreakdown,
+        normalized_turnover_cost: f64,
         next_value: Option<f32>,
         done: bool,
         date: NaiveDate,
@@ -137,9 +138,13 @@ impl SimulationEngine {
                 penalty: self.config.reward.invalid_action_penalty,
             });
         }
+        let mut learning_breakdown = reward_breakdown;
+        if self.config.turnover_constraint.is_some() {
+            learning_breakdown.turnover_basis = normalized_turnover_cost;
+        }
         let update = agent
             .learning
-            .observe_transition_with_diagnostics(transition, reward_breakdown)?;
+            .observe_transition_with_diagnostics(transition, learning_breakdown)?;
         self.apply_learning_update(agent, update, date, events, traces)?;
         if done {
             self.finish_learning_episode(
@@ -218,6 +223,10 @@ impl SimulationEngine {
                 gru_candidate_gradient_norm: metrics.gru_candidate_gradient_norm,
                 actor_gradient_norm: metrics.actor_gradient_norm,
                 critic_gradient_norm: metrics.critic_gradient_norm,
+                turnover_critic_loss: metrics.turnover_critic_loss,
+                turnover_critic_gradient_norm: metrics.turnover_critic_gradient_norm,
+                turnover_constraint_multiplier: metrics.turnover_constraint_multiplier,
+                mean_turnover_cost: metrics.mean_turnover_cost,
                 gradient_clip_fraction: metrics.gradient_clip_fraction,
                 relative_update_norm: metrics.relative_update_norm,
                 approximate_kl: metrics.approximate_kl,

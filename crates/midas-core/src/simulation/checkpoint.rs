@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
 use super::{
-    AWARENESS_CHECKPOINT_VERSION, CHECKPOINT_VERSION, DatasetSplit, DomainEvent, OperationalEvent,
-    SimulationEngine, SimulationLifecycle,
+    AWARENESS_CHECKPOINT_VERSION, CHECKPOINT_VERSION, CONSTRAINED_PPO_CHECKPOINT_VERSION,
+    DatasetSplit, DomainEvent, OperationalEvent, SimulationEngine, SimulationLifecycle,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -227,7 +227,9 @@ pub(super) fn from_state(
     let replacement = replacement.checkpoint_state()?;
     replacement.validate()?;
     Ok(Checkpoint {
-        version: if observation_schema
+        version: if config.turnover_constraint.is_some() {
+            CONSTRAINED_PPO_CHECKPOINT_VERSION
+        } else if observation_schema
             .providers
             .iter()
             .any(|provider| provider == crate::observation::AGENT_AWARENESS_PROVIDER)
@@ -318,7 +320,7 @@ fn deserialize_checkpoint(bytes: &[u8], operation: &str) -> Result<Checkpoint> {
     }
     bincode::deserialize::<Checkpoint>(bytes).map_err(|error| {
         MidasError::Checkpoint(format!(
-            "incompatible checkpoint for {operation}; expected format versions {CHECKPOINT_VERSION} or {AWARENESS_CHECKPOINT_VERSION}: {error}"
+            "incompatible checkpoint for {operation}; expected a supported format through {CONSTRAINED_PPO_CHECKPOINT_VERSION}: {error}"
         ))
     })
 }
@@ -328,6 +330,7 @@ fn validate_resume_version(checkpoint: &Checkpoint) -> Result<()> {
         checkpoint.version,
         CHECKPOINT_VERSION
             | AWARENESS_CHECKPOINT_VERSION
+            | CONSTRAINED_PPO_CHECKPOINT_VERSION
             | 12
             | 13
             | 14
@@ -360,6 +363,7 @@ fn validate_evaluation_version(checkpoint: &Checkpoint) -> Result<()> {
         checkpoint.version,
         CHECKPOINT_VERSION
             | AWARENESS_CHECKPOINT_VERSION
+            | CONSTRAINED_PPO_CHECKPOINT_VERSION
             | 12
             | 13
             | 14

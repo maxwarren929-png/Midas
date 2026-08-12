@@ -17,6 +17,9 @@ impl Config {
         self.policy_failures.validate()?;
         self.splits.validate()?;
         self.learning.validate()?;
+        if let Some(constraint) = &self.turnover_constraint {
+            constraint.validate(&self.learning)?;
+        }
         self.optimizer.validate()?;
         self.reward.validate()?;
         self.evolution.validate()?;

@@ -22,6 +22,23 @@ pub struct LearningConfig {
     pub optimisation_epochs: usize,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TurnoverConstraintConfig {
+    /// Target mean daily traded notional divided by previous net worth.
+    pub budget: f32,
+    /// Step size for projected dual ascent.
+    pub dual_learning_rate: f32,
+    /// Initial non-negative Lagrange multiplier.
+    #[serde(default)]
+    pub initial_multiplier: f32,
+    /// Upper projection bound for the Lagrange multiplier.
+    pub maximum_multiplier: f32,
+    /// Weight of the separate turnover-cost critic loss.
+    #[serde(default = "default_cost_critic_coefficient")]
+    pub critic_coefficient: f32,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OptimizerConfig {
@@ -103,6 +120,9 @@ fn default_sequence_length() -> usize {
 fn default_true() -> bool {
     true
 }
+fn default_cost_critic_coefficient() -> f32 {
+    0.5
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -136,6 +156,28 @@ impl LearningConfig {
         {
             return Err(MidasError::Config(
                 "learning configuration values are invalid".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl TurnoverConstraintConfig {
+    pub(crate) fn validate(&self, _learning: &LearningConfig) -> Result<()> {
+        if !self.budget.is_finite()
+            || self.budget < 0.0
+            || !self.dual_learning_rate.is_finite()
+            || self.dual_learning_rate <= 0.0
+            || !self.initial_multiplier.is_finite()
+            || self.initial_multiplier < 0.0
+            || !self.maximum_multiplier.is_finite()
+            || self.maximum_multiplier <= 0.0
+            || self.initial_multiplier > self.maximum_multiplier
+            || !self.critic_coefficient.is_finite()
+            || self.critic_coefficient < 0.0
+        {
+            return Err(MidasError::Config(
+                "learning turnover constraint values are invalid".into(),
             ));
         }
         Ok(())

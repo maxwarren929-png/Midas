@@ -78,7 +78,27 @@ impl BrainGenome {
         };
         let recurrent = random_dense(input + a.memory.size, recurrent_outputs, &mut rng);
         let actor = random_dense(a.memory.size, a.actor_output_size, &mut rng);
-        let critic = random_dense(a.memory.size, a.critic_output_size, &mut rng);
+        let critic = if a.critic_output_size == 2 {
+            // Preserve the exact reward-critic initialization stream used by
+            // one-output architectures, then append an independent cost
+            // critic column. Enabling the constraint must not perturb the
+            // actor or return baseline before learning begins.
+            let reward = random_dense(a.memory.size, 1, &mut rng);
+            let cost = random_dense(a.memory.size, 1, &mut rng);
+            DenseGenome {
+                inputs: a.memory.size,
+                outputs: 2,
+                weights: reward
+                    .weights
+                    .into_iter()
+                    .zip(cost.weights)
+                    .flat_map(|(reward, cost)| [reward, cost])
+                    .collect(),
+                bias: vec![reward.bias[0], cost.bias[0]],
+            }
+        } else {
+            random_dense(a.memory.size, a.critic_output_size, &mut rng)
+        };
         let g = Self {
             genome_format_version,
             architecture: a.clone(),

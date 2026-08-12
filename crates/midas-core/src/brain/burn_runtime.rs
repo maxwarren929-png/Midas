@@ -410,17 +410,25 @@ impl BurnNeuralModel {
         let logits = to_vec(dense_runtime(state.clone(), &self.cached.actor))?;
         let critic = to_vec(dense_runtime(state, &self.cached.critic))?;
         if critic.len() != self.architecture.critic_output_size
-            || self.architecture.critic_output_size != 1
+            || !matches!(self.architecture.critic_output_size, 1 | 2)
         {
             return Err(MidasError::Policy(
-                "critic output must contain exactly one value".into(),
+                "critic output must contain a reward value and optional turnover-cost value".into(),
             ));
         }
         let value = critic[0];
-        if logits.iter().any(|v| !v.is_finite()) || !value.is_finite() {
+        let turnover_cost_value = critic.get(1).copied();
+        if logits.iter().any(|v| !v.is_finite())
+            || !value.is_finite()
+            || turnover_cost_value.is_some_and(|value| !value.is_finite())
+        {
             return Err(MidasError::Policy("non-finite neural output".into()));
         }
-        Ok(NeuralOutput { logits, value })
+        Ok(NeuralOutput {
+            logits,
+            value,
+            turnover_cost_value,
+        })
     }
 }
 fn dense_runtime(x: Tensor<InferBackend, 2>, l: &BurnRuntimeDense) -> Tensor<InferBackend, 2> {

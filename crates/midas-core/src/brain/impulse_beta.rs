@@ -308,6 +308,7 @@ pub(super) fn evaluate_incremental_trade_sample(
         &NeuralOutput {
             logits: logits.to_vec(),
             value: 0.0,
+            turnover_cost_value: None,
         },
         tradable,
         sample.maximum_trade_fraction as f64,

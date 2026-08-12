@@ -18,6 +18,7 @@ impl NeuralModel for MockModel {
         Ok(NeuralOutput {
             logits: vec![0.0; self.size],
             value: self.memory,
+            turnover_cost_value: None,
         })
     }
     fn reset_memory(&mut self) {
@@ -87,6 +88,7 @@ impl NeuralModel for BootstrapForkFailureModel {
         Ok(NeuralOutput {
             logits: vec![0.0; self.size],
             value: 0.0,
+            turnover_cost_value: None,
         })
     }
     fn reset_memory(&mut self) {}
@@ -168,12 +170,14 @@ impl NeuralModel for SequencedModel {
             return Ok(NeuralOutput {
                 logits: vec![f32::NAN; self.size],
                 value: f32::NAN,
+                turnover_cost_value: None,
             });
         }
         self.memory += 1.0;
         Ok(NeuralOutput {
             logits: vec![0.0; self.size],
             value: self.memory,
+            turnover_cost_value: None,
         })
     }
     fn reset_memory(&mut self) {
