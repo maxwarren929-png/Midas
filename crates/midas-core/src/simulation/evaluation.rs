@@ -1,7 +1,7 @@
 use crate::{
-    Result,
+    MidasError, Result,
     agent::{AgentBuildContext, StandardAgentFactory},
-    brain::{NeuralModelState, PolicySnapshot},
+    brain::{LifetimeParameters, NeuralModelState, PolicySnapshot},
     config::{Config, DeathHandling, LearningKind},
     evolution::EvolutionState,
     execution::Portfolio,
@@ -29,12 +29,32 @@ impl SimulationEngine {
         path: impl AsRef<Path>,
         split: DatasetSplit,
     ) -> Result<Self> {
-        Self::evaluate_checkpoint_with_replacement_factory(
+        Self::evaluate_checkpoint_with_options(
             config,
             data,
             path,
             split,
             Box::new(BuiltInReplacementStrategyFactory),
+            false,
+        )
+    }
+
+    /// Evaluate the checkpoint's final genomes with all lifetime learning
+    /// removed. This preserves selection/replacement outcomes while providing
+    /// a matched birth-parameter control for the trained lifetime weights.
+    pub fn evaluate_checkpoint_genome_baseline(
+        config: Config,
+        data: MarketDataset,
+        path: impl AsRef<Path>,
+        split: DatasetSplit,
+    ) -> Result<Self> {
+        Self::evaluate_checkpoint_with_options(
+            config,
+            data,
+            path,
+            split,
+            Box::new(BuiltInReplacementStrategyFactory),
+            true,
         )
     }
 
@@ -44,6 +64,24 @@ impl SimulationEngine {
         path: impl AsRef<Path>,
         split: DatasetSplit,
         replacement_factory: Box<dyn ReplacementStrategyFactory>,
+    ) -> Result<Self> {
+        Self::evaluate_checkpoint_with_options(
+            config,
+            data,
+            path,
+            split,
+            replacement_factory,
+            false,
+        )
+    }
+
+    fn evaluate_checkpoint_with_options(
+        config: Config,
+        data: MarketDataset,
+        path: impl AsRef<Path>,
+        split: DatasetSplit,
+        replacement_factory: Box<dyn ReplacementStrategyFactory>,
+        reset_lifetime_to_genome: bool,
     ) -> Result<Self> {
         let cp = checkpoint::load_for_evaluation(path)?;
         checkpoint::validate_dataset(&cp, &data.identity)?;
@@ -93,6 +131,7 @@ impl SimulationEngine {
                     .simulation
                     .seed_derivation
                     .then_evaluation_seed(engine.config.simulation.seed, agent_id.0),
+                reset_lifetime_to_genome,
             )?;
             let mut agent = factory.restore(
                 state,
@@ -146,11 +185,21 @@ fn reset_evaluation_snapshot(
     snapshot: PolicySnapshot,
     maximum_trade_fraction: f64,
     evaluation_seed: Option<u64>,
+    reset_lifetime_to_genome: bool,
 ) -> Result<PolicySnapshot> {
     match snapshot {
         PolicySnapshot::Neural {
             genome, state, rng, ..
         } => {
+            if reset_lifetime_to_genome
+                && matches!(state.as_ref(), NeuralModelState::External { .. })
+            {
+                return Err(MidasError::Policy(
+                    "external neural state has no genome-parameter baseline".into(),
+                ));
+            }
+            let genome_parameters = reset_lifetime_to_genome
+                .then(|| Box::new(LifetimeParameters::from_genome(&genome)));
             let state = match *state {
                 NeuralModelState::Burn {
                     parameters,
@@ -160,7 +209,7 @@ fn reset_evaluation_snapshot(
                     runtime.memory.fill(0.0);
                     runtime.inference_steps = 0;
                     NeuralModelState::Burn {
-                        parameters,
+                        parameters: genome_parameters.clone().unwrap_or(parameters),
                         runtime,
                         optimizer,
                     }
@@ -173,7 +222,7 @@ fn reset_evaluation_snapshot(
                     runtime.memory.fill(0.0);
                     runtime.inference_steps = 0;
                     NeuralModelState::BurnTrainableEncoder {
-                        parameters,
+                        parameters: genome_parameters.clone().unwrap_or(parameters),
                         runtime,
                         optimizer,
                     }
@@ -186,7 +235,7 @@ fn reset_evaluation_snapshot(
                     runtime.memory.fill(0.0);
                     runtime.inference_steps = 0;
                     NeuralModelState::BurnBptt {
-                        parameters,
+                        parameters: genome_parameters.clone().unwrap_or(parameters),
                         runtime,
                         optimizer,
                     }
@@ -199,7 +248,7 @@ fn reset_evaluation_snapshot(
                     runtime.memory.fill(0.0);
                     runtime.inference_steps = 0;
                     NeuralModelState::BurnAdamW {
-                        parameters,
+                        parameters: genome_parameters.clone().unwrap_or(parameters),
                         runtime,
                         optimizer,
                     }

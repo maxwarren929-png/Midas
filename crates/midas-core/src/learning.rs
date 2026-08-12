@@ -4,6 +4,7 @@ use crate::{
     brain::{NeuralRuntimeState, PolicyActionSample},
     config::{LearningConfig, OptimizerConfig},
     observation::Observation,
+    reward::RewardBreakdown,
 };
 use chrono::NaiveDate;
 use rand::{Rng, SeedableRng};
@@ -48,12 +49,107 @@ pub struct PpoTrainingSample {
     pub tradable: Vec<bool>,
     pub temperature: Option<f32>,
     pub invalid_action: bool,
+    /// Report-only centered component contributions in the same normalized
+    /// units as `advantage`. Training ignores this field.
+    pub counterfactual_advantages: Option<CounterfactualAdvantages>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct CounterfactualAdvantages {
+    pub raw_return: f32,
+    pub drawdown_cost: f32,
+    pub turnover_cost: f32,
+    pub other_cost: f32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PpoTrainingBatch {
     pub samples: Vec<PpoTrainingSample>,
     pub sequence_length: usize,
+    /// Report-only attribution computed before samples are shuffled.
+    pub advantage_diagnostics: Option<Box<PpoAdvantageDiagnostics>>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct AdvantageComponentDiagnostics {
+    pub mean: f64,
+    pub standard_deviation: f64,
+    pub covariance_with_pre_normalization_advantage: f64,
+    pub correlation_with_pre_normalization_advantage: f64,
+    pub projection_on_pre_normalization_advantage: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PpoAdvantageDiagnostics {
+    /// False only for the first update after restoring a non-empty rollout,
+    /// because report-only reward decomposition is excluded from checkpoints.
+    pub complete: bool,
+    pub actor_sample_count: usize,
+    pub pre_normalization_mean: f64,
+    pub pre_normalization_standard_deviation: f64,
+    pub post_normalization_mean: f64,
+    pub post_normalization_standard_deviation: f64,
+    pub normalization_scale: f64,
+    pub sign_flip_fraction: f64,
+    pub rank_inversions: u64,
+    pub raw_return: AdvantageComponentDiagnostics,
+    pub drawdown_cost: AdvantageComponentDiagnostics,
+    pub turnover_cost: AdvantageComponentDiagnostics,
+    pub other_cost: AdvantageComponentDiagnostics,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ActorGradientComponentDiagnostics {
+    pub norm: f64,
+    pub cosine_with_actual_policy_gradient: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ActorGradientAttribution {
+    pub actual_policy_gradient_norm: f64,
+    pub raw_return: ActorGradientComponentDiagnostics,
+    pub drawdown_cost: ActorGradientComponentDiagnostics,
+    pub turnover_cost: ActorGradientComponentDiagnostics,
+    pub other_cost: ActorGradientComponentDiagnostics,
+    pub raw_return_drawdown_cosine: f64,
+    pub raw_return_turnover_cosine: f64,
+    pub drawdown_turnover_cosine: f64,
+}
+
+impl ActorGradientAttribution {
+    pub fn accumulate(&mut self, other: &Self) {
+        self.actual_policy_gradient_norm += other.actual_policy_gradient_norm;
+        self.raw_return.norm += other.raw_return.norm;
+        self.raw_return.cosine_with_actual_policy_gradient +=
+            other.raw_return.cosine_with_actual_policy_gradient;
+        self.drawdown_cost.norm += other.drawdown_cost.norm;
+        self.drawdown_cost.cosine_with_actual_policy_gradient +=
+            other.drawdown_cost.cosine_with_actual_policy_gradient;
+        self.turnover_cost.norm += other.turnover_cost.norm;
+        self.turnover_cost.cosine_with_actual_policy_gradient +=
+            other.turnover_cost.cosine_with_actual_policy_gradient;
+        self.other_cost.norm += other.other_cost.norm;
+        self.other_cost.cosine_with_actual_policy_gradient +=
+            other.other_cost.cosine_with_actual_policy_gradient;
+        self.raw_return_drawdown_cosine += other.raw_return_drawdown_cosine;
+        self.raw_return_turnover_cosine += other.raw_return_turnover_cosine;
+        self.drawdown_turnover_cosine += other.drawdown_turnover_cosine;
+    }
+
+    pub fn divide(&mut self, divisor: f64) {
+        self.actual_policy_gradient_norm /= divisor;
+        self.raw_return.norm /= divisor;
+        self.raw_return.cosine_with_actual_policy_gradient /= divisor;
+        self.drawdown_cost.norm /= divisor;
+        self.drawdown_cost.cosine_with_actual_policy_gradient /= divisor;
+        self.turnover_cost.norm /= divisor;
+        self.turnover_cost.cosine_with_actual_policy_gradient /= divisor;
+        self.other_cost.norm /= divisor;
+        self.other_cost.cosine_with_actual_policy_gradient /= divisor;
+        self.raw_return_drawdown_cosine /= divisor;
+        self.raw_return_turnover_cosine /= divisor;
+        self.drawdown_turnover_cosine /= divisor;
+    }
 }
 impl PpoTrainingBatch {
     pub fn len(&self) -> usize {
@@ -91,6 +187,7 @@ pub struct TrainingMetrics {
     pub approximate_kl: f32,
     pub clip_fraction: f32,
     pub update_index: u64,
+    pub actor_gradient_attribution: Option<ActorGradientAttribution>,
 }
 impl TrainingMetrics {
     pub fn empty() -> Self {
@@ -114,6 +211,7 @@ impl TrainingMetrics {
             approximate_kl: 0.0,
             clip_fraction: 0.0,
             update_index: 0,
+            actor_gradient_attribution: None,
         }
     }
 }
@@ -127,6 +225,13 @@ pub struct EpisodeEndContext {
 
 pub trait LearningStrategy: Send {
     fn observe_transition(&mut self, transition: Transition) -> Result<LearningUpdate>;
+    fn observe_transition_with_diagnostics(
+        &mut self,
+        transition: Transition,
+        _reward_breakdown: RewardBreakdown,
+    ) -> Result<LearningUpdate> {
+        self.observe_transition(transition)
+    }
     fn end_episode(&mut self, context: &EpisodeEndContext) -> Result<LearningUpdate>;
     fn commit_update(&mut self) -> Result<()>;
     fn snapshot(&self) -> Result<LearningStrategyState>;
@@ -248,6 +353,8 @@ pub struct PpoLearning {
     rng: ChaCha8Rng,
     update_index: u64,
     pending_update: bool,
+    diagnostic_rewards: Vec<RewardBreakdown>,
+    diagnostic_rewards_complete: bool,
 }
 impl PpoLearning {
     pub fn new(config: LearningConfig, seed: u64) -> Result<Self> {
@@ -265,13 +372,16 @@ impl PpoLearning {
             ));
         }
         config.validate()?;
+        let rollout_length = config.rollout_length;
         Ok(Self {
-            rollout: RolloutBuffer::new(config.rollout_length)?,
+            rollout: RolloutBuffer::new(rollout_length)?,
             config,
             optimizer,
             rng: ChaCha8Rng::seed_from_u64(seed),
             update_index: 0,
             pending_update: false,
+            diagnostic_rewards: Vec::with_capacity(rollout_length),
+            diagnostic_rewards_complete: true,
         })
     }
     pub fn config(&self) -> &LearningConfig {
@@ -290,6 +400,7 @@ impl PpoLearning {
         }
         let (advantages, returns) =
             generalized_advantages_masked(transitions, self.config.gamma, self.config.gae_lambda)?;
+        let pre_normalization_advantages = advantages.clone();
         let mut samples = transitions
             .iter()
             .enumerate()
@@ -332,6 +443,7 @@ impl PpoLearning {
                         tradable: transition.tradable.clone(),
                         temperature: actor_sample.as_ref().map(|sample| sample.2),
                         invalid_action: transition.invalid_action,
+                        counterfactual_advantages: None,
                     },
                 ))
             })
@@ -340,6 +452,7 @@ impl PpoLearning {
             self.pending_update = true;
             return Ok(LearningUpdate::None);
         }
+        let mut advantage_normalization_scale = 1.0_f32;
         if self.config.normalize_advantages {
             let actor_count = samples
                 .iter()
@@ -357,11 +470,26 @@ impl PpoLearning {
                 .sum::<f32>()
                 / actor_count.max(1) as f32;
             let standard_deviation = variance.sqrt().max(1e-8);
+            advantage_normalization_scale = standard_deviation.recip();
             for (_, sample) in &mut samples {
                 if let Some(advantage) = sample.advantage {
                     sample.advantage = Some((advantage - mean) / standard_deviation);
                 }
             }
+        }
+        let (advantage_diagnostics, counterfactual_advantages) = build_advantage_diagnostics(
+            transitions,
+            &self.diagnostic_rewards,
+            self.diagnostic_rewards_complete,
+            &pre_normalization_advantages,
+            &samples,
+            self.config.gamma,
+            self.config.gae_lambda,
+            self.config.normalize_advantages,
+            advantage_normalization_scale,
+        )?;
+        for (source_index, sample) in &mut samples {
+            sample.counterfactual_advantages = counterfactual_advantages[*source_index];
         }
         // Build explicit recurrent sequences before shuffling. A masked source
         // transition creates an index gap and therefore a hard BPTT boundary.
@@ -396,22 +524,46 @@ impl PpoLearning {
         Ok(LearningUpdate::Ppo(PpoTrainingBatch {
             samples: shuffled,
             sequence_length: self.config.sequence_length,
+            advantage_diagnostics: Some(Box::new(advantage_diagnostics)),
         }))
     }
-}
-impl LearningStrategy for PpoLearning {
-    fn observe_transition(&mut self, transition: Transition) -> Result<LearningUpdate> {
+
+    fn observe_transition_internal(
+        &mut self,
+        transition: Transition,
+        reward_breakdown: RewardBreakdown,
+        diagnostics_complete: bool,
+    ) -> Result<LearningUpdate> {
         if self.pending_update {
             return Err(MidasError::Policy(
                 "previous PPO update must be committed before observing more transitions".into(),
             ));
         }
-        self.rollout.push(transition)?;
+        let previous_complete = self.diagnostic_rewards_complete;
+        self.diagnostic_rewards.push(reward_breakdown);
+        self.diagnostic_rewards_complete &= diagnostics_complete;
+        if let Err(error) = self.rollout.push(transition) {
+            self.diagnostic_rewards.pop();
+            self.diagnostic_rewards_complete = previous_complete;
+            return Err(error);
+        }
         if self.rollout.len() >= self.config.rollout_length {
             self.make_update()
         } else {
             Ok(LearningUpdate::None)
         }
+    }
+}
+impl LearningStrategy for PpoLearning {
+    fn observe_transition(&mut self, transition: Transition) -> Result<LearningUpdate> {
+        self.observe_transition_internal(transition, RewardBreakdown::default(), false)
+    }
+    fn observe_transition_with_diagnostics(
+        &mut self,
+        transition: Transition,
+        reward_breakdown: RewardBreakdown,
+    ) -> Result<LearningUpdate> {
+        self.observe_transition_internal(transition, reward_breakdown, true)
     }
     fn end_episode(&mut self, _: &EpisodeEndContext) -> Result<LearningUpdate> {
         if self.pending_update {
@@ -424,6 +576,8 @@ impl LearningStrategy for PpoLearning {
     fn commit_update(&mut self) -> Result<()> {
         if self.pending_update {
             self.rollout.clear();
+            self.diagnostic_rewards.clear();
+            self.diagnostic_rewards_complete = true;
             self.pending_update = false;
             self.update_index = self.update_index.saturating_add(1);
         }
@@ -446,6 +600,8 @@ impl LearningStrategy for PpoLearning {
             rng: self.rng.clone(),
             update_index: self.update_index,
             pending_update: self.pending_update,
+            diagnostic_rewards: self.diagnostic_rewards.clone(),
+            diagnostic_rewards_complete: self.diagnostic_rewards_complete,
         }))
     }
     fn name(&self) -> &'static str {
@@ -497,6 +653,8 @@ pub fn learning_from_state(
             Ok(Box::new(PpoLearning {
                 config,
                 optimizer: optimizer.clone(),
+                diagnostic_rewards: vec![RewardBreakdown::default(); rollout.len()],
+                diagnostic_rewards_complete: rollout.is_empty(),
                 rollout,
                 rng,
                 update_index,
@@ -504,6 +662,241 @@ pub fn learning_from_state(
             }))
         }
     }
+}
+
+fn reward_signal_returns(
+    transitions: &[Transition],
+    rewards: &[f64],
+    gamma: f32,
+    gae_lambda: f32,
+) -> Result<Vec<f64>> {
+    if transitions.len() != rewards.len() || rewards.iter().any(|value| !value.is_finite()) {
+        return Err(MidasError::Policy(
+            "advantage diagnostics have invalid reward components".into(),
+        ));
+    }
+    let fully_valued = transitions.iter().all(|transition| {
+        transition.critic_eligible
+            && transition.value_estimate.is_some()
+            && transition.next_value.is_some()
+    });
+    let discount = f64::from(if fully_valued {
+        gamma * gae_lambda
+    } else {
+        gamma
+    });
+    let mut signals = vec![0.0; transitions.len()];
+    let mut next = 0.0;
+    for index in (0..transitions.len()).rev() {
+        let transition = &transitions[index];
+        if transition.done && !transition.truncated {
+            next = rewards[index];
+        } else {
+            next = rewards[index] + discount * next;
+        }
+        signals[index] = next;
+    }
+    Ok(signals)
+}
+
+fn population_moments(values: &[f64]) -> (f64, f64) {
+    if values.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let variance = values
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / values.len() as f64;
+    (mean, variance.max(0.0).sqrt())
+}
+
+fn component_diagnostics(
+    component: &[f64],
+    pre_normalization_advantages: &[f64],
+) -> AdvantageComponentDiagnostics {
+    let (mean, standard_deviation) = population_moments(component);
+    let (advantage_mean, advantage_standard_deviation) =
+        population_moments(pre_normalization_advantages);
+    let covariance = if component.is_empty() {
+        0.0
+    } else {
+        component
+            .iter()
+            .zip(pre_normalization_advantages)
+            .map(|(value, advantage)| (value - mean) * (advantage - advantage_mean))
+            .sum::<f64>()
+            / component.len() as f64
+    };
+    let correlation = if standard_deviation > 0.0 && advantage_standard_deviation > 0.0 {
+        covariance / (standard_deviation * advantage_standard_deviation)
+    } else {
+        0.0
+    };
+    let advantage_variance = advantage_standard_deviation.powi(2);
+    AdvantageComponentDiagnostics {
+        mean,
+        standard_deviation,
+        covariance_with_pre_normalization_advantage: covariance,
+        correlation_with_pre_normalization_advantage: correlation,
+        projection_on_pre_normalization_advantage: if advantage_variance > 0.0 {
+            covariance / advantage_variance
+        } else {
+            0.0
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_advantage_diagnostics(
+    transitions: &[Transition],
+    breakdowns: &[RewardBreakdown],
+    complete: bool,
+    pre_normalization_advantages: &[Option<f32>],
+    samples: &[(usize, PpoTrainingSample)],
+    gamma: f32,
+    gae_lambda: f32,
+    center_components: bool,
+    normalization_scale: f32,
+) -> Result<(
+    PpoAdvantageDiagnostics,
+    Vec<Option<CounterfactualAdvantages>>,
+)> {
+    if transitions.len() != breakdowns.len()
+        || transitions.len() != pre_normalization_advantages.len()
+    {
+        return Err(MidasError::Policy(
+            "advantage diagnostics are not aligned with the rollout".into(),
+        ));
+    }
+    let raw_rewards = breakdowns
+        .iter()
+        .map(|breakdown| breakdown.raw_log_return)
+        .collect::<Vec<_>>();
+    let drawdown_rewards = breakdowns
+        .iter()
+        .map(|breakdown| -breakdown.drawdown_penalty)
+        .collect::<Vec<_>>();
+    let turnover_rewards = breakdowns
+        .iter()
+        .map(|breakdown| -breakdown.turnover_penalty)
+        .collect::<Vec<_>>();
+    let other_rewards = breakdowns
+        .iter()
+        .map(|breakdown| {
+            f64::from(breakdown.clipped_total) - breakdown.raw_log_return
+                + breakdown.drawdown_penalty
+                + breakdown.turnover_penalty
+        })
+        .collect::<Vec<_>>();
+    let raw_signals = reward_signal_returns(transitions, &raw_rewards, gamma, gae_lambda)?;
+    let drawdown_signals =
+        reward_signal_returns(transitions, &drawdown_rewards, gamma, gae_lambda)?;
+    let turnover_signals =
+        reward_signal_returns(transitions, &turnover_rewards, gamma, gae_lambda)?;
+    let other_signals = reward_signal_returns(transitions, &other_rewards, gamma, gae_lambda)?;
+
+    let mut indices = Vec::new();
+    let mut pre = Vec::new();
+    let mut post = Vec::new();
+    for (source_index, sample) in samples {
+        let Some(post_advantage) = sample.advantage else {
+            continue;
+        };
+        let Some(pre_advantage) = pre_normalization_advantages[*source_index] else {
+            continue;
+        };
+        indices.push(*source_index);
+        pre.push(f64::from(pre_advantage));
+        post.push(f64::from(post_advantage));
+    }
+    let select = |signals: &[f64]| {
+        indices
+            .iter()
+            .map(|index| signals[*index])
+            .collect::<Vec<_>>()
+    };
+    let (pre_mean, pre_standard_deviation) = population_moments(&pre);
+    let (post_mean, post_standard_deviation) = population_moments(&post);
+    let sign_flips = pre
+        .iter()
+        .zip(&post)
+        .filter(|(before, after)| (**before >= 0.0) != (**after >= 0.0))
+        .count();
+    let mut rank_inversions = 0_u64;
+    for left in 0..pre.len() {
+        for right in left + 1..pre.len() {
+            if (pre[left] - pre[right]) * (post[left] - post[right]) < 0.0 {
+                rank_inversions = rank_inversions.saturating_add(1);
+            }
+        }
+    }
+    let raw = select(&raw_signals);
+    let drawdown = select(&drawdown_signals);
+    let turnover = select(&turnover_signals);
+    let other = select(&other_signals);
+    let (raw_mean, _) = population_moments(&raw);
+    let (drawdown_mean, _) = population_moments(&drawdown);
+    let (turnover_mean, _) = population_moments(&turnover);
+    let (other_mean, _) = population_moments(&other);
+    let mut counterfactual = vec![None; transitions.len()];
+    if complete {
+        let scale_component = |value: f64, mean: f64| {
+            let centered = if center_components {
+                value - mean
+            } else {
+                value
+            };
+            (centered * f64::from(normalization_scale)) as f32
+        };
+        for (position, source_index) in indices.iter().enumerate() {
+            let values = CounterfactualAdvantages {
+                raw_return: scale_component(raw[position], raw_mean),
+                drawdown_cost: scale_component(drawdown[position], drawdown_mean),
+                turnover_cost: scale_component(turnover[position], turnover_mean),
+                other_cost: scale_component(other[position], other_mean),
+            };
+            if [
+                values.raw_return,
+                values.drawdown_cost,
+                values.turnover_cost,
+                values.other_cost,
+            ]
+            .iter()
+            .any(|value| !value.is_finite())
+            {
+                return Err(MidasError::Policy(
+                    "counterfactual advantage is non-finite".into(),
+                ));
+            }
+            counterfactual[*source_index] = Some(values);
+        }
+    }
+    let diagnostics = PpoAdvantageDiagnostics {
+        complete,
+        actor_sample_count: pre.len(),
+        pre_normalization_mean: pre_mean,
+        pre_normalization_standard_deviation: pre_standard_deviation,
+        post_normalization_mean: post_mean,
+        post_normalization_standard_deviation: post_standard_deviation,
+        normalization_scale: if pre_standard_deviation > 0.0 {
+            post_standard_deviation / pre_standard_deviation
+        } else {
+            0.0
+        },
+        sign_flip_fraction: if pre.is_empty() {
+            0.0
+        } else {
+            sign_flips as f64 / pre.len() as f64
+        },
+        rank_inversions,
+        raw_return: component_diagnostics(&raw, &pre),
+        drawdown_cost: component_diagnostics(&drawdown, &pre),
+        turnover_cost: component_diagnostics(&turnover, &pre),
+        other_cost: component_diagnostics(&other, &pre),
+    };
+    Ok((diagnostics, counterfactual))
 }
 
 pub fn generalized_advantages(
@@ -864,6 +1257,113 @@ mod tests {
     }
 
     #[test]
+    fn reward_component_diagnostics_do_not_change_ppo_batch_or_state() {
+        let config = LearningConfig {
+            implementation: crate::config::LearningKind::Ppo,
+            learning_rate: 0.001,
+            gamma: 1.0,
+            gae_lambda: 1.0,
+            ppo_clip: 0.2,
+            critic_coefficient: 0.5,
+            entropy_coefficient: 0.01,
+            gradient_clip: 1.0,
+            rollout_length: 2,
+            minibatch_size: 1,
+            sequence_length: 1,
+            normalize_advantages: true,
+            optimisation_epochs: 1,
+        };
+        let mut control = PpoLearning::new(config.clone(), 23).unwrap();
+        let mut instrumented = PpoLearning::new(config, 23).unwrap();
+        let breakdowns = [
+            RewardBreakdown {
+                raw_log_return: 0.01,
+                drawdown_penalty: 0.001,
+                turnover_penalty: 0.002,
+                unclipped_total: 0.007,
+                clipped_total: 0.007,
+                ..RewardBreakdown::default()
+            },
+            RewardBreakdown {
+                raw_log_return: 0.02,
+                turnover_penalty: 0.003,
+                unclipped_total: 0.017,
+                clipped_total: 0.017,
+                ..RewardBreakdown::default()
+            },
+        ];
+
+        let first = transition(0.007, 0.0, 0.0, false);
+        let second = transition(0.017, 0.0, 0.0, true);
+        assert!(matches!(
+            control.observe_transition(first.clone()).unwrap(),
+            LearningUpdate::None
+        ));
+        assert!(matches!(
+            instrumented
+                .observe_transition_with_diagnostics(first, breakdowns[0])
+                .unwrap(),
+            LearningUpdate::None
+        ));
+        let LearningUpdate::Ppo(control_batch) =
+            control.observe_transition(second.clone()).unwrap()
+        else {
+            panic!("control did not produce a PPO batch")
+        };
+        let LearningUpdate::Ppo(instrumented_batch) = instrumented
+            .observe_transition_with_diagnostics(second, breakdowns[1])
+            .unwrap()
+        else {
+            panic!("instrumented learner did not produce a PPO batch")
+        };
+        let mut control_samples = control_batch.samples.clone();
+        let mut instrumented_samples = instrumented_batch.samples.clone();
+        for sample in &mut control_samples {
+            sample.counterfactual_advantages = None;
+        }
+        for sample in &mut instrumented_samples {
+            sample.counterfactual_advantages = None;
+        }
+        assert_eq!(control_samples, instrumented_samples);
+        assert_eq!(
+            control_batch.sequence_length,
+            instrumented_batch.sequence_length
+        );
+        assert_eq!(
+            control.snapshot().unwrap(),
+            instrumented.snapshot().unwrap()
+        );
+
+        let diagnostics = instrumented_batch.advantage_diagnostics.unwrap();
+        assert!(diagnostics.complete);
+        assert_eq!(diagnostics.actor_sample_count, 2);
+        assert!((diagnostics.pre_normalization_mean - 0.0205).abs() < 1e-6);
+        assert!((diagnostics.pre_normalization_standard_deviation - 0.0035).abs() < 1e-6);
+        assert!(diagnostics.post_normalization_mean.abs() < 1e-6);
+        assert!((diagnostics.post_normalization_standard_deviation - 1.0).abs() < 1e-6);
+        assert!((diagnostics.sign_flip_fraction - 0.5).abs() < 1e-12);
+        assert_eq!(diagnostics.rank_inversions, 0);
+        assert!((diagnostics.raw_return.standard_deviation - 0.005).abs() < 1e-12);
+        assert!((diagnostics.drawdown_cost.standard_deviation - 0.0005).abs() < 1e-12);
+        assert!((diagnostics.turnover_cost.standard_deviation - 0.001).abs() < 1e-12);
+        for sample in &instrumented_batch.samples {
+            let counterfactual = sample.counterfactual_advantages.unwrap();
+            let component_sum = counterfactual.raw_return
+                + counterfactual.drawdown_cost
+                + counterfactual.turnover_cost
+                + counterfactual.other_cost;
+            assert!((component_sum - sample.advantage.unwrap()).abs() < 1e-5);
+        }
+
+        control.commit_update().unwrap();
+        instrumented.commit_update().unwrap();
+        assert_eq!(
+            control.snapshot().unwrap(),
+            instrumented.snapshot().unwrap()
+        );
+    }
+
+    #[test]
     fn restored_ppo_state_is_validated_before_use() {
         let config = LearningConfig {
             implementation: crate::config::LearningKind::Ppo,
@@ -898,6 +1398,54 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("rollout capacity"));
+    }
+
+    #[test]
+    fn restored_partial_rollout_marks_first_signal_diagnostic_incomplete() {
+        let config = LearningConfig {
+            implementation: crate::config::LearningKind::Ppo,
+            learning_rate: 0.001,
+            gamma: 0.99,
+            gae_lambda: 0.95,
+            ppo_clip: 0.2,
+            critic_coefficient: 0.5,
+            entropy_coefficient: 0.01,
+            gradient_clip: 1.0,
+            rollout_length: 2,
+            minibatch_size: 1,
+            sequence_length: 1,
+            normalize_advantages: true,
+            optimisation_epochs: 1,
+        };
+        let mut learner = PpoLearning::new(config, 31).unwrap();
+        learner
+            .observe_transition_with_diagnostics(
+                transition(0.01, 0.0, 0.0, false),
+                RewardBreakdown {
+                    raw_log_return: 0.01,
+                    unclipped_total: 0.01,
+                    clipped_total: 0.01,
+                    ..RewardBreakdown::default()
+                },
+            )
+            .unwrap();
+        let mut restored = learning_from_state(learner.snapshot().unwrap(), &Default::default())
+            .expect("restore partial rollout");
+        let LearningUpdate::Ppo(batch) = restored
+            .observe_transition_with_diagnostics(
+                transition(0.02, 0.0, 0.0, true),
+                RewardBreakdown {
+                    raw_log_return: 0.02,
+                    unclipped_total: 0.02,
+                    clipped_total: 0.02,
+                    ..RewardBreakdown::default()
+                },
+            )
+            .unwrap()
+        else {
+            panic!("restored rollout did not update")
+        };
+        assert!(!batch.advantage_diagnostics.unwrap().complete);
     }
 
     #[test]

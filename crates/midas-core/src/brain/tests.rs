@@ -12,7 +12,7 @@ use crate::{
         ActionDistributionConfig, Activation, EvolvableTraitsConfig, LearningConfig, LearningKind,
         OptimizerConfig,
     },
-    learning::{PpoTrainingBatch, PpoTrainingSample},
+    learning::{CounterfactualAdvantages, PpoTrainingBatch, PpoTrainingSample},
     observation::Observation,
 };
 use rand::{Rng, SeedableRng};
@@ -87,6 +87,7 @@ fn ppo_sample(
         tradable: vec![true],
         temperature: Some(1.0),
         invalid_action: false,
+        counterfactual_advantages: None,
     }
 }
 
@@ -208,8 +209,10 @@ fn burn_training_changes_lifetime_parameters_without_changing_genome() {
             tradable: vec![true],
             temperature: Some(1.0),
             invalid_action: false,
+            counterfactual_advantages: None,
         }],
         sequence_length: 1,
+        advantage_diagnostics: None,
     };
     let metrics = model
         .train_batch(&batch, &learning_config(), &optimizer_config())
@@ -323,6 +326,7 @@ fn ppo_head_learning_changes_actor_weights_regression() {
     let batch = PpoTrainingBatch {
         samples: vec![ppo_sample(vec![0.8, 0.3], 1, 1.0, 0.5, -0.7)],
         sequence_length: 1,
+        advantage_diagnostics: None,
     };
 
     model
@@ -349,6 +353,7 @@ fn bptt_training_updates_hidden_recurrent_and_heads_but_freezes_genome() {
     let batch = PpoTrainingBatch {
         samples: vec![ppo_sample(vec![0.6, -0.2], 1, 1.0, 2.0, -0.7)],
         sequence_length: 1,
+        advantage_diagnostics: None,
     };
     model
         .train_batch(&batch, &learning_config(), &optimizer_config())
@@ -406,6 +411,7 @@ fn adamw_uses_bias_corrected_moments_decoupled_weight_decay_and_restores() {
     let batch = PpoTrainingBatch {
         samples: vec![ppo_sample(vec![0.6, -0.2], 1, 1.0, 2.0, -0.7)],
         sequence_length: 1,
+        advantage_diagnostics: None,
     };
     model
         .train_batch(&batch, &config, &optimizer_config)
@@ -671,6 +677,7 @@ fn clipped_policy_gradient_suppresses_head_update_but_keeps_objective_valid() {
             &PpoTrainingBatch {
                 samples: vec![sample],
                 sequence_length: 1,
+                advantage_diagnostics: None,
             },
             &config,
             &optimizer_config(),
@@ -680,6 +687,40 @@ fn clipped_policy_gradient_suppresses_head_update_but_keeps_objective_valid() {
     assert_eq!(before.actor, after.actor);
     assert_eq!(before.critic, after.critic);
     assert_eq!(metrics.gradient_norm, 0.0);
+}
+
+#[test]
+fn actor_gradient_attribution_reuses_exact_policy_gradient_geometry() {
+    let mut model = deterministic_head_model();
+    let mut config = learning_config();
+    config.ppo_clip = 10.0;
+    config.critic_coefficient = 0.0;
+    config.entropy_coefficient = 0.0;
+    config.gradient_clip = 100.0;
+    let mut sample = ppo_sample(vec![1.0, 0.0], 1, 1.0, 0.0, -std::f32::consts::LN_2);
+    sample.counterfactual_advantages = Some(CounterfactualAdvantages {
+        raw_return: 1.0,
+        ..CounterfactualAdvantages::default()
+    });
+    let metrics = model
+        .train_batch(
+            &PpoTrainingBatch {
+                samples: vec![sample],
+                sequence_length: 1,
+                advantage_diagnostics: None,
+            },
+            &config,
+            &optimizer_config(),
+        )
+        .unwrap();
+    let attribution = metrics
+        .actor_gradient_attribution
+        .expect("actor-gradient attribution");
+    assert!(attribution.actual_policy_gradient_norm > 0.0);
+    assert!((attribution.raw_return.norm - attribution.actual_policy_gradient_norm).abs() < 1e-8);
+    assert!((attribution.raw_return.cosine_with_actual_policy_gradient - 1.0).abs() < 1e-8);
+    assert_eq!(attribution.drawdown_cost.norm, 0.0);
+    assert_eq!(attribution.turnover_cost.norm, 0.0);
 }
 
 #[test]
@@ -699,6 +740,7 @@ fn actor_learning_is_state_dependent_for_two_encoded_states() {
             ppo_sample(vec![-1.0, 0.0], 0, 1.0, 0.0, -std::f32::consts::LN_2),
         ],
         sequence_length: 1,
+        advantage_diagnostics: None,
     };
     model
         .train_batch(&batch, &config, &optimizer_config())
@@ -781,6 +823,7 @@ fn critic_learning_is_state_dependent_for_two_encoded_states() {
             ppo_sample(vec![-1.0, 0.0], 0, 0.0, -2.0, -std::f32::consts::LN_2),
         ],
         sequence_length: 1,
+        advantage_diagnostics: None,
     };
     model
         .train_batch(&batch, &config, &optimizer_config())

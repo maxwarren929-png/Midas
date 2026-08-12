@@ -8,7 +8,7 @@ use midas_core::{
         EvolutionReplacementOutcome, EvolutionaryReplacementStrategy, LivingAgentSummary,
         ReplacementContext, ReplacementStrategy,
     },
-    simulation::{DatasetSplit, SimulationEngine, SimulationLifecycle},
+    simulation::{DatasetSplit, ReportTrace, SimulationEngine, SimulationLifecycle},
 };
 use std::path::PathBuf;
 
@@ -84,8 +84,8 @@ fn frozen_evaluation_reuses_trained_checkpoint_without_learning() {
     training.save_checkpoint(checkpoint.path()).unwrap();
 
     let mut evaluation = SimulationEngine::evaluate_checkpoint(
-        config,
-        data,
+        config.clone(),
+        data.clone(),
         checkpoint.path(),
         DatasetSplit::Validation,
     )
@@ -95,6 +95,25 @@ fn frozen_evaluation_reuses_trained_checkpoint_without_learning() {
     assert_eq!(report.learning_implementation, "no_learning");
     assert_eq!(report.learning_updates, 0);
     assert_eq!(report.lifecycle, SimulationLifecycle::Completed);
+
+    let baseline = SimulationEngine::evaluate_checkpoint_genome_baseline(
+        config,
+        data,
+        checkpoint.path(),
+        DatasetSplit::Validation,
+    )
+    .unwrap();
+    for state in baseline.agents() {
+        let genome = state.genome.as_ref().unwrap();
+        let lifetime = baseline
+            .agent_lifetime_parameters(state.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lifetime.hidden, genome.hidden);
+        assert_eq!(lifetime.recurrent, genome.recurrent);
+        assert_eq!(lifetime.actor, genome.actor);
+        assert_eq!(lifetime.critic, genome.critic);
+    }
 }
 
 #[test]
@@ -116,6 +135,15 @@ fn prompt2_ppo_updates_hidden_recurrent_and_head_parameters() {
         .unwrap();
 
     engine.run_steps(4).unwrap();
+
+    let signal_diagnostics = engine.report_traces.iter().find_map(|trace| match trace {
+        ReportTrace::PpoUpdate(update) => update.advantage_diagnostics.as_ref(),
+        ReportTrace::Decision(_) => None,
+    });
+    let signal_diagnostics = signal_diagnostics.expect("PPO advantage signal diagnostics");
+    assert!(signal_diagnostics.complete);
+    assert!(signal_diagnostics.actor_sample_count > 0);
+    assert_eq!(signal_diagnostics.rank_inversions, 0);
 
     let after = engine
         .agent_lifetime_parameters(agent_id)

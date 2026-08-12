@@ -185,6 +185,7 @@ impl SimulationEngine {
         let current = agent.state.portfolio.net_worth;
         let bankrupt = current <= self.config.simulation.bankruptcy_threshold;
         agent.state.age += 1;
+        let previous_maximum_drawdown = agent.state.maximum_drawdown;
         agent.state.maximum_net_worth = agent.state.maximum_net_worth.max(current);
         if agent.state.maximum_net_worth > 0.0 {
             agent.state.maximum_drawdown = agent
@@ -204,6 +205,7 @@ impl SimulationEngine {
         let reward_context = RewardContext {
             previous_net_worth: previous,
             current_net_worth: current,
+            previous_maximum_drawdown,
             maximum_drawdown: agent.state.maximum_drawdown,
             turnover: (agent.state.portfolio.cumulative_turnover - turnover_before).max(0.0),
             bankrupt,

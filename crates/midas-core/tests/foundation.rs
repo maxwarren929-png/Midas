@@ -14,7 +14,7 @@ use midas_core::{
     },
     config::{
         Config, CorporateActionConfig, CorporateActionMode, DeathHandling, EvolutionFallback,
-        LearningKind, ObservationFeatureKind, PolicyFailureBehavior, PolicyKind,
+        LearningKind, ObservationFeatureKind, PolicyFailureBehavior, PolicyKind, RewardKind,
     },
     evolution::FitnessScore,
     execution::{
@@ -35,7 +35,8 @@ use midas_core::{
         ReplacementStrategyState,
     },
     simulation::{
-        CHECKPOINT_VERSION, DatasetSplit, DomainEvent, SimulationEngine, SimulationLifecycle,
+        CHECKPOINT_VERSION, DatasetSplit, DomainEvent, ReportTrace, SimulationEngine,
+        SimulationLifecycle,
     },
 };
 use proptest::prelude::*;

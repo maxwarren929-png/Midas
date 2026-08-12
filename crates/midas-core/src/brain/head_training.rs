@@ -36,6 +36,7 @@ pub(super) fn train_burn_encoder(
                 let minibatch = crate::learning::PpoTrainingBatch {
                     samples: batch.samples[range.clone()].to_vec(),
                     sequence_length: batch.sequence_length,
+                    advantage_diagnostics: None,
                 };
                 let metrics = train_burn_encoder_inner(model, &minibatch, config, optimizer)?;
                 aggregate.policy_loss += metrics.policy_loss;
@@ -79,6 +80,12 @@ pub(super) fn train_burn_encoder(
                 aggregate.relative_update_norm += metrics.relative_update_norm;
                 aggregate.approximate_kl += metrics.approximate_kl;
                 aggregate.clip_fraction += metrics.clip_fraction;
+                if let Some(attribution) = metrics.actor_gradient_attribution {
+                    aggregate
+                        .actor_gradient_attribution
+                        .get_or_insert_with(Default::default)
+                        .accumulate(&attribution);
+                }
                 aggregate.update_index = metrics.update_index;
                 updates += 1;
             }
@@ -105,6 +112,9 @@ pub(super) fn train_burn_encoder(
             aggregate.relative_update_norm /= divisor;
             aggregate.approximate_kl /= divisor;
             aggregate.clip_fraction /= divisor;
+            if let Some(attribution) = &mut aggregate.actor_gradient_attribution {
+                attribution.divide(f64::from(divisor));
+            }
         }
         Ok(aggregate)
     })();
@@ -208,7 +218,13 @@ fn train_burn_encoder_inner(
         Vec::with_capacity(batch.samples.len() * model.architecture.observation_size);
     let mut recurrent_memories = Vec::with_capacity(batch.samples.len() * actor_inputs);
     let mut sequence_starts = Vec::with_capacity(batch.samples.len());
+    let mut actor_representations = Vec::with_capacity(batch.samples.len() * actor_inputs);
     let mut actor_output_gradients = Vec::with_capacity(batch.samples.len() * actor_outputs);
+    let mut policy_actor_output_gradients = Vec::with_capacity(batch.samples.len() * actor_outputs);
+    let mut raw_return_output_gradients = Vec::with_capacity(batch.samples.len() * actor_outputs);
+    let mut drawdown_output_gradients = Vec::with_capacity(batch.samples.len() * actor_outputs);
+    let mut turnover_output_gradients = Vec::with_capacity(batch.samples.len() * actor_outputs);
+    let mut other_cost_output_gradients = Vec::with_capacity(batch.samples.len() * actor_outputs);
     let mut critic_output_gradients = Vec::with_capacity(batch.samples.len() * critic_outputs);
     let mut policy_loss = 0.0_f32;
     let mut value_loss = 0.0_f32;
@@ -234,11 +250,17 @@ fn train_burn_encoder_inner(
         })?;
         let encoded = model.encode_observation(&sample.observation, current_state)?;
         let output = model.evaluate_representation(&encoded.representation)?;
+        actor_representations.extend_from_slice(&encoded.representation);
         recurrent_state = Some(encoded.next_runtime_state);
         observations.extend_from_slice(&sample.observation.values);
         recurrent_memories.extend_from_slice(&sample.recurrent_state.memory);
         sequence_starts.push(sample.sequence_start);
         let mut actor_output_gradient = vec![0.0_f32; actor_outputs];
+        let mut policy_actor_output_gradient = vec![0.0_f32; actor_outputs];
+        let mut raw_return_output_gradient = vec![0.0_f32; actor_outputs];
+        let mut drawdown_output_gradient = vec![0.0_f32; actor_outputs];
+        let mut turnover_output_gradient = vec![0.0_f32; actor_outputs];
+        let mut other_cost_output_gradient = vec![0.0_f32; actor_outputs];
         if let Some(action_sample) = sample.action_sample.as_ref() {
             let old_log_probability = sample.old_log_probability.ok_or_else(|| {
                 MidasError::Policy("actor sample is missing its old log probability".into())
@@ -290,10 +312,27 @@ fn train_burn_encoder_inner(
             if !clipped_active {
                 let coefficient = ratio * advantage;
                 for decision in &distribution.decisions {
-                    actor_output_gradient[decision.actor_alpha_index] +=
-                        -coefficient * decision.d_log_probability_d_raw_alpha;
-                    actor_output_gradient[decision.actor_beta_index] +=
-                        -coefficient * decision.d_log_probability_d_raw_beta;
+                    let alpha = -coefficient * decision.d_log_probability_d_raw_alpha;
+                    let beta = -coefficient * decision.d_log_probability_d_raw_beta;
+                    actor_output_gradient[decision.actor_alpha_index] += alpha;
+                    actor_output_gradient[decision.actor_beta_index] += beta;
+                    policy_actor_output_gradient[decision.actor_alpha_index] += alpha;
+                    policy_actor_output_gradient[decision.actor_beta_index] += beta;
+                    if let Some(counterfactual) = sample.counterfactual_advantages {
+                        for (gradient, component_advantage) in [
+                            (&mut raw_return_output_gradient, counterfactual.raw_return),
+                            (&mut drawdown_output_gradient, counterfactual.drawdown_cost),
+                            (&mut turnover_output_gradient, counterfactual.turnover_cost),
+                            (&mut other_cost_output_gradient, counterfactual.other_cost),
+                        ] {
+                            gradient[decision.actor_alpha_index] += -ratio
+                                * component_advantage
+                                * decision.d_log_probability_d_raw_alpha;
+                            gradient[decision.actor_beta_index] += -ratio
+                                * component_advantage
+                                * decision.d_log_probability_d_raw_beta;
+                        }
+                    }
                 }
             }
             // The entropy derivative is the exact derivative of each Beta
@@ -308,6 +347,11 @@ fn train_burn_encoder_inner(
             }
         }
         actor_output_gradients.extend_from_slice(&actor_output_gradient);
+        policy_actor_output_gradients.extend_from_slice(&policy_actor_output_gradient);
+        raw_return_output_gradients.extend_from_slice(&raw_return_output_gradient);
+        drawdown_output_gradients.extend_from_slice(&drawdown_output_gradient);
+        turnover_output_gradients.extend_from_slice(&turnover_output_gradient);
+        other_cost_output_gradients.extend_from_slice(&other_cost_output_gradient);
         let mut critic_output_gradient = vec![0.0_f32; critic_outputs];
         if let Some(target_return) = sample.return_value {
             critic_output_gradient[0] =
@@ -331,12 +375,43 @@ fn train_burn_encoder_inner(
             return Err(MidasError::Policy("non-finite PPO gradient".into()));
         }
     }
+    for gradients in [
+        &mut policy_actor_output_gradients,
+        &mut raw_return_output_gradients,
+        &mut drawdown_output_gradients,
+        &mut turnover_output_gradients,
+        &mut other_cost_output_gradients,
+    ] {
+        for gradient in gradients {
+            *gradient /= actor_divisor;
+            if !gradient.is_finite() {
+                return Err(MidasError::Policy(
+                    "non-finite counterfactual actor gradient".into(),
+                ));
+            }
+        }
+    }
     for gradient in &mut critic_output_gradients {
         *gradient /= critic_divisor;
         if !gradient.is_finite() {
             return Err(MidasError::Policy("non-finite PPO gradient".into()));
         }
     }
+    let actor_gradient_attribution = actor_head_gradient_attribution(
+        batch
+            .samples
+            .iter()
+            .any(|sample| sample.counterfactual_advantages.is_some()),
+        &actor_representations,
+        batch.samples.len(),
+        actor_inputs,
+        actor_outputs,
+        &policy_actor_output_gradients,
+        &raw_return_output_gradients,
+        &drawdown_output_gradients,
+        &turnover_output_gradients,
+        &other_cost_output_gradients,
+    )?;
     let BpttGradients {
         mut hidden,
         mut recurrent,
@@ -456,6 +531,7 @@ fn train_burn_encoder_inner(
         approximate_kl: approximate_kl / actor_divisor,
         clip_fraction: clipped_samples as f32 / actor_divisor,
         update_index,
+        actor_gradient_attribution,
     })
 }
 
@@ -479,6 +555,101 @@ fn vector_pair_norm(left: &[f32], right: &[f32]) -> f32 {
         .map(|value| value * value)
         .sum::<f32>()
         .sqrt()
+}
+
+fn actor_head_gradient_vector(
+    representations: &[f32],
+    output_gradients: &[f32],
+    sample_count: usize,
+    actor_inputs: usize,
+    actor_outputs: usize,
+) -> Result<Vec<f64>> {
+    if representations.len() != sample_count * actor_inputs
+        || output_gradients.len() != sample_count * actor_outputs
+    {
+        return Err(MidasError::Policy(
+            "actor-gradient attribution shape mismatch".into(),
+        ));
+    }
+    let mut vector = vec![0.0_f64; actor_inputs * actor_outputs + actor_outputs];
+    for sample in 0..sample_count {
+        let representation = &representations[sample * actor_inputs..(sample + 1) * actor_inputs];
+        let outputs = &output_gradients[sample * actor_outputs..(sample + 1) * actor_outputs];
+        for (input, representation_value) in representation.iter().enumerate() {
+            for (output, output_gradient) in outputs.iter().enumerate() {
+                vector[input * actor_outputs + output] +=
+                    f64::from(*representation_value) * f64::from(*output_gradient);
+            }
+        }
+        for (output, output_gradient) in outputs.iter().enumerate() {
+            vector[actor_inputs * actor_outputs + output] += f64::from(*output_gradient);
+        }
+    }
+    if vector.iter().any(|value| !value.is_finite()) {
+        return Err(MidasError::Policy(
+            "actor-gradient attribution is non-finite".into(),
+        ));
+    }
+    Ok(vector)
+}
+
+fn vector_norm(vector: &[f64]) -> f64 {
+    vector.iter().map(|value| value * value).sum::<f64>().sqrt()
+}
+
+fn cosine_similarity(left: &[f64], right: &[f64]) -> f64 {
+    let denominator = vector_norm(left) * vector_norm(right);
+    if denominator > 0.0 {
+        left.iter().zip(right).map(|(a, b)| a * b).sum::<f64>() / denominator
+    } else {
+        0.0
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn actor_head_gradient_attribution(
+    available: bool,
+    representations: &[f32],
+    sample_count: usize,
+    actor_inputs: usize,
+    actor_outputs: usize,
+    actual_outputs: &[f32],
+    raw_return_outputs: &[f32],
+    drawdown_outputs: &[f32],
+    turnover_outputs: &[f32],
+    other_outputs: &[f32],
+) -> Result<Option<crate::learning::ActorGradientAttribution>> {
+    if !available {
+        return Ok(None);
+    }
+    let build = |outputs: &[f32]| {
+        actor_head_gradient_vector(
+            representations,
+            outputs,
+            sample_count,
+            actor_inputs,
+            actor_outputs,
+        )
+    };
+    let actual = build(actual_outputs)?;
+    let raw_return = build(raw_return_outputs)?;
+    let drawdown = build(drawdown_outputs)?;
+    let turnover = build(turnover_outputs)?;
+    let other = build(other_outputs)?;
+    let component = |vector: &[f64]| crate::learning::ActorGradientComponentDiagnostics {
+        norm: vector_norm(vector),
+        cosine_with_actual_policy_gradient: cosine_similarity(vector, &actual),
+    };
+    Ok(Some(crate::learning::ActorGradientAttribution {
+        actual_policy_gradient_norm: vector_norm(&actual),
+        raw_return: component(&raw_return),
+        drawdown_cost: component(&drawdown),
+        turnover_cost: component(&turnover),
+        other_cost: component(&other),
+        raw_return_drawdown_cosine: cosine_similarity(&raw_return, &drawdown),
+        raw_return_turnover_cosine: cosine_similarity(&raw_return, &turnover),
+        drawdown_turnover_cosine: cosine_similarity(&drawdown, &turnover),
+    }))
 }
 
 fn dense_gradient_norm(gradient: &DenseGradients) -> f32 {

@@ -11,7 +11,7 @@ pub struct LifetimeParameters {
     pub critic: DenseGenome,
 }
 impl LifetimeParameters {
-    pub(super) fn from_genome(genome: &BrainGenome) -> Self {
+    pub(crate) fn from_genome(genome: &BrainGenome) -> Self {
         Self {
             hidden: genome.hidden.clone(),
             recurrent: genome.recurrent.clone(),

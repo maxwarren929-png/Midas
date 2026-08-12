@@ -1,5 +1,81 @@
 # Implementation Status
 
+## V3 Phase 3P: counterfactual actor-gradient attribution
+
+Burn PPO now emits report-only actor-head gradient attribution for raw return,
+drawdown cost, turnover cost, and residual cost. Counterfactual vectors reuse
+the real ratio, clipping decision, action derivatives, recurrent
+representation, normalized component advantages, and minibatch divisor but are
+never clipped globally, optimized, or applied. A geometry regression locks the
+exact sole-component equivalence; checkpoint formats and training behavior are
+unchanged.
+
+Seeds 41–42 reproduced all Phase 3O behavior hashes exactly. Drawdown and
+turnover gradients were 0.732% and 1.348% of actual policy-gradient norm, with
+cosines +0.050 and -0.081 to the actual update. Both were nearly orthogonal to
+raw return. The next implementation is an opt-in turnover-constrained PPO mode
+with its own cost critic, independently normalized cost advantage, and
+checkpointed bounded Lagrange multiplier. Full evidence is in
+`reports/V3_PHASE3P_ACTOR_GRADIENT_ATTRIBUTION.md`.
+
+## V3 Phase 3O: PPO advantage-signal audit
+
+PPO maintains a checkpoint-excluded, transactionally forked reward-component
+buffer for report-only attribution. Each update records pre/post-normalization
+advantage scale, sign changes, rank inversions, and the standard deviation,
+correlation, and projection of raw-return, drawdown-cost, turnover-cost, and
+residual-cost signals. Restored partial rollouts explicitly mark their first
+diagnostic update incomplete; training state and checkpoint formats are
+unchanged.
+
+Seeds 41–42 reproduced the Phase 3N economic and existing diagnostic hashes
+exactly. Across 6,304 complete updates, normalization caused zero rank
+inversions, while drawdown and turnover signals were only 0.716% and 0.773% of
+pre-normalization advantage standard deviation. Their projections on the
+advantage direction were +0.444% and -0.026%. Normalization is therefore not
+the primary bottleneck; counterfactual actor-gradient alignment is next. Full
+evidence is in `reports/V3_PHASE3O_ADVANTAGE_SIGNAL_AUDIT.md`.
+
+## V3 Phase 3N: normalized reward semantics and calibration
+
+The opt-in `normalized_risk_adjusted_return` charges only increases in running
+maximum drawdown and divides daily trade notional by previous net worth before
+applying turnover sensitivity. Historical `risk_adjusted_return` semantics are
+unchanged. Reward breakdowns and compact diagnostics expose the normalized
+bases and realized penalty totals. Scale-invariance, unchanged-drawdown,
+finite-difference slope, and full simulation-path regressions pass.
+
+A predeclared two-seed calibration used drawdown weight `0.15` and turnover
+weight `0.0004`. It modestly reduced training turnover but lost to unpenalized
+PPO on validation return, drawdown, and turnover in both seeds. The candidate
+failed its promotion gate, so it was not run across five seeds or enabled by
+default. Full evidence is in
+`reports/V3_PHASE3N_NORMALIZED_REWARD_CALIBRATION.md`.
+
+## V3 Phase 3L: full-horizon learning value audit
+
+Five 10-agent momentum populations trained for the full 1,259-step training
+split, producing 15,768 PPO updates. Their frozen validation performance was
+compared with exact matched controls that preserve each checkpoint's final
+genomes but reset all lifetime weights to birth parameters.
+
+- PPO changed mean return by -0.050 percentage points and won two of five
+  matched pairs. It improved average median-agent return by 0.306 points, but
+  increased turnover and fees by 22.6% and worsened drawdown by 0.804 points,
+  losing drawdown in every seed.
+- A regression locks the new genome-baseline evaluation contract. Diagnostics
+  also supports controlled policy and bankruptcy-threshold overrides.
+- Complete-horizon validation benchmarks ranged from -17.187% for random to
+  75.624% for the configured 20-day momentum policy. PPO-trained neural agents
+  averaged -2.158%, showing that usable point-in-time signal exists but is not
+  being learned effectively.
+- The active reward is pure log return with zero drawdown and turnover
+  penalties, matching the two dimensions that deteriorated under PPO.
+
+The next isolated experiment is reward alignment, not optimizer or architecture
+growth. Full evidence is in
+`reports/V3_PHASE3L_FULL_HORIZON_LEARNING_AUDIT.md`.
+
 ## V3 Phase 3K: frozen held-out optimizer evaluation
 
 The five paired Phase 3J checkpoints were evaluated with learning disabled on
@@ -744,6 +820,20 @@ Prompt 4 replaces the neural target-portfolio action with persistent incremental
 Prompt 4's controlled rerun is recorded in [Prompt 4 Persistent Incremental Trade Experiment](reports/PROMPT4_INCREMENTAL_TRADE_EXPERIMENT.md). It is a mechanical action-interface change, not evidence of profitability or intelligence. Known limitations are the independent per-asset Beta impulse factorisation, stable latent ordering, and frozen hidden/recurrent encoder.
 
 ## Prompt 3B: long-horizon diagnosis and adaptive reward experiment
+
+### V3 Phase 3M: calibrated reward-penalty comparison
+
+Diagnostics can override and record reward kind, drawdown weight, and turnover
+weight without editing the base configuration. Their compact summaries now
+include aggregate raw-return, drawdown-penalty, turnover-penalty, and unclipped
+reward totals from the committed decision traces. A five-seed full-horizon
+comparison used drawdown weight `0.0005` and raw-notional turnover weight
+`5e-8`, changing no other Phase 3L control. The treatment was active at 20.7%
+of the calibration daily-return scale, but penalized PPO averaged -2.218%
+validation return, 4.531% drawdown, and 31,140 population turnover versus
+-2.158%, 4.534%, and 28,279 unpenalized. These penalty weights are therefore
+not defaults. Details and raw artifacts are in
+[V3 Phase 3M](reports/V3_PHASE3M_PENALIZED_REWARD_COMPARISON.md).
 
 Prompt 3B adds report-only observability and a frozen, long-horizon experimental protocol. The implementation commit tested for the suite is `c692101`. The generated market contains 1,800 business dates, four assets, 1,259 training steps, and frozen validation/test splits; its SHA-256 is recorded in `reports/PROMPT3B_DIAGNOSTIC_EXPERIMENT.md`.
 

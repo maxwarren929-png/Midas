@@ -4,6 +4,7 @@ use crate::{
     agent::Agent,
     brain::PolicyContext,
     learning::{EpisodeEndContext, LearningUpdate, Transition},
+    reward::RewardBreakdown,
 };
 use chrono::NaiveDate;
 
@@ -75,6 +76,7 @@ impl SimulationEngine {
         evaluation: Option<crate::brain::PolicyEvaluation>,
         action: ValidatedAction,
         reward: f32,
+        reward_breakdown: RewardBreakdown,
         next_value: Option<f32>,
         done: bool,
         date: NaiveDate,
@@ -135,7 +137,9 @@ impl SimulationEngine {
                 penalty: self.config.reward.invalid_action_penalty,
             });
         }
-        let update = agent.learning.observe_transition(transition)?;
+        let update = agent
+            .learning
+            .observe_transition_with_diagnostics(transition, reward_breakdown)?;
         self.apply_learning_update(agent, update, date, events, traces)?;
         if done {
             self.finish_learning_episode(
@@ -176,6 +180,7 @@ impl SimulationEngine {
         traces: &mut Vec<ReportTrace>,
     ) -> Result<()> {
         if let LearningUpdate::Ppo(batch) = update {
+            let advantage_diagnostics = batch.advantage_diagnostics.as_deref().cloned();
             let learning_config = agent
                 .learning
                 .training_config()
@@ -219,6 +224,8 @@ impl SimulationEngine {
                 clip_fraction: metrics.clip_fraction,
                 actor_delta_norm,
                 critic_delta_norm,
+                advantage_diagnostics,
+                actor_gradient_attribution: metrics.actor_gradient_attribution,
             }));
             events.push(DomainEvent::LearningUpdate {
                 agent_id: agent.state.id,

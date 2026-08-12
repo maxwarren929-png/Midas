@@ -46,7 +46,12 @@ impl Default for RewardConfig {
 pub enum RewardKind {
     #[default]
     LogReturn,
+    /// Legacy formulation using full running maximum drawdown and raw notional
+    /// turnover. Retained for experiment and checkpoint reproducibility.
     RiskAdjustedReturn,
+    /// Unit-safe formulation using only increases in running maximum drawdown
+    /// and daily turnover divided by pre-step net worth.
+    NormalizedRiskAdjustedReturn,
 }
 
 impl RewardConfig {

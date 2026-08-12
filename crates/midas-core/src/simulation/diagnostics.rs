@@ -78,6 +78,8 @@ pub struct PpoUpdateTrace {
     pub clip_fraction: f32,
     pub actor_delta_norm: f64,
     pub critic_delta_norm: f64,
+    pub advantage_diagnostics: Option<crate::learning::PpoAdvantageDiagnostics>,
+    pub actor_gradient_attribution: Option<crate::learning::ActorGradientAttribution>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

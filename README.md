@@ -83,6 +83,44 @@ test advantage. See
 [V3 Phase 3J](reports/V3_PHASE3J_MULTI_SEED_OPTIMIZER_COMPARISON.md), and
 [V3 Phase 3K](reports/V3_PHASE3K_FROZEN_OPTIMIZER_EVALUATION.md).
 
+The full-horizon learning audit compares trained lifetime weights with exact
+matched final-genome controls and simple validation policies. PPO currently
+raises turnover and drawdown without improving mean return, so reward alignment
+comes before further model growth. See
+[V3 Phase 3L](reports/V3_PHASE3L_FULL_HORIZON_LEARNING_AUDIT.md).
+
+A matched five-seed follow-up enabled calibrated drawdown and raw-notional
+turnover penalties. The penalties were verified in the realized reward
+decomposition but did not reduce validation risk or trading, so they remain
+experimental rather than defaults. See
+[V3 Phase 3M](reports/V3_PHASE3M_PENALIZED_REWARD_COMPARISON.md).
+
+The follow-up adds an opt-in, versioned
+`normalized_risk_adjusted_return`: turnover is divided by previous net worth
+and only increases in running maximum drawdown are charged. Unit, finite-
+difference, and engine regressions cover the semantics while the legacy reward
+remains reproducible. Its two-seed calibration failed the validation promotion
+gate, so no five-seed run or default change was made. See
+[V3 Phase 3N](reports/V3_PHASE3N_NORMALIZED_REWARD_CALIBRATION.md).
+
+PPO update traces and compact diagnostics now provide report-only advantage
+signal attribution for raw return, drawdown cost, turnover cost, and residual
+cost. A deterministic two-seed replay showed zero normalization rank inversions
+and exact economic equivalence with the uninstrumented run. The cost signals
+survive normalization but each explains under 0.8% of advantage variation, so
+the next audit is counterfactual actor-gradient alignment rather than another
+weight sweep. See
+[V3 Phase 3O](reports/V3_PHASE3O_ADVANTAGE_SIGNAL_AUDIT.md).
+
+Counterfactual actor-head gradient attribution reuses the exact PPO ratio,
+clipping gate, Beta derivatives, recurrent representation, and minibatch
+averaging without applying component gradients. The two-seed audit found that
+drawdown and turnover contribute only 0.73% and 1.35% of actual policy-gradient
+magnitude and are nearly orthogonal to raw return. This supports an opt-in,
+turnover-first constrained PPO objective with a separate cost critic and
+checkpointed Lagrange multiplier. See
+[V3 Phase 3P](reports/V3_PHASE3P_ACTOR_GRADIENT_ATTRIBUTION.md).
+
 Deterministic seed derivation is versioned. Existing configurations omit
 `simulation.seed_derivation` and retain the exact `legacy_xor` behavior and
 configuration hashes. New controlled experiments should set

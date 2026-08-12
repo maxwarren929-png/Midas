@@ -278,6 +278,53 @@ fn simulation_runs_mock_and_burn_neural_models() {
 }
 
 #[test]
+fn normalized_risk_reward_uses_engine_drawdown_increments_and_turnover_fraction() {
+    let mut c = config();
+    c.simulation.population_size = 1;
+    c.simulation.bankruptcy_threshold = 0.0;
+    c.brain.policy = PolicyKind::EqualWeight;
+    c.reward.kind = RewardKind::NormalizedRiskAdjustedReturn;
+    c.reward.drawdown_penalty_weight = 0.5;
+    c.reward.turnover_penalty_weight = 0.25;
+    let data = loaded(&c);
+    let mut engine = SimulationEngine::new(c, data, DatasetSplit::Training).unwrap();
+    let report = engine.run().unwrap();
+    let decisions = engine
+        .report_traces
+        .iter()
+        .filter_map(|trace| match trace {
+            ReportTrace::Decision(decision) => Some(decision),
+            ReportTrace::PpoUpdate(_) => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert!(!decisions.is_empty());
+    assert!(
+        decisions
+            .iter()
+            .any(|trace| trace.reward_breakdown.turnover_basis > 0.0)
+    );
+    for trace in &decisions {
+        let expected_turnover_basis = trace.turnover / trace.previous_net_worth;
+        assert!((trace.reward_breakdown.turnover_basis - expected_turnover_basis).abs() < 1e-12);
+        assert!(
+            (trace.reward_breakdown.turnover_penalty - 0.25 * expected_turnover_basis).abs()
+                < 1e-12
+        );
+        assert!(
+            (trace.reward_breakdown.drawdown_penalty - 0.5 * trace.reward_breakdown.drawdown_basis)
+                .abs()
+                < 1e-12
+        );
+    }
+    let drawdown_increments = decisions
+        .iter()
+        .map(|trace| trace.reward_breakdown.drawdown_basis)
+        .sum::<f64>();
+    assert!((drawdown_increments - report.agents[0].1.maximum_drawdown).abs() < 1e-12);
+}
+
+#[test]
 fn continuing_bootstrap_fork_failure_is_transactional_and_not_zero() {
     let mut c = config();
     c.simulation.population_size = 1;

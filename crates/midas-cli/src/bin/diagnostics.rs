@@ -2,8 +2,10 @@ use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use midas_core::{
     brain::{DenseGenome, NeuralModelState, PolicySnapshot},
-    config::{Config, OptimizerKind, SeedDerivation},
-    learning::{LearningStrategyState, TrainingMetrics},
+    config::{Config, OptimizerKind, PolicyKind, RewardKind, SeedDerivation},
+    learning::{
+        ActorGradientAttribution, LearningStrategyState, PpoAdvantageDiagnostics, TrainingMetrics,
+    },
     market::{MarketDataSource, PolarsDataSource},
     simulation::{DatasetSplit, DomainEvent, PpoUpdateTrace, ReportTrace, SimulationEngine},
 };
@@ -26,6 +28,9 @@ struct Args {
     /// Override the configured population size for a controlled diagnostic run.
     #[arg(long)]
     population_size: Option<usize>,
+    /// Override the bankruptcy threshold for a controlled diagnostic run.
+    #[arg(long)]
+    bankruptcy_threshold: Option<f64>,
     /// Override the configured deterministic simulation seed.
     #[arg(long)]
     seed: Option<u64>,
@@ -44,6 +49,18 @@ struct Args {
     /// Override AdamW decoupled weight decay.
     #[arg(long)]
     weight_decay: Option<f32>,
+    /// Override the population policy for a controlled benchmark run.
+    #[arg(long, value_enum)]
+    policy: Option<PolicyArg>,
+    /// Override the reward function for a controlled diagnostic run.
+    #[arg(long, value_enum)]
+    reward_kind: Option<RewardArg>,
+    /// Override the maximum-drawdown penalty weight.
+    #[arg(long)]
+    drawdown_penalty_weight: Option<f32>,
+    /// Override the raw-notional turnover penalty weight.
+    #[arg(long)]
+    turnover_penalty_weight: Option<f32>,
     /// Write the JSON summary to this path instead of standard output.
     #[arg(long)]
     output: Option<PathBuf>,
@@ -53,6 +70,9 @@ struct Args {
     /// Evaluate a training checkpoint with learning disabled instead of starting a new run.
     #[arg(long)]
     evaluate_checkpoint: Option<PathBuf>,
+    /// Reset lifetime weights to the checkpoint genomes during evaluation.
+    #[arg(long, requires = "evaluate_checkpoint")]
+    genome_baseline: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -72,6 +92,47 @@ enum SeedDerivationArg {
 enum OptimizerArg {
     Momentum,
     Adamw,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PolicyArg {
+    Cash,
+    Random,
+    EqualWeight,
+    BuyAndHold,
+    Momentum,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum RewardArg {
+    #[value(name = "log-return")]
+    Log,
+    #[value(name = "risk-adjusted-return")]
+    RiskAdjusted,
+    #[value(name = "normalized-risk-adjusted-return")]
+    NormalizedRiskAdjusted,
+}
+
+impl From<RewardArg> for RewardKind {
+    fn from(value: RewardArg) -> Self {
+        match value {
+            RewardArg::Log => Self::LogReturn,
+            RewardArg::RiskAdjusted => Self::RiskAdjustedReturn,
+            RewardArg::NormalizedRiskAdjusted => Self::NormalizedRiskAdjustedReturn,
+        }
+    }
+}
+
+impl From<PolicyArg> for PolicyKind {
+    fn from(value: PolicyArg) -> Self {
+        match value {
+            PolicyArg::Cash => Self::Cash,
+            PolicyArg::Random => Self::Random,
+            PolicyArg::EqualWeight => Self::EqualWeight,
+            PolicyArg::BuyAndHold => Self::BuyAndHold,
+            PolicyArg::Momentum => Self::Momentum,
+        }
+    }
 }
 
 impl From<OptimizerArg> for OptimizerKind {
@@ -140,6 +201,9 @@ fn main() -> Result<()> {
     if let Some(population_size) = args.population_size {
         config.simulation.population_size = population_size;
     }
+    if let Some(bankruptcy_threshold) = args.bankruptcy_threshold {
+        config.simulation.bankruptcy_threshold = bankruptcy_threshold;
+    }
     if let Some(seed) = args.seed {
         config.simulation.seed = seed;
     }
@@ -158,20 +222,47 @@ fn main() -> Result<()> {
     if let Some(weight_decay) = args.weight_decay {
         config.optimizer.weight_decay = weight_decay;
     }
+    if let Some(policy) = args.policy {
+        config.brain.policy = policy.into();
+    }
+    if let Some(reward_kind) = args.reward_kind {
+        config.reward.kind = reward_kind.into();
+    }
+    if let Some(weight) = args.drawdown_penalty_weight {
+        config.reward.drawdown_penalty_weight = weight;
+    }
+    if let Some(weight) = args.turnover_penalty_weight {
+        config.reward.turnover_penalty_weight = weight;
+    }
     let experiment = json!({
         "requested_steps": args.steps,
         "population_size": config.simulation.population_size,
+        "bankruptcy_threshold": config.simulation.bankruptcy_threshold,
         "seed": config.simulation.seed,
         "seed_derivation": config.simulation.seed_derivation,
         "gradient_clip": config.learning.gradient_clip,
         "learning_rate": config.learning.learning_rate,
         "optimizer": config.optimizer.kind,
         "weight_decay": config.optimizer.weight_decay,
+        "policy": config.brain.policy,
+        "reward_kind": config.reward.kind,
+        "drawdown_penalty_weight": config.reward.drawdown_penalty_weight,
+        "turnover_penalty_weight": config.reward.turnover_penalty_weight,
         "evaluation_checkpoint": args.evaluate_checkpoint,
+        "genome_baseline": args.genome_baseline,
     });
     let data = PolarsDataSource.load(&config)?;
     let mut engine = if let Some(checkpoint) = &args.evaluate_checkpoint {
-        SimulationEngine::evaluate_checkpoint(config, data, checkpoint, args.split.into())?
+        if args.genome_baseline {
+            SimulationEngine::evaluate_checkpoint_genome_baseline(
+                config,
+                data,
+                checkpoint,
+                args.split.into(),
+            )?
+        } else {
+            SimulationEngine::evaluate_checkpoint(config, data, checkpoint, args.split.into())?
+        }
     } else {
         SimulationEngine::new(config, data, args.split.into())?
     };
@@ -235,6 +326,7 @@ fn main() -> Result<()> {
                 approximate_kl: 0.0,
                 clip_fraction: 0.0,
                 update_index: updates.len() as u64,
+                actor_gradient_attribution: None,
             }),
             DomainEvent::LearningTransitionMasked { .. } => masked += 1,
             DomainEvent::GenomeCrossed { .. } => crossover += 1,
@@ -258,6 +350,14 @@ fn main() -> Result<()> {
         .filter_map(|trace| match trace {
             ReportTrace::PpoUpdate(update) => Some(update),
             ReportTrace::Decision(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let decision_traces = engine
+        .report_traces
+        .iter()
+        .filter_map(|trace| match trace {
+            ReportTrace::Decision(decision) => Some(decision),
+            ReportTrace::PpoUpdate(_) => None,
         })
         .collect::<Vec<_>>();
     for state in engine.agents() {
@@ -354,6 +454,57 @@ fn main() -> Result<()> {
             Some(values.iter().sum::<f64>() / values.len() as f64)
         }
     };
+    let advantage_diagnostics = ppo_traces
+        .iter()
+        .filter_map(|trace| trace.advantage_diagnostics.as_ref())
+        .collect::<Vec<_>>();
+    let advantage_actor_samples = advantage_diagnostics
+        .iter()
+        .map(|diagnostics| diagnostics.actor_sample_count)
+        .sum::<usize>();
+    let weighted_advantage = |f: fn(&PpoAdvantageDiagnostics) -> f64| {
+        if advantage_actor_samples == 0 {
+            0.0
+        } else {
+            advantage_diagnostics
+                .iter()
+                .map(|diagnostics| f(diagnostics) * diagnostics.actor_sample_count as f64)
+                .sum::<f64>()
+                / advantage_actor_samples as f64
+        }
+    };
+    let gradient_attributions = ppo_traces
+        .iter()
+        .filter_map(|trace| {
+            trace
+                .actor_gradient_attribution
+                .as_ref()
+                .map(|attribution| {
+                    (
+                        attribution,
+                        trace
+                            .advantage_diagnostics
+                            .as_ref()
+                            .map_or(0, |diagnostics| diagnostics.actor_sample_count),
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+    let gradient_actor_samples = gradient_attributions
+        .iter()
+        .map(|(_, samples)| *samples)
+        .sum::<usize>();
+    let weighted_gradient = |f: fn(&ActorGradientAttribution) -> f64| {
+        if gradient_actor_samples == 0 {
+            0.0
+        } else {
+            gradient_attributions
+                .iter()
+                .map(|(attribution, samples)| f(attribution) * *samples as f64)
+                .sum::<f64>()
+                / gradient_actor_samples as f64
+        }
+    };
 
     let summary = serde_json::to_string_pretty(&json!({
             "experiment": experiment,
@@ -370,6 +521,13 @@ fn main() -> Result<()> {
             "actor_ineligible_entries": engine.metrics.actor_ineligible_transitions,
             "critic_ineligible_entries": engine.metrics.critic_ineligible_transitions,
             "invalid_action_penalty_total": engine.metrics.invalid_action_penalty_total,
+            "reward_decisions": decision_traces.len(),
+            "raw_log_return_total": decision_traces.iter().map(|trace| trace.reward_breakdown.raw_log_return).sum::<f64>(),
+            "drawdown_basis_total": decision_traces.iter().map(|trace| trace.reward_breakdown.drawdown_basis).sum::<f64>(),
+            "turnover_basis_total": decision_traces.iter().map(|trace| trace.reward_breakdown.turnover_basis).sum::<f64>(),
+            "drawdown_penalty_total": decision_traces.iter().map(|trace| trace.reward_breakdown.drawdown_penalty).sum::<f64>(),
+            "turnover_penalty_total": decision_traces.iter().map(|trace| trace.reward_breakdown.turnover_penalty).sum::<f64>(),
+            "unclipped_reward_total": decision_traces.iter().map(|trace| trace.reward_breakdown.unclipped_total).sum::<f64>(),
             "deaths": engine.metrics.deaths,
             "births": engine.metrics.births,
             "reproductions": engine.metrics.reproductions,
@@ -417,6 +575,62 @@ fn main() -> Result<()> {
             "mean_value_loss": mean(|m| f64::from(m.value_loss)),
             "mean_entropy": mean(|m| f64::from(m.entropy)),
             "mean_gradient_norm": mean(|m| f64::from(m.gradient_norm)),
+            "advantage_signal": {
+                "updates_observed": advantage_diagnostics.len(),
+                "complete_updates": advantage_diagnostics.iter().filter(|diagnostics| diagnostics.complete).count(),
+                "actor_samples": advantage_actor_samples,
+                "weighted_pre_normalization_mean": weighted_advantage(|diagnostics| diagnostics.pre_normalization_mean),
+                "weighted_pre_normalization_standard_deviation": weighted_advantage(|diagnostics| diagnostics.pre_normalization_standard_deviation),
+                "weighted_post_normalization_mean": weighted_advantage(|diagnostics| diagnostics.post_normalization_mean),
+                "weighted_post_normalization_standard_deviation": weighted_advantage(|diagnostics| diagnostics.post_normalization_standard_deviation),
+                "weighted_normalization_scale": weighted_advantage(|diagnostics| diagnostics.normalization_scale),
+                "weighted_sign_flip_fraction": weighted_advantage(|diagnostics| diagnostics.sign_flip_fraction),
+                "rank_inversions": advantage_diagnostics.iter().map(|diagnostics| diagnostics.rank_inversions).sum::<u64>(),
+                "raw_return": {
+                    "weighted_standard_deviation": weighted_advantage(|diagnostics| diagnostics.raw_return.standard_deviation),
+                    "weighted_correlation": weighted_advantage(|diagnostics| diagnostics.raw_return.correlation_with_pre_normalization_advantage),
+                    "weighted_projection": weighted_advantage(|diagnostics| diagnostics.raw_return.projection_on_pre_normalization_advantage),
+                },
+                "drawdown_cost": {
+                    "weighted_standard_deviation": weighted_advantage(|diagnostics| diagnostics.drawdown_cost.standard_deviation),
+                    "weighted_correlation": weighted_advantage(|diagnostics| diagnostics.drawdown_cost.correlation_with_pre_normalization_advantage),
+                    "weighted_projection": weighted_advantage(|diagnostics| diagnostics.drawdown_cost.projection_on_pre_normalization_advantage),
+                },
+                "turnover_cost": {
+                    "weighted_standard_deviation": weighted_advantage(|diagnostics| diagnostics.turnover_cost.standard_deviation),
+                    "weighted_correlation": weighted_advantage(|diagnostics| diagnostics.turnover_cost.correlation_with_pre_normalization_advantage),
+                    "weighted_projection": weighted_advantage(|diagnostics| diagnostics.turnover_cost.projection_on_pre_normalization_advantage),
+                },
+                "other_cost": {
+                    "weighted_standard_deviation": weighted_advantage(|diagnostics| diagnostics.other_cost.standard_deviation),
+                    "weighted_correlation": weighted_advantage(|diagnostics| diagnostics.other_cost.correlation_with_pre_normalization_advantage),
+                    "weighted_projection": weighted_advantage(|diagnostics| diagnostics.other_cost.projection_on_pre_normalization_advantage),
+                },
+            },
+            "actor_gradient_signal": {
+                "updates_observed": gradient_attributions.len(),
+                "actor_samples": gradient_actor_samples,
+                "weighted_actual_policy_gradient_norm": weighted_gradient(|attribution| attribution.actual_policy_gradient_norm),
+                "raw_return": {
+                    "weighted_norm": weighted_gradient(|attribution| attribution.raw_return.norm),
+                    "weighted_cosine_with_actual": weighted_gradient(|attribution| attribution.raw_return.cosine_with_actual_policy_gradient),
+                },
+                "drawdown_cost": {
+                    "weighted_norm": weighted_gradient(|attribution| attribution.drawdown_cost.norm),
+                    "weighted_cosine_with_actual": weighted_gradient(|attribution| attribution.drawdown_cost.cosine_with_actual_policy_gradient),
+                },
+                "turnover_cost": {
+                    "weighted_norm": weighted_gradient(|attribution| attribution.turnover_cost.norm),
+                    "weighted_cosine_with_actual": weighted_gradient(|attribution| attribution.turnover_cost.cosine_with_actual_policy_gradient),
+                },
+                "other_cost": {
+                    "weighted_norm": weighted_gradient(|attribution| attribution.other_cost.norm),
+                    "weighted_cosine_with_actual": weighted_gradient(|attribution| attribution.other_cost.cosine_with_actual_policy_gradient),
+                },
+                "weighted_raw_return_drawdown_cosine": weighted_gradient(|attribution| attribution.raw_return_drawdown_cosine),
+                "weighted_raw_return_turnover_cosine": weighted_gradient(|attribution| attribution.raw_return_turnover_cosine),
+                "weighted_drawdown_turnover_cosine": weighted_gradient(|attribution| attribution.drawdown_turnover_cosine),
+            },
             "gradient_health": {
                 "mean_pre_clip_global_norm": mean_ppo(|trace| f64::from(trace.pre_clip_gradient_norm)),
                 "mean_post_clip_global_norm": mean_ppo(|trace| f64::from(trace.gradient_norm)),
@@ -485,6 +699,8 @@ mod tests {
             "127",
             "--population-size",
             "10",
+            "--bankruptcy-threshold",
+            "0",
             "--seed",
             "43",
             "--seed-derivation",
@@ -497,18 +713,28 @@ mod tests {
             "adamw",
             "--weight-decay",
             "0.01",
+            "--policy",
+            "equal-weight",
+            "--reward-kind",
+            "risk-adjusted-return",
+            "--drawdown-penalty-weight",
+            "0.0005",
+            "--turnover-penalty-weight",
+            "0.00000005",
             "--output",
             "summary.json",
             "--checkpoint",
             "state.bin",
             "--evaluate-checkpoint",
             "trained.bin",
+            "--genome-baseline",
         ])
         .unwrap();
 
         assert!(matches!(args.split, SplitArg::Training));
         assert_eq!(args.steps, Some(127));
         assert_eq!(args.population_size, Some(10));
+        assert_eq!(args.bankruptcy_threshold, Some(0.0));
         assert_eq!(args.seed, Some(43));
         assert!(matches!(
             args.seed_derivation,
@@ -518,9 +744,14 @@ mod tests {
         assert_eq!(args.learning_rate, Some(0.000003));
         assert!(matches!(args.optimizer, Some(OptimizerArg::Adamw)));
         assert_eq!(args.weight_decay, Some(0.01));
+        assert!(matches!(args.policy, Some(PolicyArg::EqualWeight)));
+        assert!(matches!(args.reward_kind, Some(RewardArg::RiskAdjusted)));
+        assert_eq!(args.drawdown_penalty_weight, Some(0.0005));
+        assert_eq!(args.turnover_penalty_weight, Some(0.00000005));
         assert_eq!(args.output, Some(PathBuf::from("summary.json")));
         assert_eq!(args.checkpoint, Some(PathBuf::from("state.bin")));
         assert_eq!(args.evaluate_checkpoint, Some(PathBuf::from("trained.bin")));
+        assert!(args.genome_baseline);
     }
 
     #[test]
