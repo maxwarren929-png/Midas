@@ -154,7 +154,9 @@ fn main() -> Result<()> {
             let d = PolarsDataSource.load(&c)?;
             let mut engine = SimulationEngine::resume(c, d, &checkpoint)
                 .with_context(|| format!("cannot resume {}", checkpoint.display()))?;
-            println!("{}", serde_json::to_string_pretty(&engine.run()?)?);
+            let report = engine.run()?;
+            engine.save_checkpoint(&checkpoint)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Evaluate {
             config,

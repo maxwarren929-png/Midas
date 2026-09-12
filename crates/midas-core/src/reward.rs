@@ -144,6 +144,58 @@ impl RewardFunction for NormalizedRiskAdjustedReturnReward {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct AsymmetricSortinoReward {
+    pub config: RewardConfig,
+}
+
+impl RewardFunction for AsymmetricSortinoReward {
+    fn reward(&self, context: &RewardContext) -> Result<f32> {
+        Ok(self.breakdown(context)?.clipped_total)
+    }
+    fn breakdown(&self, context: &RewardContext) -> Result<RewardBreakdown> {
+        let raw_log_return = log_return(context);
+        // Convex boost for positive gains
+        let upside_boost = if raw_log_return > 0.0 {
+            raw_log_return * (1.0 + raw_log_return.min(1.0) * 0.5)
+        } else {
+            0.0
+        };
+        // Quadratic penalty only on downside drop
+        let downside_penalty = if raw_log_return < 0.0 {
+            let sensitivity = context
+                .drawdown_sensitivity
+                .unwrap_or(self.config.drawdown_penalty_weight as f64);
+            sensitivity * raw_log_return.abs().powi(2)
+        } else {
+            0.0
+        };
+        let turnover_penalty = context
+            .turnover_sensitivity
+            .unwrap_or(self.config.turnover_penalty_weight as f64)
+            * context.turnover;
+
+        let basis_return = if raw_log_return > 0.0 {
+            raw_log_return + upside_boost
+        } else {
+            raw_log_return
+        };
+
+        finish_breakdown_with_components(
+            basis_return,
+            0.0,
+            context.turnover,
+            downside_penalty,
+            turnover_penalty,
+            &self.config,
+            context,
+        )
+    }
+    fn name(&self) -> &'static str {
+        "asymmetric_sortino"
+    }
+}
+
 fn log_return(context: &RewardContext) -> f64 {
     if context.previous_net_worth > 0.0 && context.current_net_worth > 0.0 {
         (context.current_net_worth / context.previous_net_worth).ln()
@@ -224,6 +276,9 @@ pub fn configured_reward(config: &RewardConfig) -> Box<dyn RewardFunction> {
         RewardKind::NormalizedRiskAdjustedReturn => Box::new(NormalizedRiskAdjustedReturnReward {
             config: config.clone(),
         }),
+        RewardKind::AsymmetricSortino => Box::new(AsymmetricSortinoReward {
+            config: config.clone(),
+        }),
     }
 }
 
@@ -256,6 +311,7 @@ mod tests {
             RewardKind::LogReturn,
             RewardKind::RiskAdjustedReturn,
             RewardKind::NormalizedRiskAdjustedReturn,
+            RewardKind::AsymmetricSortino,
         ] {
             config.kind = kind;
             let reward = configured_reward(&config);
@@ -274,6 +330,9 @@ mod tests {
             if kind == RewardKind::LogReturn {
                 assert_eq!(breakdown.drawdown_penalty, 0.0);
                 assert_eq!(breakdown.turnover_penalty, 0.0);
+            } else if kind == RewardKind::AsymmetricSortino {
+                assert_eq!(breakdown.drawdown_penalty, 0.0); // positive return has 0 downside penalty
+                assert!(breakdown.turnover_penalty > 0.0);
             } else {
                 assert!(breakdown.drawdown_penalty > 0.0);
                 assert!(breakdown.turnover_penalty > 0.0);

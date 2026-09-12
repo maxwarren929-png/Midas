@@ -52,6 +52,9 @@ pub enum RewardKind {
     /// Unit-safe formulation using only increases in running maximum drawdown
     /// and daily turnover divided by pre-step net worth.
     NormalizedRiskAdjustedReturn,
+    /// Asymmetric Sortino convex upside reward: exponentially rewards trend runs
+    /// and penalizes downside drops only.
+    AsymmetricSortino,
 }
 
 impl RewardConfig {
